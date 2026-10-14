@@ -1166,6 +1166,13 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// applies to inference routes; control endpoints retain their existing
 	// routing behavior even when their JSON happens to contain a model field.
 	bodyBytes, model := bufferBodyAndModel(r)
+	if r.URL.Path == "/v1/responses" && len(bodyBytes) > 0 {
+		if nb := normalizeResponsesInput(bodyBytes); len(nb) != len(bodyBytes) || !bytes.Equal(nb, bodyBytes) {
+			bodyBytes = nb
+			r.ContentLength = int64(len(nb))
+			r.Header.Set("Content-Length", strconv.Itoa(len(nb)))
+		}
+	}
 	isInf := isInferenceRequest(f.profile, r.Method, r.URL.Path)
 	routingModel := ""
 	if isInf {
