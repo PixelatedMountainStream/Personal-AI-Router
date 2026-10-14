@@ -142,6 +142,9 @@ type RequestEvent struct {
 	Duration int64  `json:"duration_ms"`
 	TTFB     int64  `json:"ttfb_ms,omitempty"`
 	Error    string `json:"error,omitempty"`
+	// Affinity is the session-affinity decision (hit, miss, rebind); empty
+	// when the request carried no affinity key.
+	Affinity string `json:"affinity,omitempty"`
 }
 
 // Workload lifecycle method names (workload-manager spec 7). The proxy is
@@ -376,6 +379,9 @@ type Proxy struct {
 	priorityPending      map[string]int
 	priorityGPUPressure  map[string]int
 	priorityReservations map[string]int
+
+	// affinity pins a conversation's affinity key to a node (see affinity.go).
+	affinity affinityTable
 
 	// appliedPriorityGeneration is the newest snapshot generation applied, so a
 	// redelivered or superseded one cannot clear reservations twice. See
@@ -1189,8 +1195,10 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		resMu sync.Mutex
 		held  reservation
 	)
+	affKey, affDecision := "", ""
 	if isInf && model != "" {
-		candidates, held = p.reserveCandidate(f, candidates)
+		affKey = affinityKey(r, bodyBytes)
+		candidates, held, affDecision = p.reserveCandidateKey(f, candidates, affKey)
 	}
 	// Released exactly once, whichever way the request ends: normal unwind,
 	// client disconnect, or an early return below. Without this a node stays
@@ -1205,6 +1213,9 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		resMu.Lock()
 		defer resMu.Unlock()
 		held = p.moveReservation(held, nodeID)
+		if affKey != "" && held.held {
+			p.affinity.bind(affKey, nodeID) // failover landed elsewhere: follow it
+		}
 	}
 	defer func() {
 		resMu.Lock()
@@ -1425,6 +1436,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			"duration_ms", time.Since(start).Milliseconds(),
 			"ttfb_ms", ttfbMs,
 			"err", reportErr,
+			"affinity", affDecision,
 		)
 
 		_ = f.notify("proxy/request", RequestEvent{
@@ -1437,6 +1449,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			Duration: time.Since(start).Milliseconds(),
 			TTFB:     ttfbMs,
 			Error:    reportErr,
+			Affinity: affDecision,
 		})
 
 		// Terminal workload transition pairs with the workload:started emitted
@@ -1528,7 +1541,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		defer resMu.Unlock()
 		p.releaseReservation(held)
 		var out []candidate
-		out, held = p.reserveCandidate(f, cands)
+		var d string
+		out, held, d = p.reserveCandidateKey(f, cands, affKey)
+		if d != "" {
+			affDecision = d
+		}
 		return out
 	}
 
@@ -2105,13 +2122,23 @@ type reservation struct {
 // Process-wide is the point: two facades bursting at once are competing for the
 // same GPU, so a dispatch through either has to be visible to the other.
 func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate, reservation) {
+	out, res, _ := p.reserveCandidateKey(f, candidates, "")
+	return out, res
+}
+
+// reserveCandidateKey is reserveCandidate with session affinity. With a
+// non-empty key, a still-eligible bound node is chosen over the least-loaded
+// one; otherwise the normal pick is made and the key is bound to it. The
+// returned string is the affinity decision, empty when no key was given or no
+// reservation was made.
+func (p *Proxy) reserveCandidateKey(f *facade, candidates []candidate, key string) ([]candidate, reservation, string) {
 	if len(candidates) == 0 {
-		return candidates, reservation{}
+		return candidates, reservation{}, ""
 	}
 	if selectedID := f.SelectedID(); selectedID != "" {
 		for _, cand := range candidates {
 			if cand.id == selectedID {
-				return candidates, reservation{}
+				return candidates, reservation{}, ""
 			}
 		}
 	}
@@ -2124,7 +2151,7 @@ func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
 	if len(p.priority) == 0 {
-		return candidates, reservation{}
+		return candidates, reservation{}, ""
 	}
 	if p.priorityReservations == nil {
 		p.priorityReservations = make(map[string]int)
@@ -2133,7 +2160,20 @@ func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate
 	bestIndex := -1
 	bestOrder := len(p.priority)
 	var bestLoad uint64
+	decision := ""
+	if key != "" {
+		decision = affinityMiss
+		if bound, ok := p.affinity.lookup(key); ok {
+			decision = affinityRebind
+			if index, ok := candidateIndex[bound]; ok && containsID(p.priority, bound) {
+				bestIndex, decision = index, affinityHit
+			}
+		}
+	}
 	for order, id := range p.priority {
+		if decision == affinityHit {
+			break
+		}
 		index, ok := candidateIndex[id]
 		if !ok {
 			continue
@@ -2148,10 +2188,13 @@ func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate
 		}
 	}
 	if bestIndex < 0 {
-		return candidates, reservation{}
+		return candidates, reservation{}, ""
 	}
 
 	chosen := candidates[bestIndex]
+	if key != "" {
+		p.affinity.bind(key, chosen.id)
+	}
 	p.priorityReservations[chosen.id]++
 	if bestIndex > 0 {
 		copy(candidates[1:bestIndex+1], candidates[:bestIndex])
@@ -2161,7 +2204,16 @@ func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate
 		nodeID:     chosen.id,
 		generation: p.appliedPriorityGeneration,
 		held:       true,
+	}, decision
+}
+
+func containsID(ids []string, id string) bool {
+	for _, v := range ids {
+		if v == id {
+			return true
+		}
 	}
+	return false
 }
 
 // releaseReservation drops an in-flight dispatch's reservation once its request
