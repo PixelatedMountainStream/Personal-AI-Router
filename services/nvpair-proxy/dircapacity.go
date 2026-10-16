@@ -34,12 +34,13 @@ func newDirectoryCapacity(now func() time.Time) *directoryCapacity {
 
 // update replaces the engine's view with the snapshot (a departed node simply
 // vanishes). The observed-at stamp is the time this proxy received the update,
-// not the node's modelsObservedAt: that field is a sender clock that moves only
-// when the inventory changes, and suppression is stamped on the proxy's own
-// clock, so the two cannot be compared. The stamp is refreshed only when
-// modelsObservedAt differs from the previous snapshot's (or the node is new);
-// a re-sent snapshot for an unrelated change keeps the old stamp, so stale
-// "Loaded" data cannot lift a fresh not-loaded suppression.
+// not the node's modelsObservedAt: that is a sender clock, and suppression is
+// stamped on the proxy's own clock, so the two cannot be compared. The stamp is
+// refreshed only when modelsObservedAt differs from the previous snapshot's (or
+// the node is new). The node advances it on every successful sweep (with a
+// heartbeat), so a live node keeps a fresh stamp while a re-sent snapshot for
+// an unrelated change keeps the old one, and stale "Loaded" data cannot lift a
+// fresh not-loaded suppression.
 func (d *directoryCapacity) update(engine string, nodes []noderec.DirectoryNode) {
 	now := d.now()
 	d.mu.Lock()
