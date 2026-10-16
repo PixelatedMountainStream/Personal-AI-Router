@@ -441,3 +441,34 @@ func TestReservationsAreSharedAcrossFacades(t *testing.T) {
 		}
 	}
 }
+
+func localTieCandidates() []candidate {
+	return []candidate{{id: "a-remote"}, {id: "z-local", local: true}}
+}
+
+func localTieProxy(t *testing.T) *Proxy {
+	p := prProxy(t)
+	ids := []string{"a-remote", "z-local"}
+	applySnapshot(p, schedulerwire.Priority{Nodes: ids, Ranks: []schedulerwire.NodeRank{{ID: "a-remote", Rank: 0}, {ID: "z-local", Rank: 1}}})
+	return p
+}
+
+func TestReserveCandidate_IdleTiePrefersLocal(t *testing.T) {
+	p := localTieProxy(t)
+	if got := reservedID(p, localTieCandidates()); got != "z-local" {
+		t.Fatalf("chose %q, want local node", got)
+	}
+}
+
+func TestReserveCandidate_FullLocalYieldsToFreeRemote(t *testing.T) {
+	p := localTieProxy(t)
+	f := p.soleFacade()
+	p.priorityMu.Lock()
+	for range p.nodeSlots("z-local", f.profile.Name, "") {
+		p.takeLocked("z-local", f.profile.Name, "", false)
+	}
+	p.priorityMu.Unlock()
+	if got := reservedID(p, localTieCandidates()); got != "a-remote" {
+		t.Fatalf("chose %q, want remote with free slot", got)
+	}
+}
