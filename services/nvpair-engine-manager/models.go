@@ -8,9 +8,12 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"nvpair-shared/noderec"
 )
 
 // modelsTimeout bounds the whole engine:models sweep so one hung engine can't
@@ -39,11 +42,25 @@ const modelsTimeout = 5 * time.Second
 // loaded_models succeeds, a loaded name can appear here without a matching
 // ByEngine/Models entry until the next successful sweep. Its own omitempty drops
 // the whole map when no engine reports loaded state.
+//
+// SlotsByEngine carries typed per-slot capacity for each engine's loaded models
+// (engine -> model -> SlotInfo). It is populated only for engines declaring an
+// optional slots action that was queried successfully; a missing engine or model
+// means "capacity unknown", never "one slot".
 type ModelsResult struct {
-	Models         []string            `json:"models"`
-	ByEngine       map[string][]string `json:"modelsByEngine,omitempty"`
-	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+	Models         []string                       `json:"models"`
+	ByEngine       map[string][]string            `json:"modelsByEngine,omitempty"`
+	LoadedByEngine map[string][]string            `json:"loadedByEngine,omitempty"`
+	SlotsByEngine  map[string]map[string]SlotInfo `json:"slotsByEngine,omitempty"`
+	// JITLoadByEngine is whether each reporting engine loads a missing model on
+	// demand: the node-settings jit_load.<engine> override, else the engine
+	// default (noderec.DefaultJITLoad). Present only for engines that reported.
+	JITLoadByEngine map[string]bool `json:"jitLoadByEngine,omitempty"`
 }
+
+// SlotInfo is a loaded model's parallel capacity: concurrent request slots and
+// the context window each slot gets (0 when the engine does not report it).
+type SlotInfo = noderec.SlotInfo
 
 // Models returns the union of model names served by every installed, running
 // engine that declares a list_models action with a result-extraction spec —
@@ -80,6 +97,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 	listOK := make([]bool, len(engineNames))
 	loaded := make([][]string, len(engineNames))
 	loadedOK := make([]bool, len(engineNames))
+	slots := make([]map[string]SlotInfo, len(engineNames))
 	var wg sync.WaitGroup
 	for i, name := range engineNames {
 		mf, ok := e.reg.Get(name)
@@ -87,17 +105,21 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 			continue
 		}
 		var listSpec, loadedSpec *ActionResult
+		var slotsAct *Action
 		if act, ok := mf.Actions["list_models"]; ok {
 			listSpec = act.Result
 		}
 		if act, ok := mf.Actions["loaded_models"]; ok {
 			loadedSpec = act.Result
 		}
+		if act, ok := mf.Actions["slots"]; ok && act.Result != nil && act.Result.Record != nil {
+			slotsAct = &act
+		}
 		if listSpec == nil && loadedSpec == nil {
 			continue
 		}
 		wg.Add(1)
-		go func(i int, name string, listSpec, loadedSpec *ActionResult) {
+		go func(i int, name string, listSpec, loadedSpec *ActionResult, slotsAct *Action) {
 			defer wg.Done()
 			st, err := e.Status(name)
 			if err != nil || !st.Running {
@@ -126,7 +148,10 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 					slog.Debug("engine:models loaded_models returned an invalid inventory", "engine", name)
 				}
 			}
-		}(i, name, listSpec, loadedSpec)
+			if slotsAct != nil && loadedOK[i] {
+				slots[i] = e.querySlots(ctx, name, slotsAct, loaded[i])
+			}
+		}(i, name, listSpec, loadedSpec, slotsAct)
 	}
 	wg.Wait()
 
@@ -162,8 +187,160 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 			}
 			res.LoadedByEngine[engineNames[i]] = ld
 		}
+		if slots[i] != nil {
+			if res.SlotsByEngine == nil {
+				res.SlotsByEngine = make(map[string]map[string]SlotInfo)
+			}
+			res.SlotsByEngine[engineNames[i]] = slots[i]
+		}
 	}
+	res.applySettingsOverrides(e.settingsOverrides)
 	return res
+}
+
+// applySettingsOverrides merges node-settings engine overrides (slots, ctx per
+// slot for loaded models) into the result and resolves jit_load for every
+// engine that reported. A nil source still resolves the jit_load defaults.
+func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage) {
+	var raw map[string]json.RawMessage
+	if src != nil {
+		raw = src()
+	}
+	reported := map[string]bool{}
+	for n := range r.ByEngine {
+		reported[n] = true
+	}
+	for n := range r.LoadedByEngine {
+		reported[n] = true
+	}
+	names := make([]string, 0, len(reported))
+	for n := range reported {
+		names = append(names, n)
+	}
+	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, r.LoadedByEngine, r.SlotsByEngine)
+}
+
+// querySlots runs an engine's optional slots action and returns capacity keyed
+// by model, or nil when the engine could not be queried. An array-shaped spec is
+// one call; a query-shaped spec (empty Array) is one call per loaded model with
+// {"model": m}. A model whose capacity cannot be extracted is omitted.
+func (e *Executor) querySlots(ctx context.Context, engine string, act *Action, loaded []string) map[string]SlotInfo {
+	spec := act.Result
+	if spec.Array != "" {
+		raw, err := e.Action(ctx, engine, "slots", nil)
+		if err != nil {
+			slog.Debug("engine:models slots failed", "engine", engine, "err", err)
+			return nil
+		}
+		out, ok := extractRecords(raw, spec)
+		if !ok {
+			slog.Debug("engine:models slots returned an invalid response", "engine", engine)
+			return nil
+		}
+		return out
+	}
+	out := map[string]SlotInfo{}
+	for _, m := range loaded {
+		params, _ := json.Marshal(map[string]string{"model": m})
+		raw, err := e.Action(ctx, engine, "slots", params)
+		if err != nil {
+			slog.Debug("engine:models slots failed", "engine", engine, "model", m, "err", err)
+			continue
+		}
+		if si, ok := extractRecord(raw, spec.Record); ok {
+			out[m] = si
+		}
+	}
+	return out
+}
+
+// extractRecords builds a SlotInfo per row of the required top-level spec.Array,
+// keyed by the row's spec.Field string, honoring spec.Match. Rows whose capacity
+// cannot be extracted (missing or wrong-typed path) are skipped. A missing or
+// non-array spec.Array returns ok=false.
+func extractRecords(raw json.RawMessage, spec *ActionResult) (map[string]SlotInfo, bool) {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return nil, false
+	}
+	var arr []map[string]json.RawMessage
+	if err := json.Unmarshal(obj[spec.Array], &arr); err != nil || arr == nil {
+		return nil, false
+	}
+	out := map[string]SlotInfo{}
+	for _, el := range arr {
+		if spec.Match != nil && !matchRow(el, spec.Match) {
+			continue
+		}
+		var key string
+		if err := json.Unmarshal(el[spec.Field], &key); err != nil || key == "" {
+			continue
+		}
+		row, _ := json.Marshal(el)
+		if si, ok := extractRecord(row, spec.Record); ok {
+			out[key] = si
+		}
+	}
+	return out, true
+}
+
+// extractRecord builds one SlotInfo from raw. Slots (>= 1) is required; ctx is
+// optional, but a present ctx of the wrong type or negative invalidates the record.
+func extractRecord(raw json.RawMessage, rec *ResultRecord) (SlotInfo, bool) {
+	var si SlotInfo
+	slots, ok := recordInt(raw, rec, "slots")
+	if !ok || slots < 1 {
+		return SlotInfo{}, false
+	}
+	si.Slots = slots
+	if ctx, ok := recordInt(raw, rec, "ctx"); ok {
+		if ctx < 0 {
+			return SlotInfo{}, false
+		}
+		si.CtxPerSlot = ctx
+	} else if _, declared := rec.Fields["ctx"]; declared {
+		if _, present := resolveRecordPath(raw, rec.Fields["ctx"]); present {
+			return SlotInfo{}, false // present but not an integer
+		}
+	}
+	return si, true
+}
+
+func recordInt(raw json.RawMessage, rec *ResultRecord, key string) (int, bool) {
+	if path, ok := rec.Fields[key]; ok {
+		v, found := resolveRecordPath(raw, path)
+		var n int
+		if !found || json.Unmarshal(v, &n) != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	n, ok := rec.Static[key]
+	return n, ok
+}
+
+// resolveRecordPath walks a dot path through objects and, for numeric parts,
+// arrays.
+func resolveRecordPath(raw json.RawMessage, path string) (json.RawMessage, bool) {
+	cur := raw
+	for _, part := range strings.Split(path, ".") {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(cur, &obj) == nil {
+			v, ok := obj[part]
+			if !ok {
+				return nil, false
+			}
+			cur = v
+			continue
+		}
+		var arr []json.RawMessage
+		idx, err := strconv.Atoi(part)
+		if err != nil || idx < 0 || json.Unmarshal(cur, &arr) != nil || idx >= len(arr) {
+			return nil, false
+		}
+		cur = arr[idx]
+	}
+	return cur, true
 }
 
 // extractStrings is the value-only wrapper used by focused extractor tests.

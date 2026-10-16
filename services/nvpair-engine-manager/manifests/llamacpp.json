@@ -96,6 +96,11 @@
       "http": { "method": "GET", "path": "/models" },
       "result": { "array": "data", "field": "id", "match": { "field": "status.value", "in": ["loaded"] } }
     },
+    "slots": {
+      "description": "Per-slot capacity of one loaded model (params: {\"model\": \"<model>\"}, sent as a query parameter; autoload=false so a poll never reloads an unloaded model).",
+      "http": { "method": "GET", "path": "/props?autoload=false", "params_in": "query" },
+      "result": { "record": { "fields": { "slots": "total_slots", "ctx": "default_generation_settings.n_ctx" } } }
+    },
     "pull_model": {
       "description": "Download a model into the managed cache (params: {\"model\": \"<Hugging Face repo:quant>\"}).",
       "http": { "method": "POST", "path": "/models", "body_schema": { "model": "string" } },

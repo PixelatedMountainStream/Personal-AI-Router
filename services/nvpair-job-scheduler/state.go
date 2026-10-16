@@ -13,6 +13,7 @@ import (
 type workload struct {
 	ID             string `json:"id"`
 	Engine         string `json:"engine"`
+	Model          string `json:"model"`
 	RunID          string `json:"runId"`
 	State          string `json:"state"`
 	OriginatedFrom string `json:"originatedFrom"`

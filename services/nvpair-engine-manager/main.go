@@ -94,6 +94,7 @@ func main() {
 	reporter := NewReporter(codec)
 	emit := func(method string, params any) { _ = codec.Notify(method, params) }
 	exec := NewExecutor(reg, reporter, emit, installBase)
+	exec.settingsOverrides = settingsFileOverrides
 	if err := exec.SetReservedPort(*reservedPort); err != nil {
 		log.Fatalf("invalid --reserved-port: %v", err)
 	}

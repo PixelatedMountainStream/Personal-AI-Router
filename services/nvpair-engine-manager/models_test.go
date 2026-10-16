@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"testing"
 )
@@ -386,5 +388,112 @@ func TestSameStringSet(t *testing.T) {
 				t.Fatalf("sameStringSet(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestExtractRecords(t *testing.T) {
+	lm := &ActionResult{Array: "models", Field: "key", Record: &ResultRecord{Fields: map[string]string{
+		"slots": "loaded_instances.0.config.parallel", "ctx": "loaded_instances.0.config.context_length"}}}
+	oll := &ActionResult{Array: "models", Field: "name", Record: &ResultRecord{Static: map[string]int{"slots": 1}}}
+	llama := &ResultRecord{Fields: map[string]string{"slots": "total_slots", "ctx": "default_generation_settings.n_ctx"}}
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		spec *ActionResult
+		want map[string]SlotInfo
+	}{
+		{"lmstudio nested path", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":4,"context_length":131072}}]}]}`, lm,
+			map[string]SlotInfo{"a": {Slots: 4, CtxPerSlot: 131072}}},
+		{"lmstudio missing path", `{"models":[{"key":"a","loaded_instances":[]}]}`, lm, map[string]SlotInfo{}},
+		{"lmstudio wrong type", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":"4"}}]}]}`, lm, map[string]SlotInfo{}},
+		{"lmstudio bad ctx type", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":4,"context_length":"x"}}]}]}`, lm, map[string]SlotInfo{}},
+		{"ollama static", `{"models":[{"name":"q"}]}`, oll, map[string]SlotInfo{"q": {Slots: 1}}},
+		{"no array", `{"data":[]}`, oll, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := extractRecords(json.RawMessage(tc.raw), tc.spec)
+			if (tc.want != nil) != ok || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("extractRecords = %v,%v want %v", got, ok, tc.want)
+			}
+		})
+	}
+
+	// llama.cpp single-object shape.
+	if si, ok := extractRecord(json.RawMessage(`{"total_slots":2,"default_generation_settings":{"n_ctx":8192}}`), llama); !ok || si != (SlotInfo{Slots: 2, CtxPerSlot: 8192}) {
+		t.Fatalf("llamacpp = %v,%v", si, ok)
+	}
+	if _, ok := extractRecord(json.RawMessage(`{"default_generation_settings":{"n_ctx":8192}}`), llama); ok {
+		t.Fatal("missing total_slots must fail")
+	}
+}
+
+// TestBundledSlotsQueryThroughManifests drives ModelsResult through the bundled
+// llamacpp and ollama manifest specs against fake HTTP engines: llama.cpp
+// succeeds (and its /props poll must carry autoload=false so it never reloads
+// an unloaded 27B model), Ollama's /api/ps fails so its slots are omitted.
+func TestBundledSlotsQueryThroughManifests(t *testing.T) {
+	var propsQuery url.Values
+	llama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"m","status":{"value":"loaded"}}]}`))
+		case "/props":
+			propsQuery = r.URL.Query()
+			_, _ = w.Write([]byte(`{"total_slots":2,"default_generation_settings":{"n_ctx":8192}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer llama.Close()
+	oll := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/tags" {
+			_, _ = w.Write([]byte(`{"models":[{"name":"q"}]}`))
+			return
+		}
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer oll.Close()
+
+	set := bundledManifestSet(t)
+	reg := NewRegistry()
+	reg.engines["llamacpp"] = set["llamacpp"]
+	reg.engines["ollama"] = set["ollama"]
+	ex := NewExecutor(reg, NewReporter(nil), func(string, any) {}, t.TempDir())
+	for name, srv := range map[string]*httptest.Server{"llamacpp": llama, "ollama": oll} {
+		st, err := ex.state(name)
+		if err != nil {
+			t.Skipf("no host platform block for %s: %v", name, err)
+		}
+		u, _ := url.Parse(srv.URL)
+		_, _ = fmt.Sscanf(u.Port(), "%d", &st.port)
+		st.running = true
+	}
+
+	res := ex.ModelsResult(context.Background())
+	if want := map[string]map[string]SlotInfo{"llamacpp": {"m": {Slots: 2, CtxPerSlot: 8192}}}; !reflect.DeepEqual(res.SlotsByEngine, want) {
+		t.Fatalf("SlotsByEngine = %v, want %v (failing engine must be omitted)", res.SlotsByEngine, want)
+	}
+	if propsQuery.Get("autoload") != "false" || propsQuery.Get("model") != "m" {
+		t.Fatalf("/props query = %v, want autoload=false&model=m", propsQuery)
+	}
+}
+
+func TestApplySettingsOverrides(t *testing.T) {
+	r := ModelsResult{
+		ByEngine:       map[string][]string{"lmstudio": {"m"}, "ollama": {"q"}},
+		LoadedByEngine: map[string][]string{"lmstudio": {"m"}, "ollama": {}},
+	}
+	r.applySettingsOverrides(func() map[string]json.RawMessage {
+		return map[string]json.RawMessage{"engine_slots.lmstudio.m": json.RawMessage(`3`), "engine_slots.ollama.q": json.RawMessage(`2`)}
+	})
+	if r.SlotsByEngine["lmstudio"]["m"].Slots != 3 {
+		t.Errorf("override not applied: %v", r.SlotsByEngine)
+	}
+	if _, ok := r.SlotsByEngine["ollama"]; ok {
+		t.Errorf("override for a non-loaded model must not apply: %v", r.SlotsByEngine)
+	}
+	if r.JITLoadByEngine["lmstudio"] || !r.JITLoadByEngine["ollama"] {
+		t.Errorf("jit defaults = %v", r.JITLoadByEngine)
 	}
 }

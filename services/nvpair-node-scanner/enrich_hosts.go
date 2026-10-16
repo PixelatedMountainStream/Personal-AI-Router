@@ -16,6 +16,8 @@ type modelInventory struct {
 	models         []string
 	byEngine       map[string][]string
 	loadedByEngine map[string][]string
+	slotsByEngine  map[string]map[string]noderec.SlotInfo
+	jitByEngine    map[string]bool
 }
 
 // hostKey identifies one node's endpoint for one service. Node-info and the engine
