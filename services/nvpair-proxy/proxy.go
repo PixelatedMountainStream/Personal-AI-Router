@@ -843,6 +843,9 @@ type candidate struct {
 	id       string
 	url      *url.URL
 	peerUUID string
+	// local marks this host's own node (served from the loopback engine); it
+	// wins load ties ahead of scheduler order.
+	local bool
 }
 
 // candidateTransport returns the reverse-proxy / model-list transport for a
@@ -2136,6 +2139,7 @@ func (f *facade) resolveCandidatesN(model string) ([]candidate, int) {
 			return
 		}
 		peerUUID := ""
+		isLocal := false
 		switch {
 		case isSelfTarget(u, selfPort) || isAnyAliasSelfTarget(u, aliasBoundAddresses):
 			// Our own advertised endpoint (ol now points at this proxy). Serve
@@ -2148,6 +2152,7 @@ func (f *facade) resolveCandidatesN(model string) ([]candidate, int) {
 				return
 			}
 			u = lb
+			isLocal = true
 		case p.mesh.HasPin(n.ClusterUUID):
 			// A pinned cluster peer: reach it only over mTLS to its promoted
 			// proxy (the ol port now advertises the proxy, not the engine).
@@ -2185,6 +2190,7 @@ func (f *facade) resolveCandidatesN(model string) ([]candidate, int) {
 			id:       n.ID,
 			url:      u,
 			peerUUID: peerUUID,
+			local:    isLocal,
 		})
 	}
 
@@ -2476,14 +2482,15 @@ func (p *Proxy) occLocked(k inflightKey) int {
 
 // bestLocked returns the index of the best listed candidate not in tried and
 // accepted by ok: a node with a free slot, then lower occupancy per slot, then
-// lower GPU pressure (plus other engines' reservations), then scheduler order. When every node is full the key is
+// lower GPU pressure (plus other engines' reservations), then the local node,
+// then scheduler order. When every node is full the key is
 // the queue the request would join, (occ-slots+1)/slots.
 func (p *Proxy) bestLocked(engine, model string, cands []candidate, tried map[string]bool, ok func(string) bool) int {
 	index := make(map[string]int, len(cands))
 	for i, c := range cands {
 		index[c.id] = i
 	}
-	best, bestOrder, bestFull, bestGPU := -1, 0, false, 0
+	best, bestOrder, bestFull, bestGPU, bestLocal := -1, 0, false, 0, false
 	var bestQ float64
 	for order, id := range p.priority {
 		i, listed := index[id]
@@ -2500,10 +2507,12 @@ func (p *Proxy) bestLocked(engine, model string, cands []candidate, tried map[st
 		// Reservations through any engine's facade count as pressure: they
 		// share the GPU even though they do not share slots.
 		gpu := p.priorityGPUPressure[id] + p.priorityReservations[id]
+		local := cands[i].local
 		better := best < 0 || full != bestFull && !full || full == bestFull &&
-			(q < bestQ || q == bestQ && (gpu < bestGPU || gpu == bestGPU && order < bestOrder))
+			(q < bestQ || q == bestQ && (gpu < bestGPU || gpu == bestGPU &&
+				(local && !bestLocal || local == bestLocal && order < bestOrder)))
 		if better {
-			best, bestOrder, bestFull, bestGPU, bestQ = i, order, full, gpu, q
+			best, bestOrder, bestFull, bestGPU, bestQ, bestLocal = i, order, full, gpu, q, local
 		}
 	}
 	return best
