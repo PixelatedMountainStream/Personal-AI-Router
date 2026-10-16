@@ -388,3 +388,40 @@ func TestSameStringSet(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractRecords(t *testing.T) {
+	lm := &ActionResult{Array: "models", Field: "key", Record: &ResultRecord{Fields: map[string]string{
+		"slots": "loaded_instances.0.config.parallel", "ctx": "loaded_instances.0.config.context_length"}}}
+	oll := &ActionResult{Array: "models", Field: "name", Record: &ResultRecord{Static: map[string]int{"slots": 1}}}
+	llama := &ResultRecord{Fields: map[string]string{"slots": "total_slots", "ctx": "default_generation_settings.n_ctx"}}
+
+	for _, tc := range []struct {
+		name string
+		raw  string
+		spec *ActionResult
+		want map[string]SlotInfo
+	}{
+		{"lmstudio nested path", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":4,"context_length":131072}}]}]}`, lm,
+			map[string]SlotInfo{"a": {4, 131072}}},
+		{"lmstudio missing path", `{"models":[{"key":"a","loaded_instances":[]}]}`, lm, map[string]SlotInfo{}},
+		{"lmstudio wrong type", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":"4"}}]}]}`, lm, map[string]SlotInfo{}},
+		{"lmstudio bad ctx type", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":4,"context_length":"x"}}]}]}`, lm, map[string]SlotInfo{}},
+		{"ollama static", `{"models":[{"name":"q"}]}`, oll, map[string]SlotInfo{"q": {1, 0}}},
+		{"no array", `{"data":[]}`, oll, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := extractRecords(json.RawMessage(tc.raw), tc.spec)
+			if (tc.want != nil) != ok || !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("extractRecords = %v,%v want %v", got, ok, tc.want)
+			}
+		})
+	}
+
+	// llama.cpp single-object shape.
+	if si, ok := extractRecord(json.RawMessage(`{"total_slots":2,"default_generation_settings":{"n_ctx":8192}}`), llama); !ok || si != (SlotInfo{2, 8192}) {
+		t.Fatalf("llamacpp = %v,%v", si, ok)
+	}
+	if _, ok := extractRecord(json.RawMessage(`{"default_generation_settings":{"n_ctx":8192}}`), llama); ok {
+		t.Fatal("missing total_slots must fail")
+	}
+}

@@ -45,6 +45,8 @@ var allowedPlaceholders = map[string]bool{
 }
 
 var placeholderRe = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}`)
+var recordPathRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$`)
+
 var resultMatchFieldPathRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*(?:\.[a-zA-Z_][a-zA-Z0-9_-]*)*$`)
 var artifactNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 var sha256Re = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
@@ -293,6 +295,20 @@ type ActionResult struct {
 	// field) rather than returning a presence-only list (Ollama's /api/ps,
 	// every row of which is resident and so needs no Match).
 	Match *ResultMatch `json:"match,omitempty"`
+	// Record, when set, additionally extracts typed per-model capacity (see
+	// ResultRecord). With Array/Field set, every array row yields one record
+	// keyed by its Field. With both empty, the whole response is ONE record
+	// (a per-model query such as llama.cpp /props?model=).
+	Record *ResultRecord `json:"record,omitempty"`
+}
+
+// ResultRecord declares how to build a SlotInfo. Fields maps "slots" and "ctx"
+// to dot-separated paths, where a numeric part indexes an array (LM Studio's
+// "loaded_instances.0.config.parallel"). Static supplies "slots" and "ctx"
+// constants for engines that expose no endpoint (Ollama serves 1 slot).
+type ResultRecord struct {
+	Fields map[string]string `json:"fields,omitempty"`
+	Static map[string]int    `json:"static,omitempty"`
 }
 
 // ResultMatch is the optional row filter on an ActionResult. Exactly one of
@@ -919,7 +935,26 @@ func (a *Action) validate(name string) error {
 			return fmt.Errorf("action %q: unsupported progress_protocol %q", name, a.ProgressProtocol)
 		}
 	}
-	if a.Result != nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") {
+	if r := a.Result; r != nil && r.Record != nil {
+		if (strings.TrimSpace(r.Array) == "") != (strings.TrimSpace(r.Field) == "") {
+			return fmt.Errorf("action %q: result.array and result.field must both be set or both empty with result.record", name)
+		}
+		for k, path := range r.Record.Fields {
+			if (k != "slots" && k != "ctx") || !recordPathRe.MatchString(path) {
+				return fmt.Errorf("action %q: result.record.fields %q=%q invalid (keys slots|ctx, dot path)", name, k, path)
+			}
+		}
+		for k := range r.Record.Static {
+			if k != "slots" && k != "ctx" {
+				return fmt.Errorf("action %q: result.record.static key %q invalid (want slots or ctx)", name, k)
+			}
+		}
+		if _, ok := r.Record.Fields["slots"]; !ok {
+			if _, ok := r.Record.Static["slots"]; !ok {
+				return fmt.Errorf("action %q: result.record requires a slots field or static value", name)
+			}
+		}
+	} else if a.Result != nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") {
 		return fmt.Errorf("action %q: result.array and result.field are required when result is set", name)
 	}
 	if a.Result != nil && a.Result.Match != nil {
