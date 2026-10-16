@@ -26,11 +26,62 @@ func pick(p *Proxy, key string, ids ...string) (string, string) {
 	return out[0].id, d
 }
 
+// turn is a finished request: reserve, then release, so the slot is free again.
+func turn(p *Proxy, key string, ids ...string) (string, string) {
+	out, res, d := p.reserveCandidateKey(p.soleFacade(), reservationCandidates(ids...), key)
+	p.releaseReservation(res)
+	return out[0].id, d
+}
+
+// nodeSlotsFake serves fixed slot counts per node id.
+type nodeSlotsFake map[string]int
+
+func (f nodeSlotsFake) Slots(id, _, _ string) (int, bool) { n, ok := f[id]; return n, ok }
+
+func TestAffinity_SequentialTurnsAllHit(t *testing.T) {
+	p := affinityProxy(t, "a", "b")
+	first, _ := turn(p, "conv", "a", "b")
+	for i := 0; i < 5; i++ {
+		if got, d := turn(p, "conv", "a", "b"); got != first || d != affinityHit {
+			t.Fatalf("turn %d: %s/%s, want %s/hit", i, got, d, first)
+		}
+	}
+}
+
+func TestAffinity_YieldsToFreeNode(t *testing.T) {
+	p := affinityProxy(t, "a", "b")
+	first, _ := pick(p, "conv", "a", "b") // slot stays held
+	other := map[string]string{"a": "b", "b": "a"}[first]
+	if got, d := pick(p, "conv", "a", "b"); got != other || d != affinityYield {
+		t.Fatalf("got %s/%s, want %s/yield", got, d, other)
+	}
+	if got, d := turn(p, "conv", "a", "b"); got != other || d != affinityHit {
+		t.Fatalf("not rebound: %s/%s", got, d)
+	}
+}
+
+func TestAffinity_AllFullTolerance(t *testing.T) {
+	p := affinityProxy(t, "a", "b")
+	p.capacity = nodeSlotsFake{"a": 1, "b": 1}
+	bound, _ := pick(p, "conv", "a", "b")
+	other := map[string]string{"a": "b", "b": "a"}[bound]
+	pick(p, "x", "a", "b") // fills the other node
+	// 1 vs 1: within tolerance, stay on the bound node.
+	if got, d := pick(p, "conv", "a", "b"); got != bound || d != affinityHit {
+		t.Fatalf("within tolerance: %s/%s", got, d)
+	}
+	// Bound now holds 2 against 1 on the other: 2 <= 1+1 still stays.
+	pick(p, "conv", "a", "b")
+	// 3 against 1 is outside the tolerance: go to the shorter queue.
+	if got, d := pick(p, "conv", "a", "b"); got != other || d != affinityRebind {
+		t.Fatalf("outside tolerance: %s/%s, want %s/rebind", got, d, other)
+	}
+}
+
 func TestAffinity_SameKeyStaysOnNode(t *testing.T) {
 	p := affinityProxy(t, "a", "b")
-	first, d1 := pick(p, "conv-1", "a", "b")
-	// Load now favors the other node, but the bound one must still win.
-	second, d2 := pick(p, "conv-1", "a", "b")
+	first, d1 := turn(p, "conv-1", "a", "b")
+	second, d2 := turn(p, "conv-1", "a", "b")
 	if first != second || d1 != affinityMiss || d2 != affinityHit {
 		t.Fatalf("got %s/%s then %s/%s", first, d1, second, d2)
 	}
@@ -84,13 +135,13 @@ func TestAffinity_TTLExpiryAndRefresh(t *testing.T) {
 	p := affinityProxy(t, "a", "b")
 	now := time.Unix(1000, 0)
 	p.affinity.now = func() time.Time { return now }
-	pick(p, "k", "a", "b")
+	turn(p, "k", "a", "b")
 	now = now.Add(affinityTTL - time.Second)
-	if _, d := pick(p, "k", "a", "b"); d != affinityHit {
+	if _, d := turn(p, "k", "a", "b"); d != affinityHit {
 		t.Fatalf("within TTL: %s", d)
 	}
 	now = now.Add(affinityTTL - time.Second) // refreshed by the hit above
-	if _, d := pick(p, "k", "a", "b"); d != affinityHit {
+	if _, d := turn(p, "k", "a", "b"); d != affinityHit {
 		t.Fatalf("TTL not refreshed on use: %s", d)
 	}
 	now = now.Add(affinityTTL + time.Second)

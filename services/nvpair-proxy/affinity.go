@@ -17,9 +17,10 @@ const (
 
 // Affinity decisions reported in the per-request log.
 const (
-	affinityHit    = "hit"    // bound node was still eligible and was reused
+	affinityHit    = "hit"    // bound node was eligible with a free slot (or not worse than all-full peers)
 	affinityMiss   = "miss"   // key not seen before; bound to the load-picked node
 	affinityRebind = "rebind" // bound node unusable; fell back and rebound
+	affinityYield  = "yield"  // bound node full while another was free; moved
 )
 
 type affinityEntry struct {
