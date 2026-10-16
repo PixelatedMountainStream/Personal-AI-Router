@@ -113,6 +113,10 @@ type daemon struct {
 	// and jit_load flags from the same fetch, with the same reuse-on-miss role.
 	lastSlotsByEngine map[string]map[string]map[string]noderec.SlotInfo
 	lastJITByEngine   map[string]map[string]bool
+	// lastModelsObservedAt caches when (Unix ms) the last successful models
+	// fetch for a node completed, restored on enrichment fallback and migrated
+	// with the other caches on a host-UUID change.
+	lastModelsObservedAt map[string]int64
 	// nodeInfoDown holds the nodes whose last node-info enrichment failed, so
 	// the outage is reported when it starts and when it ends rather than once
 	// per sweep. Guarded by infoMu with the caches it explains: the reason a
@@ -839,6 +843,10 @@ func (d *daemon) dropSelf(oldHostUUID, newHostUUID string) {
 	if jit, ok := d.lastJITByEngine[oldHostUUID]; ok {
 		d.lastJITByEngine[newHostUUID] = jit
 	}
+	if at, ok := d.lastModelsObservedAt[oldHostUUID]; ok {
+		d.lastModelsObservedAt[newHostUUID] = at
+	}
+	delete(d.lastModelsObservedAt, oldHostUUID)
 	delete(d.lastSlotsByEngine, oldHostUUID)
 	delete(d.lastJITByEngine, oldHostUUID)
 	delete(d.lastInfo, oldHostUUID)
@@ -1366,7 +1374,10 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
 		d.lastModelsByEngine[node.HostUUID] = inventory.byEngine
 		d.lastLoadedByEngine[node.HostUUID] = inventory.loadedByEngine
 		d.setSlotCaches(node.HostUUID, inventory)
+		observed := time.Now().UnixMilli()
+		d.setObservedAt(node.HostUUID, observed)
 		d.infoMu.Unlock()
+		node.ModelsObservedAt = observed
 		node.Models = inventory.models
 		node.ModelsByEngine = inventory.byEngine
 		node.LoadedByEngine = inventory.loadedByEngine
@@ -1380,8 +1391,10 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
 	cachedLoaded := d.lastLoadedByEngine[node.HostUUID]
 	cachedSlots := d.lastSlotsByEngine[node.HostUUID]
 	cachedJIT := d.lastJITByEngine[node.HostUUID]
+	cachedObserved := d.lastModelsObservedAt[node.HostUUID]
 	d.infoMu.Unlock()
 	if had {
+		node.ModelsObservedAt = cachedObserved
 		node.SlotsByEngine = cachedSlots
 		node.JITLoadByEngine = cachedJIT
 		node.Models = cached
@@ -1858,9 +1871,11 @@ func (d *daemon) refreshNodeModelsCandidates(hostUUID, guardIP string, hosts []s
 	d.lastModelsByEngine[hostUUID] = inventory.byEngine
 	d.lastLoadedByEngine[hostUUID] = inventory.loadedByEngine
 	d.setSlotCaches(hostUUID, inventory)
+	observed := time.Now().UnixMilli()
+	d.setObservedAt(hostUUID, observed)
 	d.infoMu.Unlock()
 
-	node, changed, valid := d.dir.applyModels(hostUUID, guardIP, emPort, inventory)
+	node, changed, valid := d.dir.applyModels(hostUUID, guardIP, emPort, inventory, observed)
 	if !valid {
 		return false
 	}
@@ -1868,6 +1883,15 @@ func (d *daemon) refreshNodeModelsCandidates(hostUUID, guardIP string, hosts []s
 		d.emit(noderec.NotifyNodeUpdated, node)
 	}
 	return changed
+}
+
+// setObservedAt records when a node's models fetch last succeeded. The caller
+// holds infoMu.
+func (d *daemon) setObservedAt(hostUUID string, at int64) {
+	if d.lastModelsObservedAt == nil {
+		d.lastModelsObservedAt = make(map[string]int64)
+	}
+	d.lastModelsObservedAt[hostUUID] = at
 }
 
 // setSlotCaches records a node's slot capacity and jit_load flags. The caller
@@ -1895,6 +1919,7 @@ func (d *daemon) forget(hostUUID string) {
 	delete(d.lastLoadedByEngine, hostUUID)
 	delete(d.lastSlotsByEngine, hostUUID)
 	delete(d.lastJITByEngine, hostUUID)
+	delete(d.lastModelsObservedAt, hostUUID)
 	delete(d.nodeInfoDown, hostUUID)
 	d.infoMu.Unlock()
 	d.activityMu.Lock()

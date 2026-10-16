@@ -445,7 +445,7 @@ func TestApplyModelsGuard(t *testing.T) {
 	d := newDirectory()
 
 	// Removed mid-sweep: node absent -> not resurrected.
-	if _, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, modelInventory{models: []string{"a"}}); ok || changed {
+	if _, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, modelInventory{models: []string{"a"}}, 1); ok || changed {
 		t.Errorf("applyModels on an absent node = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	if _, present := d.get("ghost"); present {
@@ -459,11 +459,11 @@ func TestApplyModelsGuard(t *testing.T) {
 		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
 		Models:   []string{"old"},
 	})
-	if _, changed, ok := d.applyModels("peer-E", "127.0.0.1", 14322, modelInventory{models: []string{"new"}}); ok || changed {
+	if _, changed, ok := d.applyModels("peer-E", "127.0.0.1", 14322, modelInventory{models: []string{"new"}}, 1); ok || changed {
 		t.Errorf("applyModels with a stale IP = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	// em port changed -> also discarded.
-	if _, changed, ok := d.applyModels("peer-E", "10.0.0.9", 99999, modelInventory{models: []string{"new"}}); ok || changed {
+	if _, changed, ok := d.applyModels("peer-E", "10.0.0.9", 99999, modelInventory{models: []string{"new"}}, 1); ok || changed {
 		t.Errorf("applyModels with a stale em port = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	got, _ := d.get("peer-E")
@@ -576,5 +576,23 @@ func TestRefreshSlotChangeReportsChange(t *testing.T) {
 	stub.set(http.StatusOK, body(4, true))
 	if !d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
 		t.Error("a jit_load change must report a change")
+	}
+}
+
+// TestApplyModelsObservedAtHeartbeat: an identical sweep republishes a fresher
+// ModelsObservedAt only once it is a heartbeat ahead; sooner it is silent.
+func TestApplyModelsObservedAtHeartbeat(t *testing.T) {
+	d := newDirectory()
+	d.upsert(noderec.DirectoryNode{
+		HostUUID: "p", IP: "10.0.0.9", Models: []string{"a"}, ModelsObservedAt: 1000,
+		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
+	})
+	inv := modelInventory{models: []string{"a"}}
+	if _, changed, ok := d.applyModels("p", "10.0.0.9", 14322, inv, 2000); changed || !ok {
+		t.Fatalf("sweep inside heartbeat: changed=%v ok=%v", changed, ok)
+	}
+	n, changed, _ := d.applyModels("p", "10.0.0.9", 14322, inv, 1000+modelsObservedHeartbeat.Milliseconds())
+	if !changed || n.ModelsObservedAt != 1000+modelsObservedHeartbeat.Milliseconds() {
+		t.Fatalf("sweep past heartbeat: changed=%v at=%d", changed, n.ModelsObservedAt)
 	}
 }

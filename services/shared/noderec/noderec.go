@@ -526,10 +526,12 @@ type DirectoryNode struct {
 	// default (see DefaultJITLoad). A missing engine key means the peer did not
 	// say; treat as the engine default.
 	JITLoadByEngine map[string]bool `json:"jitLoadByEngine,omitempty"`
-	// ModelsObservedAt is when (Unix milliseconds) the model inventory fields
-	// above last changed in the scanner's sweep. Unchanged sweeps do not move it,
-	// so it is the time the current residency picture was first observed, not a
-	// heartbeat. 0 when never set (older peers).
+	// ModelsObservedAt is when (Unix milliseconds) the scanner last completed a
+	// successful models fetch for this node, whether or not the inventory
+	// changed. An unchanged sweep advances it only once it is 30s ahead of the
+	// published value, so it is a bounded-staleness heartbeat (<= ~30s plus a
+	// sweep behind the true last fetch), not a per-sweep value. 0 when never set
+	// (older peers).
 	ModelsObservedAt int64 `json:"modelsObservedAt,omitempty"`
 	LastSeen         int64 `json:"lastSeen"` // Unix seconds
 }

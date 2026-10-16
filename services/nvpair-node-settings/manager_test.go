@@ -912,3 +912,14 @@ func TestEngineOverrideRoundTrip(t *testing.T) {
 		t.Fatalf("after remove = %v", got)
 	}
 }
+
+func TestValidEngineOverrideRejectsBadKeyOnRemove(t *testing.T) {
+	for _, k := range []string{"", "bogus", "engine_slots.", "engine_slots.x", "jit_load."} {
+		if validEngineOverride(k, nil) || validEngineOverride(k, json.RawMessage("null")) {
+			t.Errorf("malformed key %q accepted for removal", k)
+		}
+	}
+	if !validEngineOverride("engine_slots.ollama.q", json.RawMessage("null")) || !validEngineOverride("jit_load.ollama", nil) {
+		t.Error("well-formed key must be removable")
+	}
+}

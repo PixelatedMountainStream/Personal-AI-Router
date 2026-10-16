@@ -529,18 +529,19 @@ func (m *Manager) handleMessage(msg *Message) {
 // (null/absent means "remove") has its type: positive integer for the slot and
 // ctx keys, bool for jit_load.
 func validEngineOverride(key string, value json.RawMessage) bool {
-	if len(value) == 0 || string(value) == "null" {
-		return key != ""
-	}
+	remove := len(value) == 0 || string(value) == "null"
 	if rest, ok := strings.CutPrefix(key, noderec.SettingJITLoad); ok {
 		var b bool
-		return rest != "" && json.Unmarshal(value, &b) == nil
+		return rest != "" && (remove || json.Unmarshal(value, &b) == nil)
 	}
 	for _, prefix := range []string{noderec.SettingEngineSlots, noderec.SettingEngineCtxPerSlot} {
 		if rest, ok := strings.CutPrefix(key, prefix); ok {
 			engine, model, ok := strings.Cut(rest, ".")
+			if !ok || engine == "" || model == "" {
+				return false
+			}
 			var n int
-			return ok && engine != "" && model != "" && json.Unmarshal(value, &n) == nil && n > 0
+			return remove || (json.Unmarshal(value, &n) == nil && n > 0)
 		}
 	}
 	return false

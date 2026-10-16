@@ -225,6 +225,10 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 	return out
 }
 
+// modelsObservedHeartbeat bounds how often an unchanged inventory republishes a
+// fresher ModelsObservedAt.
+const modelsObservedHeartbeat = 30 * time.Second
+
 // applyModels atomically reconciles one node's model inventory from a completed
 // /v1/models fetch, guarded against a node that was removed or re-addressed
 // while the fetch was in flight. It is the periodic refresh loop's write path
@@ -242,7 +246,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 // Returns the (possibly updated) node, whether the inventory changed, and
 // whether the guarded apply was valid. ok == false means the result is stale
 // (node gone or re-addressed) and the caller must not cache or emit it.
-func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory) (node noderec.DirectoryNode, changed, ok bool) {
+func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory, observedAt int64) (node noderec.DirectoryNode, changed, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n, present := d.nodes[hostUUID]
@@ -255,14 +259,22 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInvent
 	}
 	if sameStringSet(n.Models, inv.models) && sameByEngine(n.ModelsByEngine, inv.byEngine) && sameByEngine(n.LoadedByEngine, inv.loadedByEngine) &&
 		reflect.DeepEqual(n.SlotsByEngine, inv.slotsByEngine) && reflect.DeepEqual(n.JITLoadByEngine, inv.jitByEngine) {
-		return n, false, true
+		// Identical inventory: still a fresh successful observation. Publish the
+		// newer time only once it is modelsObservedHeartbeat ahead of the stored
+		// one, so steady sweeps do not churn the directory on every pass.
+		if observedAt-n.ModelsObservedAt < modelsObservedHeartbeat.Milliseconds() {
+			return n, false, true
+		}
+		n.ModelsObservedAt = observedAt
+		d.nodes[hostUUID] = n
+		return n, true, true
 	}
 	n.Models = inv.models
 	n.ModelsByEngine = inv.byEngine
 	n.LoadedByEngine = inv.loadedByEngine
 	n.SlotsByEngine = inv.slotsByEngine
 	n.JITLoadByEngine = inv.jitByEngine
-	n.ModelsObservedAt = time.Now().UnixMilli()
+	n.ModelsObservedAt = observedAt
 	d.nodes[hostUUID] = n
 	return n, true, true
 }

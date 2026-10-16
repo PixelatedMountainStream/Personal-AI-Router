@@ -471,7 +471,7 @@ func TestBundledSlotsQueryThroughManifests(t *testing.T) {
 	}
 
 	res := ex.ModelsResult(context.Background())
-	if want := map[string]map[string]SlotInfo{"llamacpp": {"m": {2, 8192}}}; !reflect.DeepEqual(res.SlotsByEngine, want) {
+	if want := map[string]map[string]SlotInfo{"llamacpp": {"m": {Slots: 2, CtxPerSlot: 8192}}}; !reflect.DeepEqual(res.SlotsByEngine, want) {
 		t.Fatalf("SlotsByEngine = %v, want %v (failing engine must be omitted)", res.SlotsByEngine, want)
 	}
 	if propsQuery.Get("autoload") != "false" || propsQuery.Get("model") != "m" {
