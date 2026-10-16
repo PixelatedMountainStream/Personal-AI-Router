@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -237,11 +238,14 @@ func (e *Executor) querySlots(ctx context.Context, engine string, act *Action, l
 // non-array spec.Array returns ok=false.
 // expandInstances splits each row into one row per entry of spec.Each, with
 // spec.Field set to the instance's id and loaded_instances narrowed to it. The
-// row's size_bytes describes only the selected variant, so it is kept only for
-// the instance whose id equals the key and dropped (unknown) otherwise.
-func expandInstances(arr []map[string]json.RawMessage, spec *ActionResult) []map[string]json.RawMessage {
+// row's size_bytes describes only the selected variant; a sibling instance
+// (id != key) keeps it only as a conservative upper bound, so a sibling of a
+// large key is never mistaken for a small model. With no key size, the sibling's
+// size stays unknown. An instance with a missing or invalid id is an error when
+// strict, and skipped otherwise.
+func expandInstances(arr []map[string]json.RawMessage, spec *ActionResult, strict bool) ([]map[string]json.RawMessage, error) {
 	if spec.Each == "" {
-		return arr
+		return arr, nil
 	}
 	idf := spec.EachField
 	if idf == "" {
@@ -254,13 +258,13 @@ func expandInstances(arr []map[string]json.RawMessage, spec *ActionResult) []map
 			out = append(out, el)
 			continue
 		}
-		var key string
-		_ = json.Unmarshal(el[spec.Field], &key)
 		for _, in := range insts {
 			var m map[string]json.RawMessage
 			var id string
 			if json.Unmarshal(in, &m) != nil || json.Unmarshal(m[idf], &id) != nil || id == "" {
-				out = append(out, el) // unclassifiable instance: keep the row
+				if strict {
+					return nil, errors.New("loaded instance has a missing or invalid id")
+				}
 				continue
 			}
 			c := map[string]json.RawMessage{}
@@ -269,13 +273,10 @@ func expandInstances(arr []map[string]json.RawMessage, spec *ActionResult) []map
 			}
 			c[spec.Field], _ = json.Marshal(id)
 			c[spec.Each], _ = json.Marshal([]json.RawMessage{in})
-			if id != key {
-				delete(c, "size_bytes")
-			}
 			out = append(out, c)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func extractRecords(raw json.RawMessage, spec *ActionResult) (map[string]SlotInfo, bool) {
@@ -288,7 +289,8 @@ func extractRecords(raw json.RawMessage, spec *ActionResult) (map[string]SlotInf
 		return nil, false
 	}
 	out := map[string]SlotInfo{}
-	for _, el := range expandInstances(arr, spec) {
+	rows, _ := expandInstances(arr, spec, false)
+	for _, el := range rows {
 		if spec.Match != nil && !matchRow(el, spec.Match) {
 			continue
 		}
@@ -404,6 +406,7 @@ func extractStringsResult(raw json.RawMessage, spec *ActionResult) ([]string, bo
 		return nil, false
 	}
 	out := make([]string, 0)
+	arr, _ = expandInstances(arr, spec, false)
 	for _, el := range arr {
 		if spec.Match != nil && !matchRow(el, spec.Match) {
 			continue
