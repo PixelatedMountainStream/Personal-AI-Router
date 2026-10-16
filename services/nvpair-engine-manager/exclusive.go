@@ -221,7 +221,11 @@ func extractResidency(raw json.RawMessage, spec *ActionResult) (loaded, loading 
 		return nil, nil, fmt.Errorf("missing or invalid %q array", spec.Array)
 	}
 	loaded = []string{}
-	for i, el := range expandInstances(arr, spec) {
+	rows, err := expandInstances(arr, spec, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	for i, el := range rows {
 		if spec.Match != nil {
 			match, ok := classifyRow(el, spec.Match)
 			if !ok {

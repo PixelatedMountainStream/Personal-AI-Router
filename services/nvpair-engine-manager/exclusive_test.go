@@ -370,4 +370,31 @@ func TestLMStudioInstancesAreResidentAndVictims(t *testing.T) {
 			}
 		})
 	}
+
+	loadedSpec, sizeSpec, slotSpec := mf.Actions["loaded_models"].Result, mf.Actions["model_sizes"].Result, mf.Actions["slots"].Result
+	t.Run("P1 sibling with 8b name is large", func(t *testing.T) {
+		raw := json.RawMessage(`{"models":[{"key":"qwen/qwen3.8-27b","size_bytes":16081678492,"loaded_instances":[` +
+			inst("qwen/qwen3.8-27b", 4) + `,` + inst("model-8b:2", 4) + `]}]}`)
+		sizes, _ := extractRecords(raw, sizeSpec)
+		if !isLargeModel(sizes["model-8b:2"].Bytes, "model-8b:2", 12*gib) {
+			t.Fatalf("sibling classified small: %v", sizes)
+		}
+	})
+	t.Run("P3 missing id fails closed", func(t *testing.T) {
+		raw := json.RawMessage(`{"models":[{"key":"k","loaded_instances":[` + inst("k", 4) + `,{"config":{}}]}]}`)
+		if _, err := extractLoadedStrict(raw, loadedSpec); err == nil {
+			t.Fatal("unidentifiable instance must fail closed")
+		}
+		if got, ok := extractStringsResult(raw, loadedSpec); !ok || len(got) != 1 || got[0] != "k" {
+			t.Fatalf("non-strict should skip it: %v %v", got, ok)
+		}
+	})
+	t.Run("P2 alias in loaded list with matching slots", func(t *testing.T) {
+		raw := json.RawMessage(`{"models":[{"key":"K","loaded_instances":[` + inst("alias", 3) + `]}]}`)
+		got, ok := extractStringsResult(raw, loadedSpec)
+		slots, _ := extractRecords(raw, slotSpec)
+		if !ok || len(got) != 1 || got[0] != "alias" || slots["alias"].Slots != 3 {
+			t.Fatalf("loaded=%v slots=%v", got, slots)
+		}
+	})
 }
