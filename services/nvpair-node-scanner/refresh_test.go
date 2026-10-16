@@ -445,7 +445,7 @@ func TestApplyModelsGuard(t *testing.T) {
 	d := newDirectory()
 
 	// Removed mid-sweep: node absent -> not resurrected.
-	if _, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, []string{"a"}, nil, nil); ok || changed {
+	if _, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, modelInventory{models: []string{"a"}}); ok || changed {
 		t.Errorf("applyModels on an absent node = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	if _, present := d.get("ghost"); present {
@@ -459,11 +459,11 @@ func TestApplyModelsGuard(t *testing.T) {
 		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
 		Models:   []string{"old"},
 	})
-	if _, changed, ok := d.applyModels("peer-E", "127.0.0.1", 14322, []string{"new"}, nil, nil); ok || changed {
+	if _, changed, ok := d.applyModels("peer-E", "127.0.0.1", 14322, modelInventory{models: []string{"new"}}); ok || changed {
 		t.Errorf("applyModels with a stale IP = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	// em port changed -> also discarded.
-	if _, changed, ok := d.applyModels("peer-E", "10.0.0.9", 99999, []string{"new"}, nil, nil); ok || changed {
+	if _, changed, ok := d.applyModels("peer-E", "10.0.0.9", 99999, modelInventory{models: []string{"new"}}); ok || changed {
 		t.Errorf("applyModels with a stale em port = (changed %v, ok %v), want (false, false)", changed, ok)
 	}
 	got, _ := d.get("peer-E")
@@ -541,5 +541,40 @@ func TestRefreshOnceConcurrentSlowPeers(t *testing.T) {
 	}
 	if got, _ := d.dir.get("peer-2"); !reflect.DeepEqual(got.Models, []string{"m"}) {
 		t.Errorf("peer-2 Models = %v, want [m]", got.Models)
+	}
+}
+
+// TestRefreshSlotChangeReportsChange: a slots-only or jit-only change (same
+// models, same loaded set) is a directory change; an identical one is not.
+func TestRefreshSlotChangeReportsChange(t *testing.T) {
+	d := newRefreshTestDaemon()
+	body := func(slots int, jit bool) map[string]any {
+		return map[string]any{
+			"models":          []string{"a"},
+			"modelsByEngine":  map[string][]string{"lmstudio": {"a"}},
+			"loadedByEngine":  map[string][]string{"lmstudio": {"a"}},
+			"slotsByEngine":   map[string]map[string]map[string]int{"lmstudio": {"a": {"slots": slots, "ctxPerSlot": 4096}}},
+			"jitLoadByEngine": map[string]bool{"lmstudio": jit},
+		}
+	}
+	stub, port := startModelsStub(t, http.StatusOK, body(2, false))
+	seedEMNode(d, "peer-S", "127.0.0.1", port)
+	if !d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
+		t.Fatal("initial populate should report a change")
+	}
+	got, _ := d.dir.get("peer-S")
+	if si := got.SlotsByEngine["lmstudio"]["a"]; si.Slots != 2 || si.CtxPerSlot != 4096 || got.JITLoadByEngine["lmstudio"] {
+		t.Fatalf("slots/jit not populated: %+v %+v", got.SlotsByEngine, got.JITLoadByEngine)
+	}
+	if d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
+		t.Error("identical slots should not report a change")
+	}
+	stub.set(http.StatusOK, body(4, false))
+	if !d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
+		t.Error("a slot-count change must report a change")
+	}
+	stub.set(http.StatusOK, body(4, true))
+	if !d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
+		t.Error("a jit_load change must report a change")
 	}
 }

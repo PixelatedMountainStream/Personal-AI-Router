@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nvpair-shared/noderec"
 )
 
 // modelsTimeout bounds the whole engine:models sweep so one hung engine can't
@@ -50,14 +52,15 @@ type ModelsResult struct {
 	ByEngine       map[string][]string            `json:"modelsByEngine,omitempty"`
 	LoadedByEngine map[string][]string            `json:"loadedByEngine,omitempty"`
 	SlotsByEngine  map[string]map[string]SlotInfo `json:"slotsByEngine,omitempty"`
+	// JITLoadByEngine is whether each reporting engine loads a missing model on
+	// demand: the node-settings jit_load.<engine> override, else the engine
+	// default (noderec.DefaultJITLoad). Present only for engines that reported.
+	JITLoadByEngine map[string]bool `json:"jitLoadByEngine,omitempty"`
 }
 
 // SlotInfo is a loaded model's parallel capacity: concurrent request slots and
 // the context window each slot gets (0 when the engine does not report it).
-type SlotInfo struct {
-	Slots      int `json:"slots"`
-	CtxPerSlot int `json:"ctxPerSlot,omitempty"`
-}
+type SlotInfo = noderec.SlotInfo
 
 // Models returns the union of model names served by every installed, running
 // engine that declares a list_models action with a result-extraction spec —
@@ -191,7 +194,30 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 			res.SlotsByEngine[engineNames[i]] = slots[i]
 		}
 	}
+	res.applySettingsOverrides(e.settingsOverrides)
 	return res
+}
+
+// applySettingsOverrides merges node-settings engine overrides (slots, ctx per
+// slot for loaded models) into the result and resolves jit_load for every
+// engine that reported. A nil source still resolves the jit_load defaults.
+func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage) {
+	var raw map[string]json.RawMessage
+	if src != nil {
+		raw = src()
+	}
+	reported := map[string]bool{}
+	for n := range r.ByEngine {
+		reported[n] = true
+	}
+	for n := range r.LoadedByEngine {
+		reported[n] = true
+	}
+	names := make([]string, 0, len(reported))
+	for n := range reported {
+		names = append(names, n)
+	}
+	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, r.LoadedByEngine, r.SlotsByEngine)
 }
 
 // querySlots runs an engine's optional slots action and returns capacity keyed

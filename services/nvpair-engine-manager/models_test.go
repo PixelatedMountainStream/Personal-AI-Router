@@ -404,11 +404,11 @@ func TestExtractRecords(t *testing.T) {
 		want map[string]SlotInfo
 	}{
 		{"lmstudio nested path", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":4,"context_length":131072}}]}]}`, lm,
-			map[string]SlotInfo{"a": {4, 131072}}},
+			map[string]SlotInfo{"a": {Slots: 4, CtxPerSlot: 131072}}},
 		{"lmstudio missing path", `{"models":[{"key":"a","loaded_instances":[]}]}`, lm, map[string]SlotInfo{}},
 		{"lmstudio wrong type", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":"4"}}]}]}`, lm, map[string]SlotInfo{}},
 		{"lmstudio bad ctx type", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":4,"context_length":"x"}}]}]}`, lm, map[string]SlotInfo{}},
-		{"ollama static", `{"models":[{"name":"q"}]}`, oll, map[string]SlotInfo{"q": {1, 0}}},
+		{"ollama static", `{"models":[{"name":"q"}]}`, oll, map[string]SlotInfo{"q": {Slots: 1}}},
 		{"no array", `{"data":[]}`, oll, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -420,7 +420,7 @@ func TestExtractRecords(t *testing.T) {
 	}
 
 	// llama.cpp single-object shape.
-	if si, ok := extractRecord(json.RawMessage(`{"total_slots":2,"default_generation_settings":{"n_ctx":8192}}`), llama); !ok || si != (SlotInfo{2, 8192}) {
+	if si, ok := extractRecord(json.RawMessage(`{"total_slots":2,"default_generation_settings":{"n_ctx":8192}}`), llama); !ok || si != (SlotInfo{Slots: 2, CtxPerSlot: 8192}) {
 		t.Fatalf("llamacpp = %v,%v", si, ok)
 	}
 	if _, ok := extractRecord(json.RawMessage(`{"default_generation_settings":{"n_ctx":8192}}`), llama); ok {
@@ -476,5 +476,24 @@ func TestBundledSlotsQueryThroughManifests(t *testing.T) {
 	}
 	if propsQuery.Get("autoload") != "false" || propsQuery.Get("model") != "m" {
 		t.Fatalf("/props query = %v, want autoload=false&model=m", propsQuery)
+	}
+}
+
+func TestApplySettingsOverrides(t *testing.T) {
+	r := ModelsResult{
+		ByEngine:       map[string][]string{"lmstudio": {"m"}, "ollama": {"q"}},
+		LoadedByEngine: map[string][]string{"lmstudio": {"m"}, "ollama": {}},
+	}
+	r.applySettingsOverrides(func() map[string]json.RawMessage {
+		return map[string]json.RawMessage{"engine_slots.lmstudio.m": json.RawMessage(`3`), "engine_slots.ollama.q": json.RawMessage(`2`)}
+	})
+	if r.SlotsByEngine["lmstudio"]["m"].Slots != 3 {
+		t.Errorf("override not applied: %v", r.SlotsByEngine)
+	}
+	if _, ok := r.SlotsByEngine["ollama"]; ok {
+		t.Errorf("override for a non-loaded model must not apply: %v", r.SlotsByEngine)
+	}
+	if r.JITLoadByEngine["lmstudio"] || !r.JITLoadByEngine["ollama"] {
+		t.Errorf("jit defaults = %v", r.JITLoadByEngine)
 	}
 }

@@ -92,6 +92,9 @@ type Executor struct {
 	// notification path. See progress.go.
 	progress *progressHub
 	baseDir  string // user-scoped install base
+	// settingsOverrides returns the flat node-settings engine overrides
+	// (engine_slots.*, engine_ctx_per_slot.*, jit_load.*); nil means none.
+	settingsOverrides func() map[string]json.RawMessage
 	// desired persists explicit per-engine ON/OFF intent. Runtime state remains
 	// in-memory; shutdown cleanup must not rewrite this store.
 	desired *desiredStateStore

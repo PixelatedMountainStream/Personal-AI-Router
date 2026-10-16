@@ -5,6 +5,7 @@ package main
 
 import (
 	"log/slog"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -241,7 +242,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 // Returns the (possibly updated) node, whether the inventory changed, and
 // whether the guarded apply was valid. ok == false means the result is stale
 // (node gone or re-addressed) and the caller must not cache or emit it.
-func (d *directory) applyModels(hostUUID, ip string, emPort int, models []string, byEngine, loadedByEngine map[string][]string) (node noderec.DirectoryNode, changed, ok bool) {
+func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory) (node noderec.DirectoryNode, changed, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n, present := d.nodes[hostUUID]
@@ -252,12 +253,16 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, models []string
 	if !has || n.IP != ip || em.Port != emPort {
 		return n, false, false
 	}
-	if sameStringSet(n.Models, models) && sameByEngine(n.ModelsByEngine, byEngine) && sameByEngine(n.LoadedByEngine, loadedByEngine) {
+	if sameStringSet(n.Models, inv.models) && sameByEngine(n.ModelsByEngine, inv.byEngine) && sameByEngine(n.LoadedByEngine, inv.loadedByEngine) &&
+		reflect.DeepEqual(n.SlotsByEngine, inv.slotsByEngine) && reflect.DeepEqual(n.JITLoadByEngine, inv.jitByEngine) {
 		return n, false, true
 	}
-	n.Models = models
-	n.ModelsByEngine = byEngine
-	n.LoadedByEngine = loadedByEngine
+	n.Models = inv.models
+	n.ModelsByEngine = inv.byEngine
+	n.LoadedByEngine = inv.loadedByEngine
+	n.SlotsByEngine = inv.slotsByEngine
+	n.JITLoadByEngine = inv.jitByEngine
+	n.ModelsObservedAt = time.Now().UnixMilli()
 	d.nodes[hostUUID] = n
 	return n, true, true
 }
