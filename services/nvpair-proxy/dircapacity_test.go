@@ -110,9 +110,10 @@ func TestJITClaimBlocksOtherModel(t *testing.T) {
 		t.Fatal("claim must block a different model only")
 	}
 	p.dropLocked(res)
-	if !p.eligible("n", "ollama", "m2") {
-		t.Fatal("claim must release with the request")
+	if p.eligible("n", "ollama", "m2") {
+		t.Fatal("released claim must persist until a newer sweep")
 	}
+
 }
 
 func TestReserveRechecksEligibility(t *testing.T) {
@@ -148,5 +149,45 @@ func TestContextLengthReplacedOrRemoved(t *testing.T) {
 	}
 	if got := string(withContextLength(json.RawMessage(`{"id":"m","context_length":9}`), 0)); got != `{"id":"m"}` {
 		t.Fatal(got)
+	}
+}
+
+func TestJITReleasedClaimPersistsUntilSweepOrCap(t *testing.T) {
+	now := time.Now()
+	d := newDirectoryCapacity(nil)
+	d.update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, now.UnixMilli())})
+	p := &Proxy{capacity: d, now: func() time.Time { return now }}
+	p.dropLocked(p.takeLocked("n", "ollama", "m", false))
+	if p.eligible("n", "ollama", "m2") {
+		t.Fatal("claim must persist after request end")
+	}
+	now = now.Add(jitReleaseCap)
+	if !p.eligible("n", "ollama", "m2") {
+		t.Fatal("claim must expire at the cap")
+	}
+	p.dropLocked(p.takeLocked("n", "ollama", "m", false))
+	d.update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, now.Add(time.Second).UnixMilli())})
+	if !p.eligible("n", "ollama", "m2") {
+		t.Fatal("a newer sweep must clear the claim")
+	}
+}
+
+func TestSelectedNodeHonoursJITClaim(t *testing.T) {
+	p := affinityProxy(t, "a")
+	d := newDirectoryCapacity(nil)
+	d.update("ollama", []noderec.DirectoryNode{dnode("a", []string{}, nil, 1)})
+	p.capacity = d
+	f := p.soleFacade()
+	f.SetSelected("a")
+	engine := f.profile.Name
+	res := p.takeLocked("a", engine, "m", false)
+	if !res.jit {
+		t.Skip("engine is not JIT on this fixture")
+	}
+	if out, _, _ := p.reserveCandidateFor(f, reservationCandidates("a"), "", "m2"); len(out) != 0 {
+		t.Fatal("selected node must honour a JIT claim for another model")
+	}
+	if out, _, _ := p.reserveCandidateFor(f, reservationCandidates("a"), "", "m"); len(out) != 1 {
+		t.Fatal("same model stays allowed")
 	}
 }
