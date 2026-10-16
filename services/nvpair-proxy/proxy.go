@@ -399,7 +399,8 @@ type Proxy struct {
 	// from the snapshot. All guarded by priorityMu.
 	reservedBy         map[inflightKey]int
 	claimMu            sync.Mutex
-	jitClaims          map[string]map[jitClaim]int // node -> live JIT claims
+	jitClaims          map[string]map[jitClaim]int       // node -> live JIT claims
+	jitReleased        map[string]map[jitClaim]time.Time // node -> claims released at T, held until a newer sweep
 	completions        map[inflightKey][]completion
 	priorityPendingBy  map[string]map[string]int
 	priorityComputedAt map[string]int64
@@ -2298,6 +2299,11 @@ func (p *Proxy) reserveCandidateFor(f *facade, candidates []candidate, key, mode
 	if selectedID := f.SelectedID(); selectedID != "" {
 		for _, cand := range candidates {
 			if cand.id == selectedID {
+				// Same eligibility (incl. JIT claim) as the auto path; a
+				// selected node with the model Loaded stays allowed.
+				if model != "" && !p.eligible(selectedID, engine, model) {
+					return nil, reservation{}, ""
+				}
 				res := p.takeLocked(selectedID, engine, model, false)
 				res.reason = "pin"
 				return candidates, res, ""

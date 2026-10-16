@@ -10,6 +10,10 @@ package main
 // before anything is loaded. Loads that bypass engine-manager (LM Studio JIT,
 // llama.cpp router, a direct Ollama request) cannot be prevented here; the
 // watcher only warns about them.
+//
+// LIMITATIONS: (1) a pinned load here and a proxy JIT load are not coordinated
+// across processes (the proxy claim is in-process). (2) Clearing an uncertain
+// load is a bounded heuristic, not a guarantee.
 
 import (
 	"context"

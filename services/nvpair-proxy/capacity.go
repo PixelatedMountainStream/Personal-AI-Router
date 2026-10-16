@@ -166,18 +166,51 @@ func (p *Proxy) eligible(nodeID, engine, model string) bool {
 
 type jitClaim struct{ engine, model string }
 
+// jitReleaseCap bounds how long a released claim stays effective, so a dead
+// scanner cannot wedge a node.
+const jitReleaseCap = 2 * time.Minute
+
 // jitClaimedByOther reports whether a live JIT claim on the node is for a
-// different engine or model.
+// different engine or model. A claim whose request ended stays live until the
+// directory reports a sweep newer than the release (so the load shows as
+// Loaded) or jitReleaseCap passes.
 func (p *Proxy) jitClaimedByOther(nodeID, engine, model string) bool {
 	p.claimMu.Lock()
 	defer p.claimMu.Unlock()
+	other := func(c jitClaim) bool {
+		return c.engine != engine || modelKey(c.engine, c.model) != modelKey(engine, model)
+	}
 	for c, n := range p.jitClaims[nodeID] {
-		if n > 0 && (c.engine != engine || modelKey(c.engine, c.model) != modelKey(engine, model)) {
+		if n > 0 && other(c) {
 			return true
 		}
 	}
+	now := p.clock()
+	for c, t := range p.jitReleased[nodeID] {
+		expired := now.Sub(t) >= jitReleaseCap
+		if !expired && p.capacity != nil {
+			if _, seen := p.capacity.Residency(nodeID, c.engine, c.model); seen.After(t) {
+				expired = true
+			}
+		}
+		if expired {
+			delete(p.jitReleased[nodeID], c) // lazy cleanup
+			continue
+		}
+		if other(c) {
+			return true
+		}
+	}
+	if len(p.jitReleased[nodeID]) == 0 {
+		delete(p.jitReleased, nodeID)
+	}
 	return false
 }
+
+// LIMITATIONS (documented, not fixed): the JIT claim is in-process, so an
+// engine-manager pinned load and a proxy JIT load on the same node are not
+// coordinated across processes. Clearing an uncertain load elsewhere is a
+// bounded heuristic, not a guarantee.
 
 // claimJIT records a dispatch to a KnownEmpty+JIT node and reports whether it
 // did, so the matching release is exact. Released when the request ends.
@@ -206,6 +239,13 @@ func (p *Proxy) releaseJIT(nodeID, engine, model string) {
 	c := jitClaim{engine, model}
 	if p.jitClaims[nodeID][c] <= 1 {
 		delete(p.jitClaims[nodeID], c)
+		if p.jitReleased == nil {
+			p.jitReleased = map[string]map[jitClaim]time.Time{}
+		}
+		if p.jitReleased[nodeID] == nil {
+			p.jitReleased[nodeID] = map[jitClaim]time.Time{}
+		}
+		p.jitReleased[nodeID][c] = p.clock()
 		if len(p.jitClaims[nodeID]) == 0 {
 			delete(p.jitClaims, nodeID)
 		}
