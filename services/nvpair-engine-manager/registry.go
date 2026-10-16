@@ -307,6 +307,13 @@ type ActionResult struct {
 	// keyed by its Field. With both empty, the whole response is ONE record
 	// (a per-model query such as llama.cpp /props?model=).
 	Record *ResultRecord `json:"record,omitempty"`
+	// Each, when set, names a per-row array of instances (LM Studio's
+	// "loaded_instances"). Each row is expanded to one row per instance, named
+	// by that instance's EachField (default "id"), so residency, sizes and
+	// slots are per loaded instance rather than per model key. Rows with an
+	// empty array stay as they are.
+	Each      string `json:"each,omitempty"`
+	EachField string `json:"each_field,omitempty"`
 }
 
 // ResultRecord declares how to build a SlotInfo. Fields maps "slots", "ctx" and

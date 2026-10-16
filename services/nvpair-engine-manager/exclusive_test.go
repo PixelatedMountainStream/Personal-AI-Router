@@ -5,9 +5,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http/httptest"
+	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -323,5 +326,48 @@ func TestVictimStillResidentTimesOut(t *testing.T) {
 	_, err := ex.PinnedLoad(context.Background(), PinnedRequest{Engine: "lmstudio", Model: "big-27b", Evict: true})
 	if pinnedStatus(err) != 504 || len(f.calls) != 1 {
 		t.Fatalf("err=%v calls=%v", err, f.calls)
+	}
+}
+
+// LM Studio groups variants under one model key; a second loaded variant must
+// be its own resident instance and a victim of a pinned load.
+func TestLMStudioInstancesAreResidentAndVictims(t *testing.T) {
+	data, err := os.ReadFile("manifests/lmstudio.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mf Manifest
+	if err := json.Unmarshal(data, &mf); err != nil {
+		t.Fatal(err)
+	}
+	inst := func(id string, par int) string {
+		return `{"id":"` + id + `","config":{"parallel":` + strconv.Itoa(par) + `,"context_length":8192}}`
+	}
+	shapes := map[string]string{
+		"one key two instances": `{"models":[{"key":"qwen/qwen3.8-27b","size_bytes":16081678492,"loaded_instances":[` +
+			inst("qwen/qwen3.8-27b", 4) + `,` + inst("qwen3.8-27b-mlx", 4) + `]}]}`,
+		"two keys": `{"models":[{"key":"qwen/qwen3.8-27b","size_bytes":16081678492,"loaded_instances":[` + inst("qwen/qwen3.8-27b", 4) + `]},` +
+			`{"key":"qwen3.8-27b-mlx","size_bytes":29500000000,"loaded_instances":[` + inst("qwen3.8-27b-mlx", 4) + `]}]}`,
+	}
+	for name, body := range shapes {
+		t.Run(name, func(t *testing.T) {
+			raw := json.RawMessage(body)
+			loaded, err := extractLoadedStrict(raw, mf.Actions["loaded_models"].Result)
+			if err != nil || len(loaded) != 2 {
+				t.Fatalf("loaded %v err=%v", loaded, err)
+			}
+			sizes, _ := extractRecords(raw, mf.Actions["model_sizes"].Result)
+			ex := newTestExecutor(t, testEngineManifest(fakeEngineBin))
+			ex.largeModelBytes = 12 * gib
+			var snap []residentModel
+			for _, m := range loaded {
+				snap = append(snap, residentModel{Engine: "lmstudio", Model: m, Bytes: sizes[m].Bytes,
+					HasSlots: true, Slots: SlotInfo{Slots: 4, CtxPerSlot: 8192}})
+			}
+			v, same := ex.victimsOf(snap, PinnedRequest{Engine: "lmstudio", Model: "qwen/qwen3.8-27b", LoadOpts: LoadOpts{Parallel: 4}})
+			if !same || len(v) != 1 || v[0].Model != "qwen3.8-27b-mlx" {
+				t.Fatalf("victims %v same=%v", v, same)
+			}
+		})
 	}
 }
