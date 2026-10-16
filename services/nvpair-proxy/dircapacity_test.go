@@ -42,21 +42,18 @@ func TestDirectoryResidencyAndProjection(t *testing.T) {
 	}
 }
 
-func TestDirectorySuppressionLiftedByNewerUpdate(t *testing.T) {
+func TestDirectorySuppressionLiftedByNewerObservation(t *testing.T) {
 	now := time.Unix(1000, 0)
-	d := newDirectoryCapacity(func() time.Time { return now })
+	d := newDirectoryCapacity(nil)
 	p := &Proxy{suppressed: map[inflightKey]time.Time{}, now: func() time.Time { return now }}
 	p.capacity = d
-	hot := dnode("n", []string{"m"}, nil, 5)
-	d.update("ollama", []noderec.DirectoryNode{hot})
-	now = now.Add(time.Second)
+	hot := dnode("n", []string{"m"}, nil, now.Add(-time.Second).UnixMilli())
 	p.suppressed[inflightKey{"ollama", "m", "n"}] = now
-	now = now.Add(time.Second)
-	d.update("ollama", []noderec.DirectoryNode{hot}) // unrelated resend: same inventory stamp
+	d.update("ollama", []noderec.DirectoryNode{hot}) // delivered late, observed before the refusal
 	if p.eligible("n", "ollama", "m") {
-		t.Fatal("stale resend must not lift suppression")
+		t.Fatal("sweep observed before the refusal must not lift suppression")
 	}
-	hot.ModelsObservedAt = 6
+	hot.ModelsObservedAt = now.Add(time.Second).UnixMilli()
 	d.update("ollama", []noderec.DirectoryNode{hot})
 	if !p.eligible("n", "ollama", "m") {
 		t.Fatal("newer sweep showing Loaded must lift suppression")
@@ -101,5 +98,55 @@ func TestJITBlockedWhenOtherEngineHoldsModel(t *testing.T) {
 	}
 	if !p.eligible("free", "ollama", "m") {
 		t.Fatal("JIT is fine when no other engine has a model loaded")
+	}
+}
+
+func TestJITClaimBlocksOtherModel(t *testing.T) {
+	d := newDirectoryCapacity(nil)
+	d.update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, 1)})
+	p := &Proxy{capacity: d}
+	res := p.takeLocked("n", "ollama", "m", false)
+	if !res.jit || p.eligible("n", "ollama", "m2") || !p.eligible("n", "ollama", "m") {
+		t.Fatal("claim must block a different model only")
+	}
+	p.dropLocked(res)
+	if !p.eligible("n", "ollama", "m2") {
+		t.Fatal("claim must release with the request")
+	}
+}
+
+func TestReserveRechecksEligibility(t *testing.T) {
+	d := newDirectoryCapacity(nil)
+	d.update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, 1), dnode("o", []string{"m"}, nil, 1)})
+	p := affinityProxy(t, "n", "o")
+	p.capacity = d
+	f := p.soleFacade()
+	p.takeLocked("n", "ollama", "other", false) // another model claims n
+	round := []candidate{{id: "n"}, {id: "o"}}
+	cand, ok := p.rescoreReserve(f, round, map[string]bool{}, &reservation{}, "m")
+	if !ok || cand.id != "o" {
+		t.Fatalf("got %v %v, want o", cand.id, ok)
+	}
+}
+
+func TestObservedAtAndModelKey(t *testing.T) {
+	d := newDirectoryCapacity(nil)
+	n := dnode("n", []string{"m:latest"}, map[string]noderec.SlotInfo{"m:latest": {Slots: 2, CtxPerSlot: 99}}, 5000)
+	d.update("ollama", []noderec.DirectoryNode{n})
+	r, at := d.Residency("n", "ollama", "m")
+	if r != ResidencyLoaded || !at.Equal(time.UnixMilli(5000)) {
+		t.Fatalf("residency %v at %v", r, at)
+	}
+	if s, ok := d.Slots("n", "ollama", "m"); !ok || s != 2 {
+		t.Fatal("slots must match m vs m:latest")
+	}
+}
+
+func TestContextLengthReplacedOrRemoved(t *testing.T) {
+	if got := string(withContextLength(json.RawMessage(`{"id":"m","context_length":999999}`), 4096)); got != `{"context_length":4096,"id":"m"}` {
+		t.Fatal(got)
+	}
+	if got := string(withContextLength(json.RawMessage(`{"id":"m","context_length":9}`), 0)); got != `{"id":"m"}` {
+		t.Fatal(got)
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -8,13 +9,11 @@ import (
 	"nvpair-shared/noderec"
 )
 
-// dirEntry is what the proxy keeps of one directory node for one engine.
+// dirEntry is what the proxy keeps of one directory node for one engine. The
+// observation time is the node's own modelsObservedAt, which the scanner
+// advances (with a 30 s heartbeat) on every successful sweep.
 type dirEntry struct {
 	node noderec.DirectoryNode
-	// observedAt is when this proxy first saw the node's current inventory
-	// (see update); it is what suppression lifting compares against.
-	observedAt time.Time
-	srcStamp   int64 // node.ModelsObservedAt the stamp belongs to
 }
 
 // directoryCapacity serves CapacityProvider from the latest directory
@@ -33,28 +32,38 @@ func newDirectoryCapacity(now func() time.Time) *directoryCapacity {
 }
 
 // update replaces the engine's view with the snapshot (a departed node simply
-// vanishes). The observed-at stamp is the time this proxy received the update,
-// not the node's modelsObservedAt: that is a sender clock, and suppression is
-// stamped on the proxy's own clock, so the two cannot be compared. The stamp is
-// refreshed only when modelsObservedAt differs from the previous snapshot's (or
-// the node is new). The node advances it on every successful sweep (with a
-// heartbeat), so a live node keeps a fresh stamp while a re-sent snapshot for
-// an unrelated change keeps the old one, and stale "Loaded" data cannot lift a
-// fresh not-loaded suppression.
+// vanishes).
 func (d *directoryCapacity) update(engine string, nodes []noderec.DirectoryNode) {
-	now := d.now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	prev := d.by[engine]
 	next := make(map[string]dirEntry, len(nodes))
 	for _, n := range nodes {
-		e := dirEntry{node: n, observedAt: now, srcStamp: n.ModelsObservedAt}
-		if old, ok := prev[n.HostUUID]; ok && old.srcStamp == n.ModelsObservedAt {
-			e.observedAt = old.observedAt
-		}
-		next[n.HostUUID] = e
+		next[n.HostUUID] = dirEntry{node: n}
 	}
 	d.by[engine] = next
+}
+
+// modelKey is the one place model names are compared for residency, slots and
+// context: Ollama's `m` and `m:latest` are the same model.
+func modelKey(engine, model string) string {
+	model = strings.TrimSpace(model)
+	if engine != engines.NameOllama || model == "" {
+		return model
+	}
+	if name := model[strings.LastIndex(model, "/")+1:]; !strings.ContainsAny(name, ":@") {
+		return model + ":latest"
+	}
+	return model
+}
+
+func slotInfo(n noderec.DirectoryNode, engine, model string) (noderec.SlotInfo, bool) {
+	want := modelKey(engine, model)
+	for m, s := range n.SlotsByEngine[engine] {
+		if modelKey(engine, m) == want {
+			return s, true
+		}
+	}
+	return noderec.SlotInfo{}, false
 }
 
 func (d *directoryCapacity) entry(nodeID, engine string) (dirEntry, bool) {
@@ -69,7 +78,7 @@ func (d *directoryCapacity) Slots(nodeID, engine, model string) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	s, ok := e.node.SlotsByEngine[engine][model]
+	s, ok := slotInfo(e.node, engine, model)
 	return s.Slots, ok && s.Slots > 0
 }
 
@@ -78,7 +87,7 @@ func (d *directoryCapacity) CtxPerSlot(nodeID, engine, model string) (int, bool)
 	if !ok {
 		return 0, false
 	}
-	s, ok := e.node.SlotsByEngine[engine][model]
+	s, ok := slotInfo(e.node, engine, model)
 	return s.CtxPerSlot, ok && s.CtxPerSlot > 0
 }
 
@@ -93,12 +102,17 @@ func (d *directoryCapacity) Residency(nodeID, engine, model string) (Residency, 
 	if !present {
 		return ResidencyUnknown, time.Time{}
 	}
+	want := modelKey(engine, model)
+	var observed time.Time
+	if ms := e.node.ModelsObservedAt; ms > 0 {
+		observed = time.UnixMilli(ms)
+	}
 	for _, m := range loaded {
-		if m == model {
-			return ResidencyLoaded, e.observedAt
+		if modelKey(engine, m) == want {
+			return ResidencyLoaded, observed
 		}
 	}
-	return ResidencyKnownEmpty, e.observedAt
+	return ResidencyKnownEmpty, observed
 }
 
 func (d *directoryCapacity) JITLoad(nodeID, engine string) bool {

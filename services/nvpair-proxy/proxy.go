@@ -398,6 +398,8 @@ type Proxy struct {
 	// have seen yet (Unix ms). priorityPendingBy and priorityComputedAt come
 	// from the snapshot. All guarded by priorityMu.
 	reservedBy         map[inflightKey]int
+	claimMu            sync.Mutex
+	jitClaims          map[string]map[jitClaim]int // node -> live JIT claims
 	completions        map[inflightKey][]completion
 	priorityPendingBy  map[string]map[string]int
 	priorityComputedAt map[string]int64
@@ -1132,8 +1134,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 	success := false
 	models := make([]json.RawMessage, 0)
 	seen := make(map[string]modelListItem)
-	var keys []string                    // model key of models[i]
-	holders := make(map[string][]string) // model key -> ids of nodes that listed it
+	var keys []string // model key of models[i]
 	for i, result := range results {
 		if !result.ok {
 			slog.Debug("model list candidate unavailable",
@@ -1142,7 +1143,6 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 		}
 		success = true
 		for _, item := range result.items {
-			holders[item.key] = append(holders[item.key], candidates[i].id)
 			if previous, duplicate := seen[item.key]; duplicate {
 				if previous.digest != "" && item.digest != "" && previous.digest != item.digest {
 					slog.Warn("conflicting model digests across candidates",
@@ -1158,9 +1158,22 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 	}
 	if openAI {
 		// Only after every candidate is merged is the holder set complete.
-		for i, key := range keys {
-			if n, ok := p.minContextLength(f.profile.Name, key, holders[key]); ok {
-				models[i] = withContextLength(models[i], n)
+		// Every routable advertised owner counts, not only the nodes whose
+		// list call succeeded: inference can still route to the others.
+		nodeByID := map[string]Node{}
+		for _, n := range f.discovery.Nodes() {
+			nodeByID[n.ID] = n
+		}
+		if p.capacity != nil {
+			for i, key := range keys {
+				var owners []string
+				for _, c := range candidates {
+					if n, ok := nodeByID[c.id]; ok && nodeAdvertisesModel(f.profile, n, key) {
+						owners = append(owners, c.id)
+					}
+				}
+				n, _ := p.minContextLength(f.profile.Name, key, owners)
+				models[i] = withContextLength(models[i], n) // n==0 removes
 			}
 		}
 	}
@@ -1676,11 +1689,16 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		cand := round[next]
 		if next > 0 && isInf && model != "" {
 			// Re-score the untried candidates now; the round's order is stale.
+			ok := true
 			func() {
 				resMu.Lock()
 				defer resMu.Unlock()
-				cand = p.rescoreReserve(f, round, tried, &held, model)
+				cand, ok = p.rescoreReserve(f, round, tried, &held, model)
 			}()
+			if !ok {
+				next = len(round) // none still eligible: end the round
+				continue
+			}
 		}
 		tried[cand.id] = true
 		next++
@@ -2223,6 +2241,8 @@ type reservation struct {
 	// held distinguishes "no reservation was taken" from "a reservation on the
 	// zero-value node", so release on the paths that never reserved is a no-op.
 	held bool
+	// jit is whether this dispatch holds a JIT claim on the node.
+	jit bool
 }
 
 // reserveCandidate atomically moves the least estimated loaded scheduler-listed
@@ -2276,6 +2296,17 @@ func (p *Proxy) reserveCandidateFor(f *facade, candidates []candidate, key, mode
 				return candidates, res, ""
 			}
 		}
+	}
+	// Eligibility is re-checked here, under the lock the claim is taken under,
+	// so two requests cannot both pass a stale check and both JIT-load.
+	kept := candidates[:0:0]
+	for _, c := range candidates {
+		if model == "" || p.eligible(c.id, engine, model) {
+			kept = append(kept, c)
+		}
+	}
+	if candidates = kept; len(candidates) == 0 {
+		return candidates, reservation{}, ""
 	}
 	if len(p.priority) == 0 {
 		return candidates, p.takeLocked(candidates[0].id, engine, model, false), ""
@@ -2362,7 +2393,7 @@ func (p *Proxy) takeLocked(nodeID, engine, model string, optimistic bool) reserv
 	return reservation{
 		nodeID: nodeID, engine: engine, model: model,
 		generation: p.appliedPriorityGeneration, held: true, optimistic: optimistic,
-		takenAt: p.clock().UnixMilli(),
+		takenAt: p.clock().UnixMilli(), jit: p.claimJIT(nodeID, engine, model),
 	}
 }
 
@@ -2370,6 +2401,9 @@ func (p *Proxy) takeLocked(nodeID, engine, model string, optimistic bool) reserv
 // whatever snapshot has arrived since; only the optimistic one is guarded by
 // the generation, because a snapshot already folded that one in.
 func (p *Proxy) dropLocked(r reservation) {
+	if r.jit {
+		p.releaseJIT(r.nodeID, r.engine, r.model)
+	}
 	k := inflightKey{r.engine, r.model, r.nodeID}
 	if p.inflight[k] <= 1 {
 		delete(p.inflight, k)
@@ -2466,22 +2500,32 @@ func (p *Proxy) bestLocked(engine, model string, cands []candidate, tried map[st
 // request's held claim onto it in one critical section, so failover sees the
 // load as it is rather than as it was when the round was formed. Candidates
 // the scheduler does not list follow in round order.
-func (p *Proxy) rescoreReserve(f *facade, round []candidate, tried map[string]bool, held *reservation, model string) candidate {
+func (p *Proxy) rescoreReserve(f *facade, round []candidate, tried map[string]bool, held *reservation, model string) (candidate, bool) {
 	engine := f.profile.Name
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
-	i := p.bestLocked(engine, model, round, tried, nil)
+	// Eligibility is re-checked under the reservation lock: another request or
+	// engine may have loaded a model, or claimed the node, since the round was
+	// built.
+	skip := make(map[string]bool, len(round))
+	for _, c := range round {
+		skip[c.id] = tried[c.id] || !p.eligible(c.id, engine, model)
+	}
+	i := p.bestLocked(engine, model, round, skip, nil)
 	if i < 0 {
 		for j, c := range round {
-			if !tried[c.id] {
+			if !skip[c.id] {
 				i = j
 				break
 			}
 		}
 	}
+	if i < 0 {
+		return candidate{}, false
+	}
 	cand := round[i]
 	if !held.held {
-		return cand
+		return cand, true
 	}
 	// The claim is published at each step so a panic below can never leave the
 	// caller holding one that was already dropped, or lose the new one.
@@ -2493,7 +2537,7 @@ func (p *Proxy) rescoreReserve(f *facade, round []candidate, tried map[string]bo
 	if p.occLocked(inflightKey{engine, model, cand.id}) > p.nodeSlots(cand.id, engine, model) {
 		held.reason = "least-queued"
 	}
-	return cand
+	return cand, true
 }
 
 func containsID(ids []string, id string) bool {

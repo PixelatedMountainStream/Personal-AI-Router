@@ -155,7 +155,63 @@ func (p *Proxy) eligible(nodeID, engine, model string) bool {
 	if o, ok := p.capacity.(otherEngineLoader); ok && o.OtherEngineLoaded(nodeID, engine) {
 		return false
 	}
-	return p.capacity.JITLoad(nodeID, engine)
+	if !p.capacity.JITLoad(nodeID, engine) {
+		return false
+	}
+	// A JIT load already dispatched here for another engine or model would
+	// make this a second one. The claim is in-process only: concurrent cold
+	// requests through other proxies are out of scope (runbook covers them).
+	return !p.jitClaimedByOther(nodeID, engine, model)
+}
+
+type jitClaim struct{ engine, model string }
+
+// jitClaimedByOther reports whether a live JIT claim on the node is for a
+// different engine or model.
+func (p *Proxy) jitClaimedByOther(nodeID, engine, model string) bool {
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
+	for c, n := range p.jitClaims[nodeID] {
+		if n > 0 && (c.engine != engine || modelKey(c.engine, c.model) != modelKey(engine, model)) {
+			return true
+		}
+	}
+	return false
+}
+
+// claimJIT records a dispatch to a KnownEmpty+JIT node and reports whether it
+// did, so the matching release is exact. Released when the request ends.
+func (p *Proxy) claimJIT(nodeID, engine, model string) bool {
+	if p.capacity == nil {
+		return false
+	}
+	if r, _ := p.capacity.Residency(nodeID, engine, model); r != ResidencyKnownEmpty || !p.capacity.JITLoad(nodeID, engine) {
+		return false
+	}
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
+	if p.jitClaims == nil {
+		p.jitClaims = map[string]map[jitClaim]int{}
+	}
+	if p.jitClaims[nodeID] == nil {
+		p.jitClaims[nodeID] = map[jitClaim]int{}
+	}
+	p.jitClaims[nodeID][jitClaim{engine, model}]++
+	return true
+}
+
+func (p *Proxy) releaseJIT(nodeID, engine, model string) {
+	p.claimMu.Lock()
+	defer p.claimMu.Unlock()
+	c := jitClaim{engine, model}
+	if p.jitClaims[nodeID][c] <= 1 {
+		delete(p.jitClaims[nodeID], c)
+		if len(p.jitClaims[nodeID]) == 0 {
+			delete(p.jitClaims, nodeID)
+		}
+	} else {
+		p.jitClaims[nodeID][c]--
+	}
 }
 
 // otherEngineLoader is the optional capability of a provider that knows what
@@ -220,18 +276,19 @@ func (p *Proxy) minContextLength(engine, model string, nodeIDs []string) (int, b
 	return min, any
 }
 
-// withContextLength adds context_length to a model record, leaving any value
-// the engine already reported alone. A record that is not a JSON object is
-// returned unchanged.
+// withContextLength sets context_length on a model record to the fleet value,
+// replacing any upstream-supplied one; n <= 0 removes the field instead. A
+// record that is not a JSON object is returned unchanged.
 func withContextLength(raw json.RawMessage, n int) json.RawMessage {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
 		return raw
 	}
-	if _, has := obj["context_length"]; has {
-		return raw
+	if n > 0 {
+		obj["context_length"] = json.RawMessage(strconv.Itoa(n))
+	} else {
+		delete(obj, "context_length")
 	}
-	obj["context_length"] = json.RawMessage(strconv.Itoa(n))
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return raw

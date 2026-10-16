@@ -113,7 +113,7 @@ func TestSlotScore_FailoverPicksFreeOverFull(t *testing.T) {
 	p.reserveCandidateFor(f, reservationCandidates("b"), "", "m") // b is full
 	_, held, _ := p.reserveCandidateFor(f, reservationCandidates("a"), "", "m")
 	round := reservationCandidates("a", "b", "c")
-	cand := p.rescoreReserve(f, round, map[string]bool{"a": true}, &held, "m")
+	cand, _ := p.rescoreReserve(f, round, map[string]bool{"a": true}, &held, "m")
 	res := held
 	if cand.id != "c" || res.nodeID != "c" {
 		t.Fatalf("failover chose %s, want free node c", cand.id)
