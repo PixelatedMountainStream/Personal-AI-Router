@@ -123,7 +123,8 @@ func TestReserveCandidate_CombinesPendingPressureAndReservations(t *testing.T) {
 		reservedID(p, candidates),
 		reservedID(p, candidates),
 	}
-	want := []string{"b", "b", "c"}
+	// One slot each: free nodes first (by GPU pressure), then the shortest queue.
+	want := []string{"c", "a", "b"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("GPU-aware reservations = %v, want %v", got, want)

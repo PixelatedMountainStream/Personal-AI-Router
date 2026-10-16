@@ -75,3 +75,16 @@ func TestPriorityCopiesOwnTheirSlices(t *testing.T) {
 		t.Fatalf("clone changed through an aliased slice: %#v", clone)
 	}
 }
+
+func TestSameRankingIgnoresComputedAtButNotPendingBy(t *testing.T) {
+	a := Priority{Nodes: []string{"n"}, Ranks: []NodeRank{{ID: "n", PendingBy: map[string]int{"e/m": 1}, ComputedAt: 1}}}
+	b := a.Clone()
+	b.Ranks[0].ComputedAt = 2
+	if !a.SameRanking(b) {
+		t.Fatal("ComputedAt alone must not make a new ranking")
+	}
+	b.Ranks[0].PendingBy["e/m"] = 2
+	if a.SameRanking(b) || a.Ranks[0].PendingBy["e/m"] != 1 {
+		t.Fatal("PendingBy change must differ, and Clone must not alias it")
+	}
+}

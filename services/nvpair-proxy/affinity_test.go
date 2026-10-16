@@ -33,11 +33,6 @@ func turn(p *Proxy, key string, ids ...string) (string, string) {
 	return out[0].id, d
 }
 
-// nodeSlotsFake serves fixed slot counts per node id.
-type nodeSlotsFake map[string]int
-
-func (f nodeSlotsFake) Slots(id, _, _ string) (int, bool) { n, ok := f[id]; return n, ok }
-
 func TestAffinity_SequentialTurnsAllHit(t *testing.T) {
 	p := affinityProxy(t, "a", "b")
 	first, _ := turn(p, "conv", "a", "b")
@@ -62,7 +57,7 @@ func TestAffinity_YieldsToFreeNode(t *testing.T) {
 
 func TestAffinity_AllFullTolerance(t *testing.T) {
 	p := affinityProxy(t, "a", "b")
-	p.capacity = nodeSlotsFake{"a": 1, "b": 1}
+	p.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1}}
 	bound, _ := pick(p, "conv", "a", "b")
 	other := map[string]string{"a": "b", "b": "a"}[bound]
 	pick(p, "x", "a", "b") // fills the other node

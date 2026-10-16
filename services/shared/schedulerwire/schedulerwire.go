@@ -5,7 +5,10 @@
 // scheduler rankings through the broker to the inference proxies.
 package schedulerwire
 
-import "slices"
+import (
+	"maps"
+	"slices"
+)
 
 const (
 	MethodTelemetry = "scheduler:telemetry"
@@ -19,6 +22,34 @@ type NodeRank struct {
 	Pending     int    `json:"pending"`
 	GPUPressure int    `json:"gpuPressure"`
 	Rank        int    `json:"rank"`
+	// PendingBy splits Pending by PendingKey(engine, model). Nil from a
+	// scheduler that predates it; consumers then fall back to Pending.
+	PendingBy map[string]int `json:"pendingBy,omitempty"`
+	// ComputedAt is when the scheduler computed this rank, in Unix ms. A
+	// consumer discounts its own completions after it, since the scheduler had
+	// not yet seen them.
+	ComputedAt int64 `json:"computedAt,omitempty"`
+}
+
+// PendingKey is the PendingBy key for one engine's model.
+func PendingKey(engine, model string) string { return engine + "/" + model }
+
+// Equal compares everything but ComputedAt, which changes on every compute.
+func (r NodeRank) Equal(o NodeRank) bool {
+	return r.ID == o.ID && r.Pending == o.Pending && r.GPUPressure == o.GPUPressure &&
+		r.Rank == o.Rank && maps.Equal(r.PendingBy, o.PendingBy)
+}
+
+// CloneRanks copies ranks, including each PendingBy map. A nil input stays nil.
+func CloneRanks(in []NodeRank) []NodeRank {
+	if in == nil {
+		return nil
+	}
+	out := slices.Clone(in)
+	for i := range out {
+		out[i].PendingBy = maps.Clone(out[i].PendingBy)
+	}
+	return out
 }
 
 // Priority is the payload accepted by a proxy's node/set-priority method.
@@ -54,7 +85,7 @@ func (p Priority) Clone() Priority {
 	return Priority{
 		Generation: p.Generation,
 		Nodes:      append([]string(nil), p.Nodes...),
-		Ranks:      append([]NodeRank(nil), p.Ranks...),
+		Ranks:      CloneRanks(p.Ranks),
 	}
 }
 
@@ -66,7 +97,7 @@ func (p Priority) Clone() Priority {
 // the two agree on every reachable value here, but DeepEqual would separate
 // nil from empty if a producer ever sent one.
 func (p Priority) SameRanking(other Priority) bool {
-	return slices.Equal(p.Nodes, other.Nodes) && slices.Equal(p.Ranks, other.Ranks)
+	return slices.Equal(p.Nodes, other.Nodes) && slices.EqualFunc(p.Ranks, other.Ranks, NodeRank.Equal)
 }
 
 // EnginePriority is the schedule:priority notification emitted by the scheduler.
@@ -81,6 +112,6 @@ type EnginePriority struct {
 func (p EnginePriority) Snapshot() Priority {
 	return Priority{
 		Nodes: append([]string(nil), p.Nodes...),
-		Ranks: append([]NodeRank(nil), p.Ranks...),
+		Ranks: CloneRanks(p.Ranks),
 	}
 }
