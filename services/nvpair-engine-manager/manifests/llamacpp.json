@@ -97,8 +97,8 @@
       "result": { "array": "data", "field": "id", "match": { "field": "status.value", "in": ["loaded"] } }
     },
     "slots": {
-      "description": "Per-slot capacity of one loaded model (params: {\"model\": \"<model>\"}, sent as a query parameter).",
-      "http": { "method": "GET", "path": "/props", "params_in": "query" },
+      "description": "Per-slot capacity of one loaded model (params: {\"model\": \"<model>\"}, sent as a query parameter; autoload=false so a poll never reloads an unloaded model).",
+      "http": { "method": "GET", "path": "/props?autoload=false", "params_in": "query" },
       "result": { "record": { "fields": { "slots": "total_slots", "ctx": "default_generation_settings.n_ctx" } } }
     },
     "pull_model": {

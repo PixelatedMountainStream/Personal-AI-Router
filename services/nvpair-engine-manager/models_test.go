@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"testing"
 )
@@ -423,5 +425,56 @@ func TestExtractRecords(t *testing.T) {
 	}
 	if _, ok := extractRecord(json.RawMessage(`{"default_generation_settings":{"n_ctx":8192}}`), llama); ok {
 		t.Fatal("missing total_slots must fail")
+	}
+}
+
+// TestBundledSlotsQueryThroughManifests drives ModelsResult through the bundled
+// llamacpp and ollama manifest specs against fake HTTP engines: llama.cpp
+// succeeds (and its /props poll must carry autoload=false so it never reloads
+// an unloaded 27B model), Ollama's /api/ps fails so its slots are omitted.
+func TestBundledSlotsQueryThroughManifests(t *testing.T) {
+	var propsQuery url.Values
+	llama := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			_, _ = w.Write([]byte(`{"data":[{"id":"m","status":{"value":"loaded"}}]}`))
+		case "/props":
+			propsQuery = r.URL.Query()
+			_, _ = w.Write([]byte(`{"total_slots":2,"default_generation_settings":{"n_ctx":8192}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer llama.Close()
+	oll := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/tags" {
+			_, _ = w.Write([]byte(`{"models":[{"name":"q"}]}`))
+			return
+		}
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer oll.Close()
+
+	set := bundledManifestSet(t)
+	reg := NewRegistry()
+	reg.engines["llamacpp"] = set["llamacpp"]
+	reg.engines["ollama"] = set["ollama"]
+	ex := NewExecutor(reg, NewReporter(nil), func(string, any) {}, t.TempDir())
+	for name, srv := range map[string]*httptest.Server{"llamacpp": llama, "ollama": oll} {
+		st, err := ex.state(name)
+		if err != nil {
+			t.Skipf("no host platform block for %s: %v", name, err)
+		}
+		u, _ := url.Parse(srv.URL)
+		_, _ = fmt.Sscanf(u.Port(), "%d", &st.port)
+		st.running = true
+	}
+
+	res := ex.ModelsResult(context.Background())
+	if want := map[string]map[string]SlotInfo{"llamacpp": {"m": {2, 8192}}}; !reflect.DeepEqual(res.SlotsByEngine, want) {
+		t.Fatalf("SlotsByEngine = %v, want %v (failing engine must be omitted)", res.SlotsByEngine, want)
+	}
+	if propsQuery.Get("autoload") != "false" || propsQuery.Get("model") != "m" {
+		t.Fatalf("/props query = %v, want autoload=false&model=m", propsQuery)
 	}
 }
