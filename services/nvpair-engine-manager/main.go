@@ -126,7 +126,7 @@ func main() {
 	// keeps a standalone machine's own model list working. Non-fatal if the port
 	// can't bind.
 	if *httpPort > 0 {
-		go serveHTTP(ctx, *httpPort, exec, mesh)
+		go serveHTTP(ctx, *httpPort, exec, mesh, mgr.pinnedLoad)
 	}
 
 	// Cluster-scoped mTLS remote-control surface (the ec service). It binds when

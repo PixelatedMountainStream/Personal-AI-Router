@@ -152,7 +152,7 @@ Requests (caller → service):
 | `engine:remote-get-installed` | `{ node }` | `{ engines: [EngineStatus] }` from the remote node |
 | `engine:remote-install` | `{ node, engine, start? }` | `{ opId, status }` after the remote install |
 | `engine:remote-pull-model` | `{ node, engine, model?, params? }` | `{ opId, result }` after the remote pull |
-| `engine:remote-load-model` | `{ node, engine, model }` | the remote action result |
+| `engine:remote-load-model` | `{ node, engine, model, context_length?, parallel?, evict? }` | `{ node, engine, model, applied:{context_length?,parallel?}, unloaded:[{engine,model,bytes?}], already_loaded, warnings? }`. A pinned load (`node` = host UUID or `"self"`). Also `POST 127.0.0.1:<http-port>/v1/models/load` (loopback only, same body). Peers serve it at the new ec route `POST /v1/models/pinned-load`; an older peer 404s it and the caller reports "peer too old". Errors: 400 bad/unsupported param, 404 unknown node, 409 conflict, 502 engine failure, 504 unload-confirm timeout. LM Studio takes both params (`lms load --context-length/--parallel`); Ollama takes `context_length` (`options.num_ctx`) and only `parallel` 1; llama.cpp refuses both (fixed at launch). |
 | `engine:remote-unload-model` | `{ node, engine, model }` | the remote action result |
 | `engine:remote-delete-model` | `{ node, engine, model }` | the remote action result |
 | `engine:remote-start` | `{ node, engine, port? }` | `EngineStatus` from the remote node (manifest `runtime.bind`; no per-call bind on the remote path) |

@@ -87,8 +87,12 @@
       "model_resolution": "lms-get"
     },
     "load_model": {
-      "description": "Load a downloaded model into memory (params: {\"model\": \"<name>\"}).",
-      "cmd": ["{cli}", "load", "{model}"]
+      "description": "Load a downloaded model into memory (params: {\"model\": \"<name>\", \"context_length\"?: int, \"parallel\"?: int}).",
+      "cmd": ["{cli}", "load", "{model}", "--yes"],
+      "optional_args": {
+        "context_length": ["--context-length", "{context_length}"],
+        "parallel": ["--parallel", "{parallel}"]
+      }
     },
     "list_downloaded": {
       "description": "List models downloaded to disk via the lms CLI.",

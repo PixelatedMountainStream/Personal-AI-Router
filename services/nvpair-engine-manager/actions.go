@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -282,6 +283,10 @@ func (e *Executor) runCmdAction(ctx context.Context, st *engineState, act Action
 		}
 	}
 
+	optArgs, err := optionalArgv(act, params)
+	if err != nil {
+		return nil, err
+	}
 	var out string
 	var lastErr error
 	for i, cand := range candidates {
@@ -290,6 +295,7 @@ func (e *Executor) runCmdAction(ctx context.Context, st *engineState, act Action
 		if err != nil {
 			return nil, err
 		}
+		argv = append(argv, optArgs...)
 		// An lms-get download resumes on re-run, so a transient stall or
 		// timeout is retried in place before we give up. A resolution
 		// failure is *not* retried in place — it falls through to the next
@@ -374,4 +380,39 @@ func (e *Executor) runWithResume(ctx context.Context, argv []string) (string, er
 		case <-time.After(lmsGetResumeBackoff):
 		}
 	}
+}
+
+// optionalArgv renders act.OptionalArgs for the params present, in sorted key
+// order. A value must be a non-negative JSON integer; it is rendered from its
+// literal text so 1000000 never becomes 1e+06.
+func optionalArgv(act Action, params json.RawMessage) ([]string, error) {
+	if len(act.OptionalArgs) == 0 || len(params) == 0 {
+		return nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(params))
+	dec.UseNumber()
+	var pm map[string]any
+	if err := dec.Decode(&pm); err != nil {
+		return nil, nil // non-object params carry no optional args
+	}
+	keys := make([]string, 0, len(act.OptionalArgs))
+	for k := range act.OptionalArgs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []string
+	for _, k := range keys {
+		v, ok := pm[k]
+		if !ok || v == nil {
+			continue
+		}
+		n, isNum := v.(json.Number)
+		if _, err := strconv.ParseUint(string(n), 10, 63); !isNum || err != nil {
+			return nil, fmt.Errorf("param %q must be a non-negative integer", k)
+		}
+		for _, f := range act.OptionalArgs[k] {
+			out = append(out, strings.ReplaceAll(f, "{"+k+"}", string(n)))
+		}
+	}
+	return out, nil
 }

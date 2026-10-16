@@ -26,6 +26,9 @@ type remoteParam struct {
 	Port   int             `json:"port,omitempty"`
 	Model  string          `json:"model,omitempty"`
 	Params json.RawMessage `json:"params,omitempty"`
+	// Pinned-load parameters (engine:remote-load-model).
+	LoadOpts
+	Evict bool `json:"evict,omitempty"`
 }
 
 // remoteProgress is the engine:remote-progress notification payload the broker
@@ -57,6 +60,10 @@ func (m *Manager) runRemote(ctx context.Context, msg *Message) {
 	}
 	if p.Node == "" {
 		m.codec.RespondError(msg.ID, -32602, "node is required")
+		return
+	}
+	if msg.Method == "engine:remote-load-model" {
+		m.runRemotePinnedLoad(ctx, msg, p)
 		return
 	}
 	peer, ok := m.peers.lookup(p.Node)
@@ -107,7 +114,7 @@ func (m *Manager) runRemote(ctx context.Context, msg *Message) {
 		}
 		m.codec.Respond(msg.ID, map[string]any{"opId": opID, "result": terminal.Result})
 
-	case "engine:remote-load-model", "engine:remote-unload-model", "engine:remote-delete-model":
+	case "engine:remote-unload-model", "engine:remote-delete-model":
 		if p.Engine == "" {
 			m.codec.RespondError(msg.ID, -32602, "engine is required")
 			return
@@ -116,10 +123,8 @@ func (m *Manager) runRemote(ctx context.Context, msg *Message) {
 			m.codec.RespondError(msg.ID, -32602, "model is required")
 			return
 		}
-		path := controlLoadPath
+		path := controlUnloadPath
 		switch msg.Method {
-		case "engine:remote-unload-model":
-			path = controlUnloadPath
 		case "engine:remote-delete-model":
 			path = controlDeletePath
 		}
@@ -161,4 +166,20 @@ func (m *Manager) remoteProgressFn(opID, node string) func(streamFrame) {
 		}
 		_ = m.codec.Notify("engine:remote-progress", p)
 	}
+}
+
+// runRemotePinnedLoad serves engine:remote-load-model as a pinned load on the
+// target node ("self" = this node). Params: {node, engine, model,
+// context_length?, parallel?, evict?}; result: PinnedResult.
+func (m *Manager) runRemotePinnedLoad(ctx context.Context, msg *Message, p remoteParam) {
+	res, err := m.pinnedLoad(ctx, p.Node, PinnedRequest{Engine: p.Engine, Model: p.Model, LoadOpts: p.LoadOpts, Evict: p.Evict})
+	if err != nil {
+		code := -32000
+		if pinnedStatus(err) == 400 {
+			code = -32602
+		}
+		m.codec.RespondError(msg.ID, code, err.Error())
+		return
+	}
+	m.codec.Respond(msg.ID, res)
 }

@@ -293,6 +293,13 @@ and loaded actions require LM Studio 0.4.0 or newer, where the native
 `/api/v1/models` endpoint is available. All of this stays additive:
 `manifest_version` is still `1`.
 
+An optional **`optional_args`** map (cmd actions only) appends an argv fragment
+only when the caller supplied that param, e.g.
+`"optional_args": {"context_length": ["--context-length", "{context_length}"]}`.
+The value must be a non-negative integer (rendered from its literal text) and
+replaces `{<param>}` in the fragment; `model` and the runner placeholders are
+reserved keys. LM Studio's `load_model` uses it for `context_length` and `parallel`.
+
 An optional **`model_resolution`** expands or resolves the `{model}`
 placeholder before the action runs:
 

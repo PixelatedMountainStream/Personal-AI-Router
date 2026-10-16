@@ -45,6 +45,8 @@ var allowedPlaceholders = map[string]bool{
 }
 
 var placeholderRe = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}`)
+var optionalArgKeyRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
 var recordPathRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$`)
 
 var resultMatchFieldPathRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*(?:\.[a-zA-Z_][a-zA-Z0-9_-]*)*$`)
@@ -255,10 +257,15 @@ type StopSpec struct {
 // placeholders (e.g. {model}); an HTTP action sends params in its declared
 // body or query location.
 type Action struct {
-	Description string            `json:"description,omitempty"`
-	HTTP        *ActionHTTP       `json:"http,omitempty"`
-	Cmd         []string          `json:"cmd,omitempty"`
-	RemovePath  *ActionRemovePath `json:"remove_path,omitempty"`
+	Description string      `json:"description,omitempty"`
+	HTTP        *ActionHTTP `json:"http,omitempty"`
+	Cmd         []string    `json:"cmd,omitempty"`
+	// OptionalArgs maps a caller param name to an argv fragment appended to Cmd
+	// only when that param is present, e.g. {"context_length": ["--context-length",
+	// "{context_length}"]}. The param value must be a non-negative integer and
+	// replaces {<param>} in the fragment. Cmd actions only.
+	OptionalArgs map[string][]string `json:"optional_args,omitempty"`
+	RemovePath   *ActionRemovePath   `json:"remove_path,omitempty"`
 	// ProgressProtocol selects a narrowly defined streaming adapter for an
 	// asynchronous pull HTTP action. Empty keeps the ordinary response-stream
 	// behavior; named protocols are validated so a typo cannot silently fall
@@ -911,6 +918,19 @@ func (a *Action) validate(name string) error {
 	}
 	if kinds != 1 {
 		return fmt.Errorf("action %q: exactly one of http, cmd, or remove_path is required", name)
+	}
+	if len(a.OptionalArgs) > 0 {
+		if !hasCmd {
+			return fmt.Errorf("action %q: optional_args requires a cmd action", name)
+		}
+		for k, frag := range a.OptionalArgs {
+			if !optionalArgKeyRe.MatchString(k) || allowedPlaceholders[k] || k == "model" {
+				return fmt.Errorf("action %q: optional_args key %q is invalid or reserved", name, k)
+			}
+			if len(frag) == 0 {
+				return fmt.Errorf("action %q: optional_args %q has an empty fragment", name, k)
+			}
+		}
 	}
 	if hasRemovePath {
 		if strings.TrimSpace(a.RemovePath.Path) == "" || strings.TrimSpace(a.RemovePath.Root) == "" {

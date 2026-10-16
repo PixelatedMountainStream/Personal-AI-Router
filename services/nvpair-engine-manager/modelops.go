@@ -17,11 +17,65 @@ type modelActionRequest struct {
 
 // ModelLoad warms a model into engine memory using each engine's manifest action.
 func (e *Executor) ModelLoad(ctx context.Context, engine, model string) (json.RawMessage, error) {
-	action, params, err := modelActionWire(engine, "load", model)
+	return e.ModelLoadWith(ctx, engine, model, LoadOpts{})
+}
+
+// LoadOpts are the optional load-time parameters of a pinned load. Zero means
+// "engine default" and is never sent.
+type LoadOpts struct {
+	ContextLength int `json:"context_length,omitempty"`
+	Parallel      int `json:"parallel,omitempty"`
+}
+
+// ModelLoadWith loads a model with explicit load-time parameters. An engine
+// that cannot honor a requested parameter fails with a 400 *pinnedError rather
+// than silently ignoring it.
+func (e *Executor) ModelLoadWith(ctx context.Context, engine, model string, o LoadOpts) (json.RawMessage, error) {
+	action, params, err := modelLoadWire(engine, model, o)
 	if err != nil {
 		return nil, err
 	}
 	return e.Action(ctx, engine, action, params)
+}
+
+// modelLoadWire builds the load action and params for the engine.
+//   - ollama: context_length is sent as options.num_ctx; parallel other than 1
+//     is refused (Ollama sizes parallelism server-side).
+//   - lmstudio: both go to the load action's optional_args (lms load flags).
+//   - llamacpp and any other engine: context and parallel are fixed at launch,
+//     so requesting them is refused.
+func modelLoadWire(engine, model string, o LoadOpts) (string, json.RawMessage, error) {
+	if o.ContextLength < 0 || o.Parallel < 0 {
+		return "", nil, badParam("context_length and parallel must be non-negative")
+	}
+	if o == (LoadOpts{}) {
+		return modelActionWire(engine, "load", model)
+	}
+	if model == "" {
+		return "", nil, fmt.Errorf("model is required")
+	}
+	switch engine {
+	case "ollama":
+		if o.Parallel > 1 {
+			return "", nil, badParam("ollama does not support a per-load parallel setting")
+		}
+		body := map[string]any{"model": model, "stream": false}
+		if o.ContextLength > 0 {
+			body["options"] = map[string]int{"num_ctx": o.ContextLength}
+		}
+		return marshalModelAction("run_model", body)
+	case "lmstudio":
+		body := map[string]any{"model": model}
+		if o.ContextLength > 0 {
+			body["context_length"] = o.ContextLength
+		}
+		if o.Parallel > 0 {
+			body["parallel"] = o.Parallel
+		}
+		return marshalModelAction("load_model", body)
+	default:
+		return "", nil, badParam(fmt.Sprintf("engine %q fixes context_length and parallel at launch; omit them", engine))
+	}
 }
 
 // ModelUnload frees a model from engine memory.

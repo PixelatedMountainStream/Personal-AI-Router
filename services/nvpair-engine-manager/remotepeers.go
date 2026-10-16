@@ -14,6 +14,9 @@ package main
 // engine:remote-* methods look targets up here.
 
 import (
+	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	"nvpair-shared/noderec"
@@ -70,4 +73,19 @@ func (d *peerDirectory) lookup(nodeID string) (ecPeer, bool) {
 	defer d.mu.RUnlock()
 	p, ok := d.peers[nodeID]
 	return p, ok
+}
+
+// describe lists the known peer ids with their addresses, for a 404 message.
+func (d *peerDirectory) describe() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if len(d.peers) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(d.peers))
+	for id, p := range d.peers {
+		parts = append(parts, fmt.Sprintf("%s (%s)", id, strings.Join(p.addresses, ",")))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "; ")
 }
