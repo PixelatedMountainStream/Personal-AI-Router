@@ -134,7 +134,8 @@ type Executor struct {
 	unloadPollInterval   time.Duration
 	ops                  *pinnedOps
 	onMultiLarge         func(names []string)
-	multiLargeWarned     bool // watcher goroutine only
+	multiLargeWarned     bool   // watcher goroutine only
+	uncertain            string // engine/model of a failed load with unconfirmed residency; under loadMu
 
 	reservedPort atomic.Int32
 	// StopAll is terminal for an Executor; the gate closes its start/snapshot race.

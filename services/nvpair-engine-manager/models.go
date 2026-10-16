@@ -387,27 +387,35 @@ func extractStringsResult(raw json.RawMessage, spec *ActionResult) ([]string, bo
 // /api/v1/models loaded_instances). A missing or wrong-typed path fails the
 // match, so a row we cannot classify is excluded rather than counted as loaded.
 func matchRow(el map[string]json.RawMessage, m *ResultMatch) bool {
-	fv, ok := resolveObjectPath(el, m.Field)
-	if !ok {
-		return false
+	match, _ := classifyRow(el, m)
+	return match
+}
+
+// classifyRow is matchRow with a second result: ok=false when the row cannot be
+// classified (path missing or wrong-typed), which residency checks treat as a
+// failure instead of "not loaded".
+func classifyRow(el map[string]json.RawMessage, m *ResultMatch) (match, ok bool) {
+	fv, found := resolveObjectPath(el, m.Field)
+	if !found {
+		return false, false
 	}
 	if m.Nonempty {
 		var arr []json.RawMessage
 		if err := json.Unmarshal(fv, &arr); err != nil {
-			return false
+			return false, false
 		}
-		return len(arr) > 0
+		return len(arr) > 0, true
 	}
 	var s string
 	if err := json.Unmarshal(fv, &s); err != nil {
-		return false
+		return false, false
 	}
 	for _, want := range m.In {
 		if s == want {
-			return true
+			return true, true
 		}
 	}
-	return false
+	return false, true
 }
 
 func resolveObjectPath(obj map[string]json.RawMessage, path string) (json.RawMessage, bool) {

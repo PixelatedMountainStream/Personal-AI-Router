@@ -15,11 +15,6 @@ type modelActionRequest struct {
 	Model  string `json:"model"`
 }
 
-// ModelLoad warms a model into engine memory using each engine's manifest action.
-func (e *Executor) ModelLoad(ctx context.Context, engine, model string) (json.RawMessage, error) {
-	return e.ModelLoadWith(ctx, engine, model, LoadOpts{})
-}
-
 // LoadOpts are the optional load-time parameters of a pinned load. Zero means
 // "engine default" and is never sent.
 type LoadOpts struct {
@@ -27,10 +22,10 @@ type LoadOpts struct {
 	Parallel      int `json:"parallel,omitempty"`
 }
 
-// ModelLoadWith loads a model with explicit load-time parameters. An engine
-// that cannot honor a requested parameter fails with a 400 *pinnedError rather
+// loadModelUnguarded is the single private loader: it bypasses the exclusivity
+// gate, so only exclusiveRun may reach it. An engine that cannot honor a requested parameter fails with a 400 *pinnedError rather
 // than silently ignoring it.
-func (e *Executor) ModelLoadWith(ctx context.Context, engine, model string, o LoadOpts) (json.RawMessage, error) {
+func (e *Executor) loadModelUnguarded(ctx context.Context, engine, model string, o LoadOpts) (json.RawMessage, error) {
 	action, params, err := modelLoadWire(engine, model, o)
 	if err != nil {
 		return nil, err

@@ -6,7 +6,9 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +23,9 @@ type fakeOps struct {
 	calls     []string
 	unloadErr error
 	stuck     bool // unload succeeds but the model stays resident
+	shrink    bool // ... and then reports a small size
+	loadErr   error
+	snapErr   error
 	loadHook  func()
 }
 
@@ -29,6 +34,9 @@ func (f *fakeOps) ops() *pinnedOps {
 		resident: func(context.Context) ([]residentModel, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
+			if f.snapErr != nil {
+				return nil, f.snapErr
+			}
 			return append([]residentModel(nil), f.res...), nil
 		},
 		unload: func(_ context.Context, engine, model string) error {
@@ -37,6 +45,11 @@ func (f *fakeOps) ops() *pinnedOps {
 			f.calls = append(f.calls, "unload "+engine+"/"+model)
 			if f.unloadErr != nil {
 				return f.unloadErr
+			}
+			if f.stuck && f.shrink {
+				for i := range f.res {
+					f.res[i].Bytes = gib
+				}
 			}
 			if !f.stuck {
 				for i, r := range f.res {
@@ -55,7 +68,7 @@ func (f *fakeOps) ops() *pinnedOps {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.calls = append(f.calls, "load "+engine+"/"+model)
-			return nil
+			return f.loadErr
 		},
 		applied: func(context.Context, string, string) (SlotInfo, bool) { return SlotInfo{}, false },
 	}
@@ -78,7 +91,8 @@ func TestLargeRule(t *testing.T) {
 		want  bool
 	}{
 		{20 * gib, "tiny", true},        // by bytes
-		{2 * gib, "qwen3.8:27b", false}, // known bytes beat the name
+		{2 * gib, "qwen3.8:27b", true},  // a >=20b name token is large whatever the bytes
+		{2 * gib, "llama3.2:3b", false}, // small bytes, small token
 		{0, "qwen3.8:27b", true},        // by name
 		{0, "llama3.2:3b", false},       // small by name
 		{0, "mystery-model", true},      // unknown -> large
@@ -186,5 +200,54 @@ func TestMultiLargeWarningOnce(t *testing.T) {
 	ex.observeLarge(two)
 	if warnings != 2 {
 		t.Fatalf("warnings=%d want 2 after re-arm", warnings)
+	}
+}
+
+func TestLegacyLoadConflicts(t *testing.T) {
+	f := &fakeOps{res: []residentModel{{Engine: "ollama", Model: "qwen-30b"}}}
+	ex := exclusiveExec(t, f)
+	w := httptest.NewRecorder()
+	body := strings.NewReader(`{"engine":"lmstudio","model":"big-27b"}`)
+	(&controlServer{exec: ex}).handleModelAction(w, httptest.NewRequest("POST", "/v1/models/load", body), "load")
+	if w.Code != 409 || len(f.calls) != 0 {
+		t.Fatalf("code=%d calls=%v", w.Code, f.calls)
+	}
+}
+
+func TestUncertainLoadBlocksNext(t *testing.T) {
+	f := &fakeOps{loadErr: errors.New("transport closed")}
+	ex := exclusiveExec(t, f)
+	req := PinnedRequest{Engine: "lmstudio", Model: "big-27b"}
+	if _, err := ex.PinnedLoad(context.Background(), req); pinnedStatus(err) != 502 {
+		t.Fatalf("first err=%v", err)
+	}
+	f.snapErr = errors.New("down")
+	if _, err := ex.PinnedLoad(context.Background(), req); pinnedStatus(err) != 409 {
+		t.Fatalf("blocked err=%v", err)
+	}
+	f.snapErr, f.loadErr = nil, nil
+	if _, err := ex.PinnedLoad(context.Background(), req); err != nil {
+		t.Fatalf("after confirm err=%v", err)
+	}
+}
+
+func TestStrictResidencyFailsClosed(t *testing.T) {
+	spec := &ActionResult{Array: "data", Field: "id", Match: &ResultMatch{Field: "status.value", In: []string{"loaded"}}}
+	ok := `{"data":[{"id":"a","status":{"value":"loaded"}},{"id":"b","status":{"value":"unloaded"}}]}`
+	if got, err := extractLoadedStrict([]byte(ok), spec); err != nil || len(got) != 1 || got[0] != "a" {
+		t.Fatalf("got %v err=%v", got, err)
+	}
+	if _, err := extractLoadedStrict([]byte(`{"data":[{"id":"a"}]}`), spec); err == nil {
+		t.Fatal("row without status must fail closed")
+	}
+}
+
+func TestVictimStillResidentTimesOut(t *testing.T) {
+	// The stuck victim later reports a small size; it must still count.
+	f := &fakeOps{res: []residentModel{{Engine: "ollama", Model: "mystery", Bytes: 20 * gib}}, stuck: true, shrink: true}
+	ex := exclusiveExec(t, f)
+	_, err := ex.PinnedLoad(context.Background(), PinnedRequest{Engine: "lmstudio", Model: "big-27b", Evict: true})
+	if pinnedStatus(err) != 504 || len(f.calls) != 1 {
+		t.Fatalf("err=%v calls=%v", err, f.calls)
 	}
 }

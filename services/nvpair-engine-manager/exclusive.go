@@ -13,6 +13,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -46,11 +48,13 @@ func (r residentModel) victim() Victim {
 
 var paramTokenRe = regexp.MustCompile(`(?i)(?:^|[^a-z0-9.])(\d+(?:\.\d+)?)b(?:$|[^a-z0-9])`)
 
-// isLargeModel: by resident bytes when known; else by the largest "<n>b"
-// parameter token in the name; with neither, large (fail safe).
+// isLargeModel: large when the resident bytes reach the threshold OR the name
+// carries a "<n>b" parameter token of at least largeParamBillions (a heavily
+// quantized 27b is still large). Otherwise small when bytes are known or a
+// smaller token is present; with neither, large (fail safe).
 func isLargeModel(bytes int64, name string, thresholdBytes int64) bool {
-	if bytes > 0 {
-		return bytes >= thresholdBytes
+	if bytes > 0 && bytes >= thresholdBytes {
+		return true
 	}
 	found := false
 	for _, m := range paramTokenRe.FindAllStringSubmatch(name, -1) {
@@ -61,7 +65,7 @@ func isLargeModel(bytes int64, name string, thresholdBytes int64) bool {
 			}
 		}
 	}
-	return !found
+	return !found && bytes <= 0
 }
 
 func (e *Executor) isLarge(r residentModel) bool {
@@ -96,14 +100,14 @@ func (e *Executor) pinnedOps() *pinnedOps {
 		resident: func(ctx context.Context) ([]residentModel, error) {
 			ctx, cancel := context.WithTimeout(ctx, modelsTimeout)
 			defer cancel()
-			return e.residentFrom(ctx, e.ModelsResult(ctx))
+			return e.residentStrict(ctx)
 		},
 		unload: func(ctx context.Context, engine, model string) error {
 			_, err := e.ModelUnload(ctx, engine, model)
 			return err
 		},
 		load: func(ctx context.Context, engine, model string, o LoadOpts) error {
-			_, err := e.ModelLoadWith(ctx, engine, model, o)
+			_, err := e.loadModelUnguarded(ctx, engine, model, o)
 			return err
 		},
 		applied: func(ctx context.Context, engine, model string) (SlotInfo, bool) {
@@ -113,22 +117,85 @@ func (e *Executor) pinnedOps() *pinnedOps {
 	}
 }
 
-// residentFrom turns a models sweep into the resident list, adding byte sizes
-// from each engine's model_sizes action. It fails closed: a running engine that
-// declares loaded_models but did not report it leaves residency unknown.
-func (e *Executor) residentFrom(ctx context.Context, res ModelsResult) ([]residentModel, error) {
-	var out []residentModel
+// residentStrict is the exclusivity snapshot: it queries every running engine
+// that declares loaded_models and fails closed when any engine cannot be
+// queried or any row cannot be classified (a partial view could hide a large
+// resident model). Sizes and slots come from the helpers the watcher shares.
+func (e *Executor) residentStrict(ctx context.Context) ([]residentModel, error) {
+	res := ModelsResult{LoadedByEngine: map[string][]string{}, SlotsByEngine: map[string]map[string]SlotInfo{}}
 	for _, name := range e.reg.Names() {
 		mf, ok := e.reg.Get(name)
 		if !ok {
 			continue
 		}
-		if _, declares := mf.Actions["loaded_models"]; declares {
-			if st, err := e.Status(name); err == nil && st.Running {
-				if _, reported := res.LoadedByEngine[name]; !reported {
-					return nil, fmt.Errorf("cannot determine which models engine %q has loaded", name)
-				}
+		act, declares := mf.Actions["loaded_models"]
+		if !declares {
+			continue
+		}
+		if st, err := e.Status(name); err != nil || !st.Running {
+			continue
+		}
+		raw, err := e.Action(ctx, name, "loaded_models", nil)
+		if err != nil {
+			return nil, fmt.Errorf("cannot determine which models engine %q has loaded: %w", name, err)
+		}
+		loaded, err := extractLoadedStrict(raw, act.Result)
+		if err != nil {
+			return nil, fmt.Errorf("engine %q loaded_models is unusable: %w", name, err)
+		}
+		res.LoadedByEngine[name] = loaded
+		if sa, ok := mf.Actions["slots"]; ok && sa.Result != nil && sa.Result.Record != nil && len(loaded) > 0 {
+			res.SlotsByEngine[name] = e.querySlots(ctx, name, &sa, loaded)
+		}
+	}
+	return e.residentFrom(ctx, res), nil
+}
+
+// extractLoadedStrict is extractStringsResult for residency: every row must be
+// classifiable (filter field present and well-typed, name a non-empty string);
+// anything else is an error rather than a silently dropped row.
+func extractLoadedStrict(raw json.RawMessage, spec *ActionResult) ([]string, error) {
+	if spec == nil {
+		return nil, errors.New("no result spec")
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil, errors.New("response is not an object")
+	}
+	var arr []map[string]json.RawMessage
+	if arrRaw, ok := obj[spec.Array]; !ok || json.Unmarshal(arrRaw, &arr) != nil || arr == nil {
+		return nil, fmt.Errorf("missing or invalid %q array", spec.Array)
+	}
+	out := []string{}
+	for i, el := range arr {
+		if spec.Match != nil {
+			match, ok := classifyRow(el, spec.Match)
+			if !ok {
+				return nil, fmt.Errorf("row %d cannot be classified", i)
 			}
+			if !match {
+				continue
+			}
+		}
+		var name string
+		if json.Unmarshal(el[spec.Field], &name) != nil || name == "" {
+			return nil, fmt.Errorf("row %d has no model name", i)
+		}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
+// residentFrom turns a models sweep into the resident list, adding byte sizes
+// from each engine's model_sizes action. Engines absent from the sweep
+// contribute nothing; the exclusivity caller gets completeness from
+// residentStrict, the watcher tolerates gaps.
+func (e *Executor) residentFrom(ctx context.Context, res ModelsResult) []residentModel {
+	var out []residentModel
+	for _, name := range e.reg.Names() {
+		mf, ok := e.reg.Get(name)
+		if !ok {
+			continue
 		}
 		loaded := res.LoadedByEngine[name]
 		if len(loaded) == 0 {
@@ -148,7 +215,7 @@ func (e *Executor) residentFrom(ctx context.Context, res ModelsResult) ([]reside
 			out = append(out, r)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // victimsOf returns what must be unloaded before req can load, and whether the
@@ -179,6 +246,31 @@ func (e *Executor) victimsOf(snap []residentModel, req PinnedRequest) (victims [
 
 // exclusiveLoad is the guarded body of PinnedLoad. Callers have validated req.
 func (e *Executor) exclusiveLoad(ctx context.Context, req PinnedRequest) (PinnedResult, error) {
+	return e.exclusiveRun(ctx, req, nil)
+}
+
+// residentChecked takes the exclusivity snapshot (caller holds loadMu) and
+// enforces the residency-uncertain reservation: after a load that errored or
+// was cancelled post-acceptance, nothing else loads until a strict snapshot
+// succeeds again.
+func (e *Executor) residentChecked(ctx context.Context, ops *pinnedOps) ([]residentModel, error) {
+	snap, err := ops.resident(ctx)
+	if e.uncertain != "" {
+		if err != nil {
+			return nil, &pinnedError{Status: http.StatusConflict,
+				Message: fmt.Sprintf("residency is uncertain after the failed load of %s and cannot be confirmed yet: %v", e.uncertain, err)}
+		}
+		e.uncertain = ""
+	}
+	if err != nil {
+		return nil, &pinnedError{Status: http.StatusBadGateway, Message: err.Error()}
+	}
+	return snap, nil
+}
+
+// exclusiveRun runs a load under the node-wide gate. load performs the engine
+// call; nil means ops.load with req's parameters.
+func (e *Executor) exclusiveRun(ctx context.Context, req PinnedRequest, load func(context.Context) error) (PinnedResult, error) {
 	// Node-wide: pinned loads on different engines must not interleave.
 	if !e.loadMu.TryLock() {
 		return PinnedResult{}, &pinnedError{Status: http.StatusConflict, Message: "another pinned load is in progress on this node"}
@@ -186,9 +278,12 @@ func (e *Executor) exclusiveLoad(ctx context.Context, req PinnedRequest) (Pinned
 	defer e.loadMu.Unlock()
 
 	ops := e.pinnedOps()
-	snap, err := ops.resident(ctx)
+	if load == nil {
+		load = func(ctx context.Context) error { return ops.load(ctx, req.Engine, req.Model, req.LoadOpts) }
+	}
+	snap, err := e.residentChecked(ctx, ops)
 	if err != nil {
-		return PinnedResult{}, &pinnedError{Status: http.StatusBadGateway, Message: err.Error()}
+		return PinnedResult{}, err
 	}
 	victims, same := e.victimsOf(snap, req)
 	res := PinnedResult{Engine: req.Engine, Model: req.Model, Applied: req.LoadOpts, Unloaded: []Victim{}}
@@ -208,7 +303,7 @@ func (e *Executor) exclusiveLoad(ctx context.Context, req PinnedRequest) (Pinned
 			}
 			res.Unloaded = append(res.Unloaded, v)
 		}
-		same, err = e.confirmGone(ctx, ops, req)
+		same, err = e.confirmGone(ctx, ops, req, victims)
 		if err != nil {
 			return PinnedResult{}, err
 		}
@@ -217,7 +312,12 @@ func (e *Executor) exclusiveLoad(ctx context.Context, req PinnedRequest) (Pinned
 		res.AlreadyLoaded = true
 		return res, nil
 	}
-	if err := ops.load(ctx, req.Engine, req.Model, req.LoadOpts); err != nil {
+	if err := load(ctx); err != nil {
+		if pinnedStatus(err) != http.StatusBadRequest {
+			// The engine may have accepted the load before the error or
+			// cancellation; keep the reservation until a snapshot confirms.
+			e.uncertain = req.Engine + "/" + req.Model
+		}
 		if pinnedStatus(err) != http.StatusInternalServerError {
 			return PinnedResult{}, err
 		}
@@ -227,30 +327,111 @@ func (e *Executor) exclusiveLoad(ctx context.Context, req PinnedRequest) (Pinned
 	return res, nil
 }
 
-// confirmGone polls until no victim remains resident (a model that appears
-// meanwhile, e.g. JIT, counts too) or the confirm timeout expires. It returns
+// confirmGone polls until every original victim is absent and nothing else
+// large is resident, all within one confirm deadline that also bounds each
+// snapshot. An empty result after the deadline does not count. It returns
 // whether the target is now resident with the requested parameters.
-func (e *Executor) confirmGone(ctx context.Context, ops *pinnedOps, req PinnedRequest) (bool, error) {
+func (e *Executor) confirmGone(ctx context.Context, ops *pinnedOps, req PinnedRequest, victims []Victim) (bool, error) {
 	deadline := time.Now().Add(e.unloadConfirmTimeout)
+	dctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	timeout := func(remain []Victim) error {
+		return &pinnedError{Status: http.StatusGatewayTimeout, Victims: remain,
+			Message: "timed out waiting for unload (nothing loaded): " + describeVictims(remain)}
+	}
 	for {
-		snap, err := ops.resident(ctx)
+		snap, err := ops.resident(dctx)
+		expired := !time.Now().Before(deadline)
 		if err != nil {
+			if expired {
+				return false, timeout(victims)
+			}
 			return false, &pinnedError{Status: http.StatusBadGateway, Message: err.Error()}
 		}
 		remain, same := e.victimsOf(snap, req)
-		if len(remain) == 0 {
+		seen := map[string]bool{}
+		for _, v := range remain {
+			seen[v.Engine+"/"+v.Model] = true
+		}
+		for _, r := range snap {
+			for _, v := range victims {
+				if r.Engine == v.Engine && r.Model == v.Model && !seen[v.Engine+"/"+v.Model] {
+					seen[v.Engine+"/"+v.Model] = true
+					remain = append(remain, r.victim())
+				}
+			}
+		}
+		if len(remain) == 0 && !expired {
 			return same, nil
 		}
-		if !time.Now().Before(deadline) {
-			return false, &pinnedError{Status: http.StatusGatewayTimeout, Victims: remain,
-				Message: "timed out waiting for unload (nothing loaded): " + describeVictims(remain)}
+		if expired {
+			return false, timeout(remain)
 		}
 		select {
-		case <-ctx.Done():
-			return false, &pinnedError{Status: http.StatusGatewayTimeout, Message: ctx.Err().Error()}
+		case <-dctx.Done():
+			return false, timeout(remain)
 		case <-time.After(e.unloadPollInterval):
 		}
 	}
+}
+
+// loadActions are the manifest actions that load a model into memory.
+var loadActions = map[string]bool{"load_model": true, "run_model": true}
+
+// guardedLoadAction runs a manifest load action (engine:action from the TUI)
+// through the same exclusivity gate without evicting: a conflict is a 409.
+func (e *Executor) guardedLoadAction(ctx context.Context, engine, action string, params json.RawMessage) (json.RawMessage, error) {
+	model := modelFromParams(params)
+	if _, ok := e.reg.Get(engine); !ok || model == "" {
+		return nil, badParam(fmt.Sprintf("a load needs a known engine and a model (engine %q)", engine))
+	}
+	var out json.RawMessage
+	res, err := e.exclusiveRun(ctx, PinnedRequest{Engine: engine, Model: model}, func(ctx context.Context) (err error) {
+		out, err = e.Action(ctx, engine, action, params)
+		return err
+	})
+	if err == nil && out == nil {
+		out, _ = json.Marshal(res)
+	}
+	return out, err
+}
+
+// launchLoadsModel reports whether engine launch args name a model to load at
+// startup (llama-server -m/-hf and friends).
+func launchLoadsModel(args []string) bool {
+	for _, a := range args {
+		flag, _, _ := strings.Cut(a, "=")
+		switch flag {
+		case "-m", "--model", "-hf", "-hfr", "--hf-repo", "-mu", "--model-url":
+			return true
+		}
+	}
+	return false
+}
+
+// gateStartupLoad gates an engine start whose launch args load a model (an
+// auto-start or custom launch): it refuses with 409 when a large model is
+// already resident, else holds loadMu until the returned release runs so no
+// pinned load interleaves with the start.
+func (e *Executor) gateStartupLoad(ctx context.Context, engine string, args []string) (func(), error) {
+	noop := func() {}
+	if !launchLoadsModel(args) {
+		return noop, nil
+	}
+	if !e.loadMu.TryLock() {
+		return noop, &pinnedError{Status: http.StatusConflict, Message: "another model load is in progress on this node"}
+	}
+	snap, err := e.residentChecked(ctx, e.pinnedOps())
+	if err != nil {
+		e.loadMu.Unlock()
+		return noop, err
+	}
+	if victims, _ := e.victimsOf(snap, PinnedRequest{Engine: engine}); len(victims) > 0 {
+		e.loadMu.Unlock()
+		return noop, &pinnedError{Status: http.StatusConflict, Victims: victims,
+			Message: "starting " + engine + " with a model would leave two large models resident: " + describeVictims(victims)}
+	}
+	return e.loadMu.Unlock, nil
 }
 
 // reportApplied fills Applied from what the engine reports it actually loaded
@@ -317,10 +498,7 @@ func (e *Executor) checkMultiLarge(ctx context.Context, res ModelsResult) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, modelsTimeout)
 	defer cancel()
-	snap, err := e.residentFrom(ctx, res)
-	if err != nil {
-		return
-	}
+	snap := e.residentFrom(ctx, res)
 	var large []string
 	for _, r := range snap {
 		if e.isLarge(r) {
