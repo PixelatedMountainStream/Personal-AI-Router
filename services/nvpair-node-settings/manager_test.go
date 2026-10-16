@@ -895,3 +895,31 @@ func writePipeRequest(t *testing.T, conn net.Conn, id int, method string, params
 		t.Fatalf("write request: %v", err)
 	}
 }
+
+func TestEngineOverrideRoundTrip(t *testing.T) {
+	m, rw, _ := newTestManager(t)
+	_ = callAndDecode[map[string]bool](t, m, rw, 1, "settings/set-engine-override", map[string]any{"key": "engine_slots.lmstudio.qwen3.8-27b-mlx", "value": 4})
+	_ = callAndDecode[map[string]bool](t, m, rw, 2, "settings/set-engine-override", map[string]any{"key": "jit_load.lmstudio", "value": true})
+	got := callAndDecode[map[string]map[string]json.RawMessage](t, m, rw, 3, "settings/get-engine-overrides", nil)
+	if string(got["value"]["engine_slots.lmstudio.qwen3.8-27b-mlx"]) != "4" || string(got["value"]["jit_load.lmstudio"]) != "true" {
+		t.Fatalf("overrides = %v", got)
+	}
+	callExpectError(t, m, rw, 4, "settings/set-engine-override", map[string]any{"key": "engine_slots.lmstudio.m", "value": 0}, -32602)
+	callExpectError(t, m, rw, 5, "settings/set-engine-override", map[string]any{"key": "bogus.x", "value": 1}, -32602)
+	_ = callAndDecode[map[string]bool](t, m, rw, 6, "settings/set-engine-override", map[string]any{"key": "jit_load.lmstudio", "value": nil})
+	got = callAndDecode[map[string]map[string]json.RawMessage](t, m, rw, 7, "settings/get-engine-overrides", nil)
+	if _, ok := got["value"]["jit_load.lmstudio"]; ok || len(got["value"]) != 1 {
+		t.Fatalf("after remove = %v", got)
+	}
+}
+
+func TestValidEngineOverrideRejectsBadKeyOnRemove(t *testing.T) {
+	for _, k := range []string{"", "bogus", "engine_slots.", "engine_slots.x", "jit_load."} {
+		if validEngineOverride(k, nil) || validEngineOverride(k, json.RawMessage("null")) {
+			t.Errorf("malformed key %q accepted for removal", k)
+		}
+	}
+	if !validEngineOverride("engine_slots.ollama.q", json.RawMessage("null")) || !validEngineOverride("jit_load.ollama", nil) {
+		t.Error("well-formed key must be removable")
+	}
+}

@@ -114,6 +114,10 @@ type AvailableNode struct {
 	// consumer show which of a remote node's models are loaded. Omitted
 	// when no engine reports loaded state.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+	// SlotsByEngine and JITLoadByEngine: per-engine slot capacity (loaded models)
+	// and on-demand-load flags, relayed from the node directory.
+	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine,omitempty"`
+	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine,omitempty"`
 }
 
 // GetNodesResult is the response to "discovery:get-nodes". Wrapped in an
