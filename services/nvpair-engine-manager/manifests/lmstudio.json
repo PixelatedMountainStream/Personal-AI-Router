@@ -74,17 +74,17 @@
     "loaded_models": {
       "description": "List models currently loaded in memory (native REST v1, filtered by nonempty loaded_instances).",
       "http": { "method": "GET", "path": "/api/v1/models" },
-      "result": { "array": "models", "field": "key", "match": { "field": "loaded_instances", "nonempty": true } }
+      "result": { "array": "models", "field": "key", "each": "loaded_instances", "match": { "field": "loaded_instances", "nonempty": true } }
     },
     "slots": {
       "description": "Per-model parallel slots and context of loaded instances (set at load time).",
       "http": { "method": "GET", "path": "/api/v1/models" },
-      "result": { "array": "models", "field": "key", "match": { "field": "loaded_instances", "nonempty": true }, "record": { "fields": { "slots": "loaded_instances.0.config.parallel", "ctx": "loaded_instances.0.config.context_length" } } }
+      "result": { "array": "models", "field": "key", "each": "loaded_instances", "match": { "field": "loaded_instances", "nonempty": true }, "record": { "fields": { "slots": "loaded_instances.0.config.parallel", "ctx": "loaded_instances.0.config.context_length" } } }
     },
     "model_sizes": {
       "description": "Size in bytes of each loaded model (/api/v1/models models[].size_bytes, filtered to loaded_instances nonempty).",
       "http": { "method": "GET", "path": "/api/v1/models" },
-      "result": { "array": "models", "field": "key", "match": { "field": "loaded_instances", "nonempty": true }, "record": { "fields": { "bytes": "size_bytes" } } }
+      "result": { "array": "models", "field": "key", "each": "loaded_instances", "match": { "field": "loaded_instances", "nonempty": true }, "record": { "fields": { "bytes": "size_bytes" } } }
     },
     "pull_model": {
       "description": "Download a model via the lms CLI (params: {\"model\": \"<owner/name | huggingface.co or lmstudio.ai URL>\"}). Tries the value as given, then the LM Studio Hub artifact id, then the Hugging Face repo URL. Resumes automatically on a transient download timeout.",

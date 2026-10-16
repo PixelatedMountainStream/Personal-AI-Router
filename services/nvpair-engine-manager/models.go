@@ -235,6 +235,49 @@ func (e *Executor) querySlots(ctx context.Context, engine string, act *Action, l
 // keyed by the row's spec.Field string, honoring spec.Match. Rows whose capacity
 // cannot be extracted (missing or wrong-typed path) are skipped. A missing or
 // non-array spec.Array returns ok=false.
+// expandInstances splits each row into one row per entry of spec.Each, with
+// spec.Field set to the instance's id and loaded_instances narrowed to it. The
+// row's size_bytes describes only the selected variant, so it is kept only for
+// the instance whose id equals the key and dropped (unknown) otherwise.
+func expandInstances(arr []map[string]json.RawMessage, spec *ActionResult) []map[string]json.RawMessage {
+	if spec.Each == "" {
+		return arr
+	}
+	idf := spec.EachField
+	if idf == "" {
+		idf = "id"
+	}
+	var out []map[string]json.RawMessage
+	for _, el := range arr {
+		var insts []json.RawMessage
+		if json.Unmarshal(el[spec.Each], &insts) != nil || len(insts) == 0 {
+			out = append(out, el)
+			continue
+		}
+		var key string
+		_ = json.Unmarshal(el[spec.Field], &key)
+		for _, in := range insts {
+			var m map[string]json.RawMessage
+			var id string
+			if json.Unmarshal(in, &m) != nil || json.Unmarshal(m[idf], &id) != nil || id == "" {
+				out = append(out, el) // unclassifiable instance: keep the row
+				continue
+			}
+			c := map[string]json.RawMessage{}
+			for k, v := range el {
+				c[k] = v
+			}
+			c[spec.Field], _ = json.Marshal(id)
+			c[spec.Each], _ = json.Marshal([]json.RawMessage{in})
+			if id != key {
+				delete(c, "size_bytes")
+			}
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func extractRecords(raw json.RawMessage, spec *ActionResult) (map[string]SlotInfo, bool) {
 	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &obj); err != nil {
@@ -245,7 +288,7 @@ func extractRecords(raw json.RawMessage, spec *ActionResult) (map[string]SlotInf
 		return nil, false
 	}
 	out := map[string]SlotInfo{}
-	for _, el := range arr {
+	for _, el := range expandInstances(arr, spec) {
 		if spec.Match != nil && !matchRow(el, spec.Match) {
 			continue
 		}
