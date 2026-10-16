@@ -399,6 +399,9 @@ func classifyRow(el map[string]json.RawMessage, m *ResultMatch) (match, ok bool)
 	if !found {
 		return false, false
 	}
+	if bytes.Equal(bytes.TrimSpace(fv), []byte("null")) {
+		return false, false // JSON null would decode as an empty value, i.e. "not loaded"
+	}
 	if m.Nonempty {
 		var arr []json.RawMessage
 		if err := json.Unmarshal(fv, &arr); err != nil {

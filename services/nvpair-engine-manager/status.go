@@ -57,6 +57,18 @@ func (e *Executor) Status(engine string) (EngineStatus, error) {
 // lets upgrade orchestration identify a legacy listener before changing the
 // persisted backend port; successful identification updates the live state.
 func (e *Executor) StatusAtPort(engine string, probePort int) (EngineStatus, error) {
+	return e.statusCtx(context.Background(), engine, probePort, true)
+}
+
+// statusNoWait is Status for callers that may already hold a lifecycle lock
+// (startup gating) or run under a deadline: it never blocks on opMu. When a
+// lifecycle operation owns the lock it returns the in-memory state without
+// re-probing, and the probe honors ctx.
+func (e *Executor) statusNoWait(ctx context.Context, engine string) (EngineStatus, error) {
+	return e.statusCtx(ctx, engine, 0, false)
+}
+
+func (e *Executor) statusCtx(ctx context.Context, engine string, probePort int, wait bool) (EngineStatus, error) {
 	st, err := e.state(engine)
 	if err != nil {
 		// Known engine with no host-platform block: return a shell status
@@ -67,7 +79,11 @@ func (e *Executor) StatusAtPort(engine string, probePort int) (EngineStatus, err
 		}
 		return EngineStatus{}, err
 	}
-	st.opMu.Lock()
+	if wait {
+		st.opMu.Lock()
+	} else if !st.opMu.TryLock() {
+		return e.snapshot(engine, st), nil
+	}
 	defer st.opMu.Unlock()
 	pathInstalled, _ := e.Detect(engine)
 	st.mu.Lock()
@@ -76,7 +92,7 @@ func (e *Executor) StatusAtPort(engine string, probePort int) (EngineStatus, err
 	if probePort > 0 {
 		port = probePort
 	}
-	e.reconcilePresence(context.Background(), engine, st, pathInstalled, port, false)
+	e.reconcilePresence(ctx, engine, st, pathInstalled, port, false)
 	return e.snapshot(engine, st), nil
 }
 

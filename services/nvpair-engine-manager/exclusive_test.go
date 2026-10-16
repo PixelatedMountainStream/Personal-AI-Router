@@ -18,15 +18,16 @@ const gib = int64(1) << 30
 
 // fakeOps simulates engines in memory and records the call order.
 type fakeOps struct {
-	mu        sync.Mutex
-	res       []residentModel
-	calls     []string
-	unloadErr error
-	stuck     bool // unload succeeds but the model stays resident
-	shrink    bool // ... and then reports a small size
-	loadErr   error
-	snapErr   error
-	loadHook  func()
+	mu         sync.Mutex
+	res        []residentModel
+	calls      []string
+	unloadErr  error
+	stuck      bool // unload succeeds but the model stays resident
+	shrink     bool // ... and then reports a small size
+	loadErr    error
+	snapErr    error
+	loadHook   func()
+	loadingFor int // resident calls before a Loading model becomes loaded
 }
 
 func (f *fakeOps) ops() *pinnedOps {
@@ -36,6 +37,13 @@ func (f *fakeOps) ops() *pinnedOps {
 			defer f.mu.Unlock()
 			if f.snapErr != nil {
 				return nil, f.snapErr
+			}
+			if f.loadingFor > 0 {
+				if f.loadingFor--; f.loadingFor == 0 {
+					for i := range f.res {
+						f.res[i].Loading = false
+					}
+				}
 			}
 			return append([]residentModel(nil), f.res...), nil
 		},
@@ -217,6 +225,7 @@ func TestLegacyLoadConflicts(t *testing.T) {
 func TestUncertainLoadBlocksNext(t *testing.T) {
 	f := &fakeOps{loadErr: errors.New("transport closed")}
 	ex := exclusiveExec(t, f)
+	ex.uncertainGap = time.Nanosecond
 	req := PinnedRequest{Engine: "lmstudio", Model: "big-27b"}
 	if _, err := ex.PinnedLoad(context.Background(), req); pinnedStatus(err) != 502 {
 		t.Fatalf("first err=%v", err)
@@ -226,8 +235,66 @@ func TestUncertainLoadBlocksNext(t *testing.T) {
 		t.Fatalf("blocked err=%v", err)
 	}
 	f.snapErr, f.loadErr = nil, nil
+	// Still loading: never cleared, however many snapshots.
+	f.res = []residentModel{{Engine: "lmstudio", Model: "big-27b", Loading: true}}
+	for i := 0; i < 2; i++ {
+		if _, err := ex.PinnedLoad(context.Background(), req); pinnedStatus(err) != 409 {
+			t.Fatalf("loading i=%d err=%v unc=%q", i, err, ex.uncertain)
+		}
+	}
+	// Absent once is not enough; absent twice releases.
+	f.res = nil
+	if _, err := ex.PinnedLoad(context.Background(), req); pinnedStatus(err) != 409 {
+		t.Fatalf("first absent err=%v", err)
+	}
 	if _, err := ex.PinnedLoad(context.Background(), req); err != nil {
-		t.Fatalf("after confirm err=%v", err)
+		t.Fatalf("second absent err=%v", err)
+	}
+}
+
+func TestLoadingCountsAndGateHeldUntilLoaded(t *testing.T) {
+	f := &fakeOps{res: []residentModel{{Engine: "ollama", Model: "qwen-30b", Loading: true}}}
+	ex := exclusiveExec(t, f)
+	if _, err := ex.PinnedLoad(context.Background(), PinnedRequest{Engine: "lmstudio", Model: "big-27b"}); pinnedStatus(err) != 409 {
+		t.Fatalf("a loading large model must conflict, err=%v", err)
+	}
+	f = &fakeOps{}
+	ex = exclusiveExec(t, f)
+	f.loadingFor = 2
+	f.loadHook = func() { f.res = append(f.res, residentModel{Engine: "lmstudio", Model: "big-27b", Loading: true}) }
+	if _, err := ex.PinnedLoad(context.Background(), PinnedRequest{Engine: "lmstudio", Model: "big-27b"}); err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if f.loadingFor != 0 {
+		t.Fatalf("returned before the model finished loading (loadingFor=%d)", f.loadingFor)
+	}
+}
+
+func TestStatusNoWaitDoesNotDeadlockUnderLifecycleLock(t *testing.T) {
+	ex := exclusiveExec(t, &fakeOps{})
+	st, err := ex.state("lmstudio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.opMu.Lock()
+	defer st.opMu.Unlock()
+	done := make(chan struct{})
+	go func() { _, _ = ex.statusNoWait(context.Background(), "lmstudio"); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("statusNoWait blocked on the lifecycle lock")
+	}
+}
+
+func TestUnloadParamsAreCanonical(t *testing.T) {
+	_, p, err := modelActionWire("ollama", "unload", "big-27b")
+	if err != nil || !strings.Contains(string(p), `"keep_alive":0`) {
+		t.Fatalf("params=%s err=%v", p, err)
+	}
+	ex := exclusiveExec(t, &fakeOps{})
+	if _, err := ex.canonicalUnload(context.Background(), "ollama", []byte(`{"stream":false}`)); pinnedStatus(err) != 400 {
+		t.Fatalf("model-less unload must be 400, err=%v", err)
 	}
 }
 
@@ -239,6 +306,13 @@ func TestStrictResidencyFailsClosed(t *testing.T) {
 	}
 	if _, err := extractLoadedStrict([]byte(`{"data":[{"id":"a"}]}`), spec); err == nil {
 		t.Fatal("row without status must fail closed")
+	}
+	if _, err := extractLoadedStrict([]byte(`{"data":[{"id":"a","status":{"value":null}}]}`), spec); err == nil {
+		t.Fatal("null filter value must fail closed")
+	}
+	ne := &ActionResult{Array: "models", Field: "key", Match: &ResultMatch{Field: "loaded_instances", Nonempty: true}}
+	if _, err := extractLoadedStrict([]byte(`{"models":[{"key":"a","loaded_instances":null}]}`), ne); err == nil {
+		t.Fatal("null loaded_instances must fail closed")
 	}
 }
 

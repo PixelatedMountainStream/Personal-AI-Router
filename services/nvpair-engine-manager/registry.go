@@ -338,6 +338,9 @@ type ResultMatch struct {
 	Field    string   `json:"field"`              // element field to test, e.g. "state" / "loaded_instances"
 	In       []string `json:"in,omitempty"`       // accepted string values, e.g. ["loaded"]
 	Nonempty bool     `json:"nonempty,omitempty"` // true → Field must be a nonempty JSON array
+	// LoadingIn lists string values that are not matched (not "loaded") but still
+	// occupy memory; strict residency counts them as occupied.
+	LoadingIn []string `json:"loading_in,omitempty"`
 }
 
 // ActionRemovePath deletes a filesystem path declared in the manifest.

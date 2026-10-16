@@ -40,6 +40,9 @@ type residentModel struct {
 	Bytes    int64 // 0 = unknown
 	Slots    SlotInfo
 	HasSlots bool
+	// Loading: the engine reports the model still loading. It already occupies
+	// memory, so it counts as resident, but it is not yet usable.
+	Loading bool
 }
 
 func (r residentModel) victim() Victim {
@@ -90,6 +93,8 @@ type pinnedOps struct {
 	unload   func(ctx context.Context, engine, model string) error
 	load     func(ctx context.Context, engine, model string, o LoadOpts) error
 	applied  func(ctx context.Context, engine, model string) (SlotInfo, bool)
+	// running reports whether the engine process is up; nil means "assume yes".
+	running func(engine string) bool
 }
 
 func (e *Executor) pinnedOps() *pinnedOps {
@@ -114,6 +119,15 @@ func (e *Executor) pinnedOps() *pinnedOps {
 			si, ok := e.ModelsResult(ctx).SlotsByEngine[engine][model]
 			return si, ok
 		},
+		running: func(engine string) bool {
+			st, err := e.state(engine)
+			if err != nil {
+				return false
+			}
+			st.mu.Lock()
+			defer st.mu.Unlock()
+			return st.running
+		},
 	}
 }
 
@@ -123,6 +137,7 @@ func (e *Executor) pinnedOps() *pinnedOps {
 // resident model). Sizes and slots come from the helpers the watcher shares.
 func (e *Executor) residentStrict(ctx context.Context) ([]residentModel, error) {
 	res := ModelsResult{LoadedByEngine: map[string][]string{}, SlotsByEngine: map[string]map[string]SlotInfo{}}
+	loadingSet := map[string]bool{}
 	for _, name := range e.reg.Names() {
 		mf, ok := e.reg.Get(name)
 		if !ok {
@@ -132,58 +147,123 @@ func (e *Executor) residentStrict(ctx context.Context) ([]residentModel, error) 
 		if !declares {
 			continue
 		}
-		if st, err := e.Status(name); err != nil || !st.Running {
+		// statusNoWait: startup gating calls this while holding the starting
+		// engine's lifecycle lock, and the confirm deadline must bound it.
+		if st, err := e.statusNoWait(ctx, name); err != nil || !st.Running {
+			if e.residencyUnqueryable(name, act) {
+				return nil, fmt.Errorf("cannot query residency of engine %q while its server is stopped (it may still hold loaded models)", name)
+			}
 			continue
 		}
 		raw, err := e.Action(ctx, name, "loaded_models", nil)
 		if err != nil {
 			return nil, fmt.Errorf("cannot determine which models engine %q has loaded: %w", name, err)
 		}
-		loaded, err := extractLoadedStrict(raw, act.Result)
+		loaded, loading, err := extractResidency(raw, act.Result)
 		if err != nil {
 			return nil, fmt.Errorf("engine %q loaded_models is unusable: %w", name, err)
 		}
-		res.LoadedByEngine[name] = loaded
+		res.LoadedByEngine[name] = append(append([]string{}, loaded...), loading...)
+		for _, m := range loading {
+			loadingSet[name+"/"+m] = true
+		}
 		if sa, ok := mf.Actions["slots"]; ok && sa.Result != nil && sa.Result.Record != nil && len(loaded) > 0 {
 			res.SlotsByEngine[name] = e.querySlots(ctx, name, &sa, loaded)
 		}
 	}
-	return e.residentFrom(ctx, res), nil
+	out := e.residentFrom(ctx, res)
+	for i := range out {
+		out[i].Loading = loadingSet[out[i].Engine+"/"+out[i].Model]
+	}
+	return out, nil
+}
+
+// residencyUnqueryable: a stopped engine normally holds nothing, but an
+// installed command-mode engine (LM Studio) keeps a daemon that can hold loaded
+// models with its HTTP server down, and its loaded_models needs that server.
+func (e *Executor) residencyUnqueryable(engine string, act Action) bool {
+	if len(act.Cmd) > 0 {
+		return false
+	}
+	st, err := e.state(engine)
+	if err != nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.installed && st.plat.Runtime.modeOrDefault() == "command"
 }
 
 // extractLoadedStrict is extractStringsResult for residency: every row must be
 // classifiable (filter field present and well-typed, name a non-empty string);
 // anything else is an error rather than a silently dropped row.
 func extractLoadedStrict(raw json.RawMessage, spec *ActionResult) ([]string, error) {
+	loaded, _, err := extractResidency(raw, spec)
+	return loaded, err
+}
+
+// extractResidency also returns the models that match Match.LoadingIn (still
+// loading; they occupy memory but are not loaded).
+func extractResidency(raw json.RawMessage, spec *ActionResult) (loaded, loading []string, err error) {
 	if spec == nil {
-		return nil, errors.New("no result spec")
+		return nil, nil, errors.New("no result spec")
 	}
 	var obj map[string]json.RawMessage
 	if json.Unmarshal(raw, &obj) != nil {
-		return nil, errors.New("response is not an object")
+		return nil, nil, errors.New("response is not an object")
 	}
 	var arr []map[string]json.RawMessage
 	if arrRaw, ok := obj[spec.Array]; !ok || json.Unmarshal(arrRaw, &arr) != nil || arr == nil {
-		return nil, fmt.Errorf("missing or invalid %q array", spec.Array)
+		return nil, nil, fmt.Errorf("missing or invalid %q array", spec.Array)
 	}
-	out := []string{}
+	loaded = []string{}
 	for i, el := range arr {
 		if spec.Match != nil {
 			match, ok := classifyRow(el, spec.Match)
 			if !ok {
-				return nil, fmt.Errorf("row %d cannot be classified", i)
+				return nil, nil, fmt.Errorf("row %d cannot be classified", i)
 			}
 			if !match {
+				isLoading, ok := classifyLoading(el, spec.Match)
+				if !ok {
+					return nil, nil, fmt.Errorf("row %d cannot be classified", i)
+				}
+				if !isLoading {
+					continue
+				}
+				var n string
+				if json.Unmarshal(el[spec.Field], &n) != nil || n == "" {
+					return nil, nil, fmt.Errorf("row %d has no model name", i)
+				}
+				loading = append(loading, n)
 				continue
 			}
 		}
 		var name string
 		if json.Unmarshal(el[spec.Field], &name) != nil || name == "" {
-			return nil, fmt.Errorf("row %d has no model name", i)
+			return nil, nil, fmt.Errorf("row %d has no model name", i)
 		}
-		out = append(out, name)
+		loaded = append(loaded, name)
 	}
-	return out, nil
+	return loaded, loading, nil
+}
+
+// classifyLoading reports whether the row's match field holds one of LoadingIn.
+func classifyLoading(el map[string]json.RawMessage, m *ResultMatch) (loading, ok bool) {
+	if len(m.LoadingIn) == 0 {
+		return false, true
+	}
+	fv, found := resolveObjectPath(el, m.Field)
+	var s string
+	if !found || json.Unmarshal(fv, &s) != nil {
+		return false, false
+	}
+	for _, v := range m.LoadingIn {
+		if s == v {
+			return true, true
+		}
+	}
+	return false, true
 }
 
 // residentFrom turns a models sweep into the resident list, adding byte sizes
@@ -251,8 +331,9 @@ func (e *Executor) exclusiveLoad(ctx context.Context, req PinnedRequest) (Pinned
 
 // residentChecked takes the exclusivity snapshot (caller holds loadMu) and
 // enforces the residency-uncertain reservation: after a load that errored or
-// was cancelled post-acceptance, nothing else loads until a strict snapshot
-// succeeds again.
+// was cancelled post-acceptance, nothing else loads until a snapshot shows the
+// target loaded, or absent (not loading) twice at least uncertainGap apart, or
+// the engine has stopped.
 func (e *Executor) residentChecked(ctx context.Context, ops *pinnedOps) ([]residentModel, error) {
 	snap, err := ops.resident(ctx)
 	if e.uncertain != "" {
@@ -260,12 +341,94 @@ func (e *Executor) residentChecked(ctx context.Context, ops *pinnedOps) ([]resid
 			return nil, &pinnedError{Status: http.StatusConflict,
 				Message: fmt.Sprintf("residency is uncertain after the failed load of %s and cannot be confirmed yet: %v", e.uncertain, err)}
 		}
-		e.uncertain = ""
+		if !e.confirmUncertain(ops, snap) {
+			return nil, &pinnedError{Status: http.StatusConflict,
+				Message: fmt.Sprintf("residency is uncertain after the failed load of %s: the model is not yet confirmed loaded or gone", e.uncertain)}
+		}
 	}
 	if err != nil {
 		return nil, &pinnedError{Status: http.StatusBadGateway, Message: err.Error()}
 	}
 	return snap, nil
+}
+
+// confirmUncertain reports whether the uncertain reservation can be released.
+func (e *Executor) confirmUncertain(ops *pinnedOps, snap []residentModel) bool {
+	eng, model, _ := strings.Cut(e.uncertain, "/")
+	release := func() bool {
+		e.uncertain, e.uncertainAbsentSince = "", time.Time{}
+		return true
+	}
+	for _, r := range snap {
+		if r.Engine == eng && r.Model == model {
+			e.uncertainAbsentSince = time.Time{}
+			if !r.Loading {
+				return release()
+			}
+			return false
+		}
+	}
+	if ops.running != nil && !ops.running(eng) {
+		return release()
+	}
+	gap := e.uncertainGap
+	if gap <= 0 {
+		gap = 5 * time.Second
+	}
+	now := time.Now()
+	if e.uncertainAbsentSince.IsZero() {
+		e.uncertainAbsentSince = now
+		return false
+	}
+	if now.Sub(e.uncertainAbsentSince) >= gap {
+		return release()
+	}
+	return false
+}
+
+// awaitLoaded keeps the gate held after an accepted load until the model
+// reaches a terminal state: an engine that loads asynchronously (llama.cpp
+// router) reports "loading", which already occupies memory. Bounded by the
+// confirm deadline; a timeout leaves the reservation uncertain.
+func (e *Executor) awaitLoaded(ctx context.Context, ops *pinnedOps, req PinnedRequest) error {
+	key := req.Engine + "/" + req.Model
+	deadline := time.Now().Add(e.unloadConfirmTimeout)
+	dctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	timeout := func() error {
+		e.uncertain = key
+		return &pinnedError{Status: http.StatusGatewayTimeout, Message: "timed out waiting for " + key + " to finish loading"}
+	}
+	for first := true; ; first = false {
+		snap, err := ops.resident(dctx)
+		if err != nil {
+			e.uncertain = key
+			return &pinnedError{Status: http.StatusBadGateway, Message: "cannot confirm " + key + " finished loading: " + err.Error()}
+		}
+		state := "absent"
+		for _, r := range snap {
+			if r.Engine == req.Engine && r.Model == req.Model {
+				state = "loaded"
+				if r.Loading {
+					state = "loading"
+				}
+			}
+		}
+		switch {
+		case state == "loaded", state == "absent" && first:
+			return nil // nothing to wait for (or the engine loads synchronously)
+		case state == "absent":
+			return &pinnedError{Status: http.StatusBadGateway, Message: key + " failed to load"}
+		}
+		if !time.Now().Before(deadline) {
+			return timeout()
+		}
+		select {
+		case <-dctx.Done():
+			return timeout()
+		case <-time.After(e.unloadPollInterval):
+		}
+	}
 }
 
 // exclusiveRun runs a load under the node-wide gate. load performs the engine
@@ -322,6 +485,9 @@ func (e *Executor) exclusiveRun(ctx context.Context, req PinnedRequest, load fun
 			return PinnedResult{}, err
 		}
 		return PinnedResult{}, &pinnedError{Status: http.StatusBadGateway, Message: err.Error()}
+	}
+	if err := e.awaitLoaded(ctx, ops, req); err != nil {
+		return PinnedResult{}, err
 	}
 	e.reportApplied(ctx, ops, req, &res)
 	return res, nil
@@ -385,8 +551,12 @@ func (e *Executor) guardedLoadAction(ctx context.Context, engine, action string,
 	if _, ok := e.reg.Get(engine); !ok || model == "" {
 		return nil, badParam(fmt.Sprintf("a load needs a known engine and a model (engine %q)", engine))
 	}
+	opts, err := loadOptsFromParams(engine, model, params)
+	if err != nil {
+		return nil, err
+	}
 	var out json.RawMessage
-	res, err := e.exclusiveRun(ctx, PinnedRequest{Engine: engine, Model: model}, func(ctx context.Context) (err error) {
+	res, err := e.exclusiveRun(ctx, PinnedRequest{Engine: engine, Model: model, LoadOpts: opts}, func(ctx context.Context) (err error) {
 		out, err = e.Action(ctx, engine, action, params)
 		return err
 	})
@@ -394,6 +564,41 @@ func (e *Executor) guardedLoadAction(ctx context.Context, engine, action string,
 		out, _ = json.Marshal(res)
 	}
 	return out, err
+}
+
+// loadOptsFromParams reads and validates the load options a TUI load action
+// carries (context_length, parallel, Ollama options.num_ctx) so the gate sees
+// the same request a pinned load would.
+func loadOptsFromParams(engine, model string, params json.RawMessage) (LoadOpts, error) {
+	var p struct {
+		ContextLength int `json:"context_length"`
+		Parallel      int `json:"parallel"`
+		Options       struct {
+			NumCtx int `json:"num_ctx"`
+		} `json:"options"`
+	}
+	if len(params) > 0 && json.Unmarshal(params, &p) != nil {
+		return LoadOpts{}, badParam("invalid load params: context_length, parallel and options.num_ctx must be integers")
+	}
+	o := LoadOpts{ContextLength: p.ContextLength, Parallel: p.Parallel}
+	if o.ContextLength == 0 {
+		o.ContextLength = p.Options.NumCtx
+	}
+	if _, _, err := modelLoadWire(engine, model, o); err != nil {
+		return LoadOpts{}, err
+	}
+	return o, nil
+}
+
+// canonicalUnload runs unload_model with parameters built from the model name
+// alone. Forwarding caller params would let an Ollama generate request without
+// keep_alive:0 preload instead of unload.
+func (e *Executor) canonicalUnload(ctx context.Context, engine string, params json.RawMessage) (json.RawMessage, error) {
+	model := modelFromParams(params)
+	if model == "" {
+		return nil, badParam("unload_model needs a model")
+	}
+	return e.ModelUnload(ctx, engine, model)
 }
 
 // launchLoadsModel reports whether engine launch args name a model to load at

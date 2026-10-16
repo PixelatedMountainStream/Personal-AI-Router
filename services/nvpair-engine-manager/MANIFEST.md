@@ -541,3 +541,5 @@ Caveats worth encoding when authoring these:
 - **LM Studio** model dir is settings-controlled (no documented relocation env); surface its config as flags/API, not env.
 - **vLLM**: native Windows is unsupported (WSL only); the bind is a flag, not env.
 - **GPT4All**: no first-class headless CLI today — out of scope for a config-only manager unless targeting its Python SDK.
+
+Known limitation (exclusive loads): operator-configured engine startup loads (llama.cpp `--models-preset`/load-on-startup, model environment variables) are not gated by engine-manager; rely on LM Studio JIT off, `--models-max 1` and `OLLAMA_MAX_LOADED_MODELS=1`.
