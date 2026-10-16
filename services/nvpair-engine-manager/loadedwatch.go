@@ -65,6 +65,7 @@ func (e *Executor) watchLoaded(ctx context.Context) {
 		}
 		changed, next, res := e.sweepLoaded(ctx, prev)
 		prev = next
+		e.checkMultiLarge(ctx, res)
 		if !seeded {
 			seeded = true
 			continue // first sweep only seeds the baseline

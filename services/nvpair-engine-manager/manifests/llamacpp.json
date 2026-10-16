@@ -94,7 +94,7 @@
     "loaded_models": {
       "description": "List models currently resident in memory.",
       "http": { "method": "GET", "path": "/models" },
-      "result": { "array": "data", "field": "id", "match": { "field": "status.value", "in": ["loaded"] } }
+      "result": { "array": "data", "field": "id", "match": { "field": "status.value", "in": ["loaded"], "loading_in": ["loading"] } }
     },
     "slots": {
       "description": "Per-slot capacity of one loaded model (params: {\"model\": \"<model>\"}, sent as a query parameter; autoload=false so a poll never reloads an unloaded model).",

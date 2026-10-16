@@ -47,7 +47,7 @@ const modelsPath = "/v1/models"
 //     handshake from live membership, so an unclustered node presents none and no
 //     LAN caller gets in at all, and a node that joins starts serving its peers on
 //     the same listener with no rebind.
-func serveHTTP(ctx context.Context, port int, exec *Executor, mesh *clustertrust.Mesh) {
+func serveHTTP(ctx context.Context, port int, exec *Executor, mesh *clustertrust.Mesh, load pinnedLoader) {
 	addr := net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
 	models := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -64,6 +64,10 @@ func serveHTTP(ctx context.Context, port int, exec *Executor, mesh *clustertrust
 
 	plainMux := http.NewServeMux()
 	plainMux.Handle(modelsPath, loopbackOnly(models))
+	if load != nil {
+		// POST /v1/models/load: pinned load of one model on one node. Loopback only.
+		plainMux.Handle(modelsPath+"/load", loopbackOnly(pinnedLoadHandler(load)))
+	}
 	tlsMux := http.NewServeMux()
 	tlsMux.Handle(modelsPath, requirePinnedPeer(mesh, models))
 

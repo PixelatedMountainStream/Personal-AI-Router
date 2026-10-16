@@ -127,6 +127,21 @@ type Executor struct {
 	// tick. Buffered depth 1: a coalesced signal is enough.
 	loadedPoke chan struct{}
 
+	// Pinned-load exclusivity (exclusive.go). loadMu serializes pinned loads
+	// node-wide; largeModelBytes is the resident size from which a model counts
+	// as large; ops overrides the engine operations in tests; onMultiLarge
+	// replaces the watcher's warning in tests.
+	loadMu               sync.Mutex
+	largeModelBytes      int64
+	unloadConfirmTimeout time.Duration
+	unloadPollInterval   time.Duration
+	ops                  *pinnedOps
+	onMultiLarge         func(names []string)
+	multiLargeWarned     bool          // watcher goroutine only
+	uncertain            string        // engine/model of a failed load with unconfirmed residency; under loadMu
+	uncertainAbsentSince time.Time     // first snapshot (under loadMu) that lacked the uncertain target
+	uncertainGap         time.Duration // required spacing of absent snapshots; 0 = 5s
+
 	reservedPort atomic.Int32
 	// StopAll is terminal for an Executor; the gate closes its start/snapshot race.
 	shuttingDown atomic.Bool
@@ -136,22 +151,25 @@ type Executor struct {
 
 func NewExecutor(reg *Registry, reporter *Reporter, emit func(string, any), baseDir string) *Executor {
 	return &Executor{
-		reg:                 reg,
-		reporter:            reporter,
-		emit:                emit,
-		client:              newEngineHTTPClient(engineResponseHeaderTimeout),
-		ollamaLoadClient:    newEngineHTTPClient(ollamaLoadResponseHeaderTimeout),
-		progress:            newProgressHub(),
-		baseDir:             baseDir,
-		desired:             newDesiredStateStore(baseDir),
-		detectTimeout:       30 * time.Second,
-		actionTimeout:       30 * time.Minute,
-		pullProgressTimeout: 30 * time.Minute,
-		pullStartTimeout:    30 * time.Second,
-		pullCleanupTimeout:  5 * time.Second,
-		loadedPollInterval:  defaultLoadedPollSeconds * time.Second,
-		loadedPoke:          make(chan struct{}, 1),
-		engines:             make(map[string]*engineState),
+		reg:                  reg,
+		reporter:             reporter,
+		emit:                 emit,
+		client:               newEngineHTTPClient(engineResponseHeaderTimeout),
+		ollamaLoadClient:     newEngineHTTPClient(ollamaLoadResponseHeaderTimeout),
+		progress:             newProgressHub(),
+		baseDir:              baseDir,
+		desired:              newDesiredStateStore(baseDir),
+		detectTimeout:        30 * time.Second,
+		actionTimeout:        30 * time.Minute,
+		pullProgressTimeout:  30 * time.Minute,
+		pullStartTimeout:     30 * time.Second,
+		pullCleanupTimeout:   5 * time.Second,
+		loadedPollInterval:   defaultLoadedPollSeconds * time.Second,
+		loadedPoke:           make(chan struct{}, 1),
+		largeModelBytes:      defaultLargeModelGiB << 30,
+		unloadConfirmTimeout: 30 * time.Second,
+		unloadPollInterval:   500 * time.Millisecond,
+		engines:              make(map[string]*engineState),
 	}
 }
 

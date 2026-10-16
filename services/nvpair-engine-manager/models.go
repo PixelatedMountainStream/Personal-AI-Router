@@ -288,11 +288,20 @@ func extractRecords(raw json.RawMessage, spec *ActionResult) (map[string]SlotInf
 // optional, but a present ctx of the wrong type or negative invalidates the record.
 func extractRecord(raw json.RawMessage, rec *ResultRecord) (SlotInfo, bool) {
 	var si SlotInfo
-	slots, ok := recordInt(raw, rec, "slots")
-	if !ok || slots < 1 {
-		return SlotInfo{}, false
+	if rec.declares("slots") || !rec.declares("bytes") {
+		slots, ok := recordInt(raw, rec, "slots")
+		if !ok || slots < 1 {
+			return SlotInfo{}, false
+		}
+		si.Slots = slots
 	}
-	si.Slots = slots
+	if rec.declares("bytes") {
+		b, ok := recordInt(raw, rec, "bytes")
+		if !ok || b < 0 {
+			return SlotInfo{}, false
+		}
+		si.Bytes = int64(b)
+	}
 	if ctx, ok := recordInt(raw, rec, "ctx"); ok {
 		if ctx < 0 {
 			return SlotInfo{}, false
@@ -401,27 +410,38 @@ func extractStringsResult(raw json.RawMessage, spec *ActionResult) ([]string, bo
 // /api/v1/models loaded_instances). A missing or wrong-typed path fails the
 // match, so a row we cannot classify is excluded rather than counted as loaded.
 func matchRow(el map[string]json.RawMessage, m *ResultMatch) bool {
-	fv, ok := resolveObjectPath(el, m.Field)
-	if !ok {
-		return false
+	match, _ := classifyRow(el, m)
+	return match
+}
+
+// classifyRow is matchRow with a second result: ok=false when the row cannot be
+// classified (path missing or wrong-typed), which residency checks treat as a
+// failure instead of "not loaded".
+func classifyRow(el map[string]json.RawMessage, m *ResultMatch) (match, ok bool) {
+	fv, found := resolveObjectPath(el, m.Field)
+	if !found {
+		return false, false
+	}
+	if bytes.Equal(bytes.TrimSpace(fv), []byte("null")) {
+		return false, false // JSON null would decode as an empty value, i.e. "not loaded"
 	}
 	if m.Nonempty {
 		var arr []json.RawMessage
 		if err := json.Unmarshal(fv, &arr); err != nil {
-			return false
+			return false, false
 		}
-		return len(arr) > 0
+		return len(arr) > 0, true
 	}
 	var s string
 	if err := json.Unmarshal(fv, &s); err != nil {
-		return false
+		return false, false
 	}
 	for _, want := range m.In {
 		if s == want {
-			return true
+			return true, true
 		}
 	}
-	return false
+	return false, true
 }
 
 func resolveObjectPath(obj map[string]json.RawMessage, path string) (json.RawMessage, bool) {

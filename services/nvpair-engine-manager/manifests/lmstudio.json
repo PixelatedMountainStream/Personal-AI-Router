@@ -81,14 +81,23 @@
       "http": { "method": "GET", "path": "/api/v1/models" },
       "result": { "array": "models", "field": "key", "match": { "field": "loaded_instances", "nonempty": true }, "record": { "fields": { "slots": "loaded_instances.0.config.parallel", "ctx": "loaded_instances.0.config.context_length" } } }
     },
+    "model_sizes": {
+      "description": "Size in bytes of each loaded model (/api/v1/models models[].size_bytes, filtered to loaded_instances nonempty).",
+      "http": { "method": "GET", "path": "/api/v1/models" },
+      "result": { "array": "models", "field": "key", "match": { "field": "loaded_instances", "nonempty": true }, "record": { "fields": { "bytes": "size_bytes" } } }
+    },
     "pull_model": {
       "description": "Download a model via the lms CLI (params: {\"model\": \"<owner/name | huggingface.co or lmstudio.ai URL>\"}). Tries the value as given, then the LM Studio Hub artifact id, then the Hugging Face repo URL. Resumes automatically on a transient download timeout.",
       "cmd": ["{cli}", "get", "{model}", "--yes"],
       "model_resolution": "lms-get"
     },
     "load_model": {
-      "description": "Load a downloaded model into memory (params: {\"model\": \"<name>\"}).",
-      "cmd": ["{cli}", "load", "{model}"]
+      "description": "Load a downloaded model into memory (params: {\"model\": \"<name>\", \"context_length\"?: int, \"parallel\"?: int}).",
+      "cmd": ["{cli}", "load", "{model}", "--yes"],
+      "optional_args": {
+        "context_length": ["--context-length", "{context_length}"],
+        "parallel": ["--parallel", "{parallel}"]
+      }
     },
     "list_downloaded": {
       "description": "List models downloaded to disk via the lms CLI.",

@@ -542,6 +542,9 @@ type DirectoryNode struct {
 type SlotInfo struct {
 	Slots      int `json:"slots"`
 	CtxPerSlot int `json:"ctxPerSlot,omitempty"`
+	// Bytes is the model's resident size when a record declares "bytes"
+	// (model_sizes); internal, never part of the wire shape.
+	Bytes int64 `json:"-"`
 }
 
 // Clustered reports whether the node advertises a cluster identity.

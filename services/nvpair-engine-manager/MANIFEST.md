@@ -293,6 +293,19 @@ and loaded actions require LM Studio 0.4.0 or newer, where the native
 `/api/v1/models` endpoint is available. All of this stays additive:
 `manifest_version` is still `1`.
 
+An optional **`optional_args`** map (cmd actions only) appends an argv fragment
+only when the caller supplied that param, e.g.
+`"optional_args": {"context_length": ["--context-length", "{context_length}"]}`.
+The value must be a non-negative integer (rendered from its literal text) and
+replaces `{<param>}` in the fragment; `model` and the runner placeholders are
+reserved keys. LM Studio's `load_model` uses it for `context_length` and `parallel`.
+
+An optional **`model_sizes`** action (HTTP, `result.record.fields.bytes` = path to
+the resident size in bytes) lets pinned-load exclusivity classify a loaded model
+as large; `bytes` is a third `result.record` key beside `slots` and `ctx`, and a
+record may declare `bytes` without `slots`. Ollama reads `/api/ps` `size`, LM
+Studio `/api/v1/models` `size_bytes`; llama.cpp declares none (name rule applies).
+
 An optional **`model_resolution`** expands or resolves the `{model}`
 placeholder before the action runs:
 
@@ -528,3 +541,5 @@ Caveats worth encoding when authoring these:
 - **LM Studio** model dir is settings-controlled (no documented relocation env); surface its config as flags/API, not env.
 - **vLLM**: native Windows is unsupported (WSL only); the bind is a flag, not env.
 - **GPT4All**: no first-class headless CLI today — out of scope for a config-only manager unless targeting its Python SDK.
+
+Known limitation (exclusive loads): operator-configured engine startup loads (llama.cpp `--models-preset`/load-on-startup, model environment variables) are not gated by engine-manager; rely on LM Studio JIT off, `--models-max 1` and `OLLAMA_MAX_LOADED_MODELS=1`.
