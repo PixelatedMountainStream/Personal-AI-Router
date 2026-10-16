@@ -147,7 +147,21 @@ func (p *Proxy) eligible(nodeID, engine, model string) bool {
 	if p.capacity == nil {
 		return true
 	}
-	return r != ResidencyKnownEmpty || p.capacity.JITLoad(nodeID, engine)
+	if r != ResidencyKnownEmpty {
+		return true
+	}
+	// A JIT load would put a second large model on a node whose other engine
+	// already holds one; the proxy has no sizes, so any loaded model counts.
+	if o, ok := p.capacity.(otherEngineLoader); ok && o.OtherEngineLoaded(nodeID, engine) {
+		return false
+	}
+	return p.capacity.JITLoad(nodeID, engine)
+}
+
+// otherEngineLoader is the optional capability of a provider that knows what
+// the node's other engines have loaded.
+type otherEngineLoader interface {
+	OtherEngineLoaded(nodeID, engine string) bool
 }
 
 // suppressTTL is how long a not-loaded refusal keeps a node out of routing.
@@ -180,4 +194,47 @@ func (p *Proxy) suppressedAt(k inflightKey) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return at, ok
+}
+
+// minContextLength is the smallest per-slot context over every node that
+// listed the model and is eligible for it (Loaded, Unknown or JIT). It is
+// false when no node qualifies or when any eligible node has no value: a
+// client that needs a safe window must not be handed an optimistic one.
+func (p *Proxy) minContextLength(engine, model string, nodeIDs []string) (int, bool) {
+	if p.capacity == nil {
+		return 0, false
+	}
+	min, any := 0, false
+	for _, id := range nodeIDs {
+		if !p.eligible(id, engine, model) {
+			continue
+		}
+		n, ok := p.capacity.CtxPerSlot(id, engine, model)
+		if !ok || n <= 0 {
+			return 0, false
+		}
+		if !any || n < min {
+			min, any = n, true
+		}
+	}
+	return min, any
+}
+
+// withContextLength adds context_length to a model record, leaving any value
+// the engine already reported alone. A record that is not a JSON object is
+// returned unchanged.
+func withContextLength(raw json.RawMessage, n int) json.RawMessage {
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
+		return raw
+	}
+	if _, has := obj["context_length"]; has {
+		return raw
+	}
+	obj["context_length"] = json.RawMessage(strconv.Itoa(n))
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
 }

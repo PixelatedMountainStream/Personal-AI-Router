@@ -327,6 +327,9 @@ func (f *facade) replaceSubscribed(params json.RawMessage) {
 		slog.Warn("invalid discovery:nodes snapshot", "err", err)
 		return
 	}
+	if f.host.directory != nil {
+		f.host.directory.update(f.profile.Name, res.Nodes)
+	}
 	nodes := make([]Node, 0, len(res.Nodes))
 	present := make(map[string]bool, len(res.Nodes))
 	for _, dn := range res.Nodes {

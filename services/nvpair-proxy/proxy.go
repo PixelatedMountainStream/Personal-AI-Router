@@ -388,7 +388,10 @@ type Proxy struct {
 	// dispatched and not finished, per engine/model/node. Guarded by
 	// priorityMu. Unlike priorityReservations it is never reset by a snapshot.
 	capacity CapacityProvider
-	inflight map[inflightKey]int
+	// directory is fed by every facade's discovery snapshot; nil in tests that
+	// inject capacity directly.
+	directory *directoryCapacity
+	inflight  map[inflightKey]int
 
 	// reservedBy is the optimistic reservations since the last snapshot, per
 	// engine/model/node; completions are local finishes the scheduler may not
@@ -1129,6 +1132,8 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 	success := false
 	models := make([]json.RawMessage, 0)
 	seen := make(map[string]modelListItem)
+	var keys []string                    // model key of models[i]
+	holders := make(map[string][]string) // model key -> ids of nodes that listed it
 	for i, result := range results {
 		if !result.ok {
 			slog.Debug("model list candidate unavailable",
@@ -1137,6 +1142,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 		}
 		success = true
 		for _, item := range result.items {
+			holders[item.key] = append(holders[item.key], candidates[i].id)
 			if previous, duplicate := seen[item.key]; duplicate {
 				if previous.digest != "" && item.digest != "" && previous.digest != item.digest {
 					slog.Warn("conflicting model digests across candidates",
@@ -1147,6 +1153,15 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 			}
 			seen[item.key] = item
 			models = append(models, item.raw)
+			keys = append(keys, item.key)
+		}
+	}
+	if openAI {
+		// Only after every candidate is merged is the holder set complete.
+		for i, key := range keys {
+			if n, ok := p.minContextLength(f.profile.Name, key, holders[key]); ok {
+				models[i] = withContextLength(models[i], n)
+			}
 		}
 	}
 	if !success {
