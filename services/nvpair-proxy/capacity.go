@@ -135,14 +135,17 @@ func (p *Proxy) nodeSlots(nodeID, engine, model string) int {
 // demand. A node that just refused the model as not loaded is skipped for
 // suppressTTL unless a newer directory sweep shows it loaded.
 func (p *Proxy) eligible(nodeID, engine, model string) bool {
-	if p.capacity == nil {
-		return true
+	r, seen := ResidencyUnknown, time.Time{}
+	if p.capacity != nil {
+		r, seen = p.capacity.Residency(nodeID, engine, model)
 	}
-	r, seen := p.capacity.Residency(nodeID, engine, model)
 	if at, ok := p.suppressedAt(inflightKey{engine, model, nodeID}); ok {
 		if r != ResidencyLoaded || !seen.After(at) {
 			return false
 		}
+	}
+	if p.capacity == nil {
+		return true
 	}
 	return r != ResidencyKnownEmpty || p.capacity.JITLoad(nodeID, engine)
 }

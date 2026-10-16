@@ -395,7 +395,7 @@ type Proxy struct {
 	// have seen yet (Unix ms). priorityPendingBy and priorityComputedAt come
 	// from the snapshot. All guarded by priorityMu.
 	reservedBy         map[inflightKey]int
-	completions        map[inflightKey][]int64
+	completions        map[inflightKey][]completion
 	priorityPendingBy  map[string]map[string]int
 	priorityComputedAt map[string]int64
 
@@ -1661,9 +1661,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		cand := round[next]
 		if next > 0 && isInf && model != "" {
 			// Re-score the untried candidates now; the round's order is stale.
-			resMu.Lock()
-			cand, held = p.rescoreReserve(f, round, tried, held, model)
-			resMu.Unlock()
+			func() {
+				resMu.Lock()
+				defer resMu.Unlock()
+				cand = p.rescoreReserve(f, round, tried, &held, model)
+			}()
 		}
 		tried[cand.id] = true
 		next++
@@ -1683,9 +1685,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		attemptStart := time.Now()
 		attemptStatus, attemptTTFB := 0, int64(0)
 		if isInf && model != "" {
-			resMu.Lock()
-			reason := held.reason
-			resMu.Unlock()
+			reason := func() string {
+				resMu.Lock()
+				defer resMu.Unlock()
+				return held.reason
+			}()
 			if notLoadedRetry {
 				reason, notLoadedRetry = "notloaded-retry", false
 			}
@@ -1771,7 +1775,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				attemptTTFB = time.Since(attemptStart).Milliseconds()
 				if isInf && r.Method == http.MethodPost && model != "" &&
 					(resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound) &&
-					classifyNotLoaded(f.profile.Name, resp) {
+					classifyNotLoaded(attemptCtx, f.profile.Name, resp, firstBodyTimeout) {
 					p.suppress(inflightKey{f.profile.Name, model, cand.id})
 					if !last {
 						retry, notLoadedRetry = true, true
@@ -2178,7 +2182,20 @@ func (f *facade) resolveCandidatesN(model string) ([]candidate, int) {
 // load below zero and making it look permanently idle.
 type inflightKey struct{ engine, model, node string }
 
+// completion is a local finish the scheduler may not have seen. It discounts
+// a snapshot's pending only when the claim began before that snapshot was
+// computed and ended after it, and, for an optimistic claim released within
+// its own generation (reservedBy already dropped it), only once a later
+// snapshot has been applied.
+type completion struct {
+	taken, done int64
+	gen         uint64
+	deferred    bool
+}
+
 type reservation struct {
+	// takenAt is when the claim began, Unix ms.
+	takenAt    int64
 	nodeID     string
 	engine     string
 	model      string
@@ -2267,7 +2284,9 @@ func (p *Proxy) reserveCandidateFor(f *facade, candidates []candidate, key, mode
 		if bound, ok := p.affinity.lookup(key); ok {
 			decision = affinityRebind
 			if index, ok := candidateIndex[bound]; ok && containsID(p.priority, bound) {
-				if free(bound) {
+				// The hit test reads our own durable count, not scheduler
+				// pending, which can be stale enough to break sequential hits.
+				if p.inflight[inflightKey{engine, model, bound}] < p.nodeSlots(bound, engine, model) {
 					bestIndex, decision, reason = index, affinityHit, "affinity-hit"
 				} else if other := best(free); other >= 0 {
 					bestIndex, decision, reason = other, affinityYield, "affinity-yield"
@@ -2328,6 +2347,7 @@ func (p *Proxy) takeLocked(nodeID, engine, model string, optimistic bool) reserv
 	return reservation{
 		nodeID: nodeID, engine: engine, model: model,
 		generation: p.appliedPriorityGeneration, held: true, optimistic: optimistic,
+		takenAt: p.clock().UnixMilli(),
 	}
 }
 
@@ -2341,17 +2361,19 @@ func (p *Proxy) dropLocked(r reservation) {
 	} else {
 		p.inflight[k]--
 	}
-	if !r.optimistic || r.generation != p.appliedPriorityGeneration {
-		// Not counted in this snapshot's reservations, so the scheduler's
-		// pending may still include it: remember the finish.
-		if p.completions == nil {
-			p.completions = make(map[inflightKey][]int64)
-		}
-		if ts := append(p.completions[k], p.clock().UnixMilli()); len(ts) <= 1024 {
-			p.completions[k] = ts
-		} else {
-			p.completions[k] = ts[len(ts)-1024:]
-		}
+	same := r.optimistic && r.generation == p.appliedPriorityGeneration
+	// Remembered either way: a snapshot computed while this ran but applied
+	// after it finished would otherwise resurrect its occupancy.
+	if p.completions == nil {
+		p.completions = make(map[inflightKey][]completion)
+	}
+	c := completion{taken: r.takenAt, done: p.clock().UnixMilli(), gen: p.appliedPriorityGeneration, deferred: same}
+	if ts := append(p.completions[k], c); len(ts) <= 1024 {
+		p.completions[k] = ts
+	} else {
+		p.completions[k] = ts[len(ts)-1024:]
+	}
+	if !same {
 		return
 	}
 	if p.reservedBy[k] <= 1 {
@@ -2378,8 +2400,12 @@ func (p *Proxy) occLocked(k inflightKey) int {
 		base = by[schedulerwire.PendingKey(k.engine, k.model)]
 	}
 	done := 0
-	for _, t := range p.completions[k] {
-		if t > p.priorityComputedAt[k.node] {
+	at := p.priorityComputedAt[k.node]
+	for _, c := range p.completions[k] {
+		if c.deferred && c.gen >= p.appliedPriorityGeneration {
+			continue // reservedBy already dropped it
+		}
+		if c.taken <= at && c.done > at {
 			done++
 		}
 	}
@@ -2425,7 +2451,7 @@ func (p *Proxy) bestLocked(engine, model string, cands []candidate, tried map[st
 // request's held claim onto it in one critical section, so failover sees the
 // load as it is rather than as it was when the round was formed. Candidates
 // the scheduler does not list follow in round order.
-func (p *Proxy) rescoreReserve(f *facade, round []candidate, tried map[string]bool, held reservation, model string) (candidate, reservation) {
+func (p *Proxy) rescoreReserve(f *facade, round []candidate, tried map[string]bool, held *reservation, model string) candidate {
 	engine := f.profile.Name
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
@@ -2440,15 +2466,19 @@ func (p *Proxy) rescoreReserve(f *facade, round []candidate, tried map[string]bo
 	}
 	cand := round[i]
 	if !held.held {
-		return cand, held
+		return cand
 	}
-	p.dropLocked(held)
-	res := p.takeLocked(cand.id, engine, model, held.optimistic)
-	res.reason = "free-slot"
+	// The claim is published at each step so a panic below can never leave the
+	// caller holding one that was already dropped, or lose the new one.
+	old := *held
+	*held = reservation{}
+	p.dropLocked(old)
+	*held = p.takeLocked(cand.id, engine, model, old.optimistic)
+	held.reason = "free-slot"
 	if p.occLocked(inflightKey{engine, model, cand.id}) > p.nodeSlots(cand.id, engine, model) {
-		res.reason = "least-queued"
+		held.reason = "least-queued"
 	}
-	return cand, res
+	return cand
 }
 
 func containsID(ids []string, id string) bool {
@@ -2793,9 +2823,9 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 	p.reservedBy = nil
 	for k, ts := range p.completions {
 		kept := ts[:0]
-		for _, t := range ts {
-			if t > computedAt[k.node] {
-				kept = append(kept, t)
+		for _, c := range ts {
+			if c.done > computedAt[k.node] {
+				kept = append(kept, c)
 			}
 		}
 		if len(kept) == 0 {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -92,9 +93,11 @@ func TestSlotScore_OccupancyUsesPendingByAndDiscountsCompletions(t *testing.T) {
 	}
 	p.priorityMu.Unlock()
 	// A pinned request finishes after the scheduler computed: it is discounted.
+	p.now = func() time.Time { return time.UnixMilli(8_000) }
 	p.priorityMu.Lock()
-	r := p.takeLocked("a", f.profile.Name, "m", false)
+	r := p.takeLocked("a", f.profile.Name, "m", false) // began before the snapshot was computed
 	p.priorityMu.Unlock()
+	p.now = func() time.Time { return now }
 	p.releaseReservation(r)
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
@@ -110,7 +113,8 @@ func TestSlotScore_FailoverPicksFreeOverFull(t *testing.T) {
 	p.reserveCandidateFor(f, reservationCandidates("b"), "", "m") // b is full
 	_, held, _ := p.reserveCandidateFor(f, reservationCandidates("a"), "", "m")
 	round := reservationCandidates("a", "b", "c")
-	cand, res := p.rescoreReserve(f, round, map[string]bool{"a": true}, held, "m")
+	cand := p.rescoreReserve(f, round, map[string]bool{"a": true}, &held, "m")
+	res := held
 	if cand.id != "c" || res.nodeID != "c" {
 		t.Fatalf("failover chose %s, want free node c", cand.id)
 	}
@@ -219,5 +223,85 @@ func TestSlotScore_TruncatedCommittedStreamNotReplayed(t *testing.T) {
 	}
 	if n := inflightTotal(p); n != 0 {
 		t.Fatalf("inflight after stream abort = %d, want 0", n)
+	}
+}
+
+func TestSlotScore_AffinityHitUsesLocalInflight(t *testing.T) {
+	p := affinityProxy(t, "a", "b")
+	f := p.soleFacade()
+	p.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1}}
+	_, r, _ := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "k", "m")
+	p.releaseReservation(r)
+	// Stale scheduler pending says a is full; our own inflight says it is free.
+	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b"}, Ranks: []schedulerwire.NodeRank{
+		{ID: "a", Pending: 5, ComputedAt: time.Now().UnixMilli() + 1000}, {ID: "b"}}})
+	_, _, d := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "k", "m")
+	if d != affinityHit {
+		t.Fatalf("decision = %q, want hit", d)
+	}
+}
+
+func TestSlotScore_SuppressionAppliesWithoutProvider(t *testing.T) {
+	p := affinityProxy(t, "a")
+	p.capacity = nil
+	p.suppress(inflightKey{"e", "m", "a"})
+	if p.eligible("a", "e", "m") {
+		t.Fatal("suppressed node eligible with no capacity provider")
+	}
+	p.capacity = &fakeCap{}
+	if p.eligible("a", "e", "m") {
+		t.Fatal("suppressed node eligible with Unknown residency")
+	}
+}
+
+func notLoadedResp(r io.Reader) *http.Response {
+	return &http.Response{StatusCode: 400, Body: io.NopCloser(r)}
+}
+
+type stallReader struct{ done chan struct{} }
+
+func (s stallReader) Read([]byte) (int, error) { <-s.done; return 0, io.EOF }
+
+func TestNotLoaded_ReadIsCancellable(t *testing.T) {
+	done := make(chan struct{})
+	defer close(done)
+	resp := &http.Response{Body: struct {
+		io.Reader
+		io.Closer
+	}{stallReader{done}, io.NopCloser(nil)}}
+	start := time.Now()
+	if classifyNotLoaded(context.Background(), "ollama", resp, 20*time.Millisecond) {
+		t.Fatal("classified a stalled body")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("classification did not honour its deadline")
+	}
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Fatal("stalled body should surface the failure")
+	}
+}
+
+type failAfter struct {
+	data string
+	sent bool
+}
+
+func (f *failAfter) Read(b []byte) (int, error) {
+	if f.sent {
+		return 0, io.ErrUnexpectedEOF
+	}
+	f.sent = true
+	return copy(b, f.data), nil
+}
+
+func TestNotLoaded_ReadErrorPassesThrough(t *testing.T) {
+	prefix := `{"error":"model \"x\" not found"}`
+	resp := notLoadedResp(&failAfter{data: prefix})
+	if classifyNotLoaded(context.Background(), "ollama", resp, time.Second) {
+		t.Fatal("truncated body must not classify")
+	}
+	got, err := io.ReadAll(resp.Body)
+	if string(got) != prefix || err != io.ErrUnexpectedEOF {
+		t.Fatalf("got %q, %v; want prefix then ErrUnexpectedEOF", got, err)
 	}
 }
