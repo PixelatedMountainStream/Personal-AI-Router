@@ -13,10 +13,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"nvpair-shared/applog"
+	"nvpair-shared/noderec"
 )
 
 // Version is stamped at build time via -ldflags "-X main.Version=...".
@@ -64,6 +66,14 @@ type Settings struct {
 	// label is purely UI sugar and a getter call on first paint is
 	// enough.
 	ClusterFriendlyName string `json:"cluster_friendly_name"`
+
+	// EngineOverrides holds per-node engine capacity overrides as flat keys:
+	// "engine_slots.<engine>.<model>", "engine_ctx_per_slot.<engine>.<model>"
+	// (positive integers; applied only while the model is loaded) and
+	// "jit_load.<engine>" (bool; defaults: ollama and llamacpp true, lmstudio
+	// false). engine-manager merges them into its /v1/models reply, which is how
+	// they reach the node directory and the proxy.
+	EngineOverrides map[string]json.RawMessage `json:"engine_overrides,omitempty"`
 }
 
 func defaultSettings() Settings {
@@ -456,6 +466,51 @@ func (m *Manager) handleMessage(msg *Message) {
 			slog.Warn("failed to emit cluster-auto-sync notification after set", "err", err)
 		}
 
+	case "settings/get-engine-overrides":
+		m.mu.RLock()
+		v := m.settings.EngineOverrides
+		m.mu.RUnlock()
+		if v == nil {
+			v = map[string]json.RawMessage{}
+		}
+		m.codec.Respond(msg.ID, map[string]any{"value": v})
+
+	case "settings/set-engine-override":
+		// {"key": "...", "value": <int|bool>}; a null/absent value removes the key.
+		var p struct {
+			Key   string          `json:"key"`
+			Value json.RawMessage `json:"value"`
+		}
+		if err := json.Unmarshal(msg.Params, &p); err != nil || !validEngineOverride(p.Key, p.Value) {
+			m.codec.RespondError(msg.ID, -32602, `invalid params: expected {"key": "engine_slots.<engine>.<model>"|"engine_ctx_per_slot.<engine>.<model>"|"jit_load.<engine>", "value": <positive int | bool | null>}`)
+			return
+		}
+		m.mu.RLock()
+		newSettings := m.settings
+		m.mu.RUnlock()
+		next := make(map[string]json.RawMessage, len(newSettings.EngineOverrides)+1)
+		for k, v := range newSettings.EngineOverrides {
+			next[k] = v
+		}
+		if len(p.Value) == 0 || string(p.Value) == "null" {
+			delete(next, p.Key)
+		} else {
+			next[p.Key] = p.Value
+		}
+		if len(next) == 0 {
+			next = nil
+		}
+		newSettings.EngineOverrides = next
+		if err := m.saveSettings(newSettings); err != nil {
+			slog.Error("failed to persist engine override", "err", err)
+			m.codec.RespondError(msg.ID, -32603, "failed to persist setting: "+err.Error())
+			return
+		}
+		m.mu.Lock()
+		m.settings = newSettings
+		m.mu.Unlock()
+		m.codec.Respond(msg.ID, map[string]bool{"ok": true})
+
 	case "shutdown":
 		if err := m.codec.Respond(msg.ID, nil); err != nil {
 			log.Printf("failed to respond to shutdown: %v", err)
@@ -468,4 +523,26 @@ func (m *Manager) handleMessage(msg *Message) {
 			log.Printf("failed to send error response: %v", err)
 		}
 	}
+}
+
+// validEngineOverride reports whether key is a recognised override key and value
+// (null/absent means "remove") has its type: positive integer for the slot and
+// ctx keys, bool for jit_load.
+func validEngineOverride(key string, value json.RawMessage) bool {
+	remove := len(value) == 0 || string(value) == "null"
+	if rest, ok := strings.CutPrefix(key, noderec.SettingJITLoad); ok {
+		var b bool
+		return rest != "" && (remove || json.Unmarshal(value, &b) == nil)
+	}
+	for _, prefix := range []string{noderec.SettingEngineSlots, noderec.SettingEngineCtxPerSlot} {
+		if rest, ok := strings.CutPrefix(key, prefix); ok {
+			engine, model, ok := strings.Cut(rest, ".")
+			if !ok || engine == "" || model == "" {
+				return false
+			}
+			var n int
+			return remove || (json.Unmarshal(value, &n) == nil && n > 0)
+		}
+	}
+	return false
 }

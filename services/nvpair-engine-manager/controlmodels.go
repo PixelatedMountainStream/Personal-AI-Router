@@ -56,7 +56,11 @@ func (s *controlServer) handleModelAction(w http.ResponseWriter, r *http.Request
 	)
 	switch op {
 	case "load":
-		res, err = s.exec.ModelLoad(r.Context(), req.Engine, req.Model)
+		// Legacy load: same exclusive gate, never evicts (409 on conflict).
+		if _, err := s.exec.PinnedLoad(r.Context(), PinnedRequest{Engine: req.Engine, Model: req.Model}); err != nil {
+			writePinnedError(w, err)
+			return
+		}
 	case "unload":
 		res, err = s.exec.ModelUnload(r.Context(), req.Engine, req.Model)
 	case "delete":

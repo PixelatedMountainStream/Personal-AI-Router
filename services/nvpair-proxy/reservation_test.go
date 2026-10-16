@@ -123,7 +123,8 @@ func TestReserveCandidate_CombinesPendingPressureAndReservations(t *testing.T) {
 		reservedID(p, candidates),
 		reservedID(p, candidates),
 	}
-	want := []string{"b", "b", "c"}
+	// One slot each: free nodes first (by GPU pressure), then the shortest queue.
+	want := []string{"c", "a", "b"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("GPU-aware reservations = %v, want %v", got, want)
@@ -438,5 +439,36 @@ func TestReservationsAreSharedAcrossFacades(t *testing.T) {
 		if got := reservationCount(p, r.nodeID); got != 1 {
 			t.Errorf("node %q holds %d reservations, want 1", r.nodeID, got)
 		}
+	}
+}
+
+func localTieCandidates() []candidate {
+	return []candidate{{id: "a-remote"}, {id: "z-local", local: true}}
+}
+
+func localTieProxy(t *testing.T) *Proxy {
+	p := prProxy(t)
+	ids := []string{"a-remote", "z-local"}
+	applySnapshot(p, schedulerwire.Priority{Nodes: ids, Ranks: []schedulerwire.NodeRank{{ID: "a-remote", Rank: 0}, {ID: "z-local", Rank: 1}}})
+	return p
+}
+
+func TestReserveCandidate_IdleTiePrefersLocal(t *testing.T) {
+	p := localTieProxy(t)
+	if got := reservedID(p, localTieCandidates()); got != "z-local" {
+		t.Fatalf("chose %q, want local node", got)
+	}
+}
+
+func TestReserveCandidate_FullLocalYieldsToFreeRemote(t *testing.T) {
+	p := localTieProxy(t)
+	f := p.soleFacade()
+	p.priorityMu.Lock()
+	for range p.nodeSlots("z-local", f.profile.Name, "") {
+		p.takeLocked("z-local", f.profile.Name, "", false)
+	}
+	p.priorityMu.Unlock()
+	if got := reservedID(p, localTieCandidates()); got != "a-remote" {
+		t.Fatalf("chose %q, want remote with free slot", got)
 	}
 }

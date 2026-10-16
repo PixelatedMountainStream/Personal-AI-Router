@@ -57,6 +57,10 @@ func (s *controlServer) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.exec.StartWith(r.Context(), req.Engine, startOpts{Port: req.Port, Bind: "127.0.0.1"}); err != nil {
+		if pinnedStatus(err) != http.StatusInternalServerError {
+			writePinnedError(w, err)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

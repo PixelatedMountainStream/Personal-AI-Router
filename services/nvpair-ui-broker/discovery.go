@@ -71,6 +71,10 @@ type EnrichedNode struct {
 	// peer's engine-manager /v1/models loadedByEngine field. Carried through to
 	// AvailableNode so a remote node's cards can reflect loaded state.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+	// SlotsByEngine and JITLoadByEngine carry per-engine slot capacity and
+	// jit_load flags from the directory to AvailableNode.
+	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine,omitempty"`
+	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine,omitempty"`
 }
 
 // directoryToEnriched projects the promoted daemon's DirectoryNode onto the
@@ -95,20 +99,22 @@ func directoryToEnriched(n noderec.DirectoryNode) EnrichedNode {
 		port = ni.Port
 	}
 	return EnrichedNode{
-		ID:             n.Name,
-		HostUUID:       n.HostUUID,
-		Host:           n.Name,
-		Port:           port,
-		Addresses:      addrs,
-		TXT:            txt,
-		GPUs:           n.GPUs,
-		CPU:            n.CPU,
-		Memory:         n.Memory,
-		Trusted:        n.Trusted,
-		Clustered:      n.Clustered(),
-		Models:         n.Models,
-		ModelsByEngine: n.ModelsByEngine,
-		LoadedByEngine: n.LoadedByEngine,
+		ID:              n.Name,
+		HostUUID:        n.HostUUID,
+		Host:            n.Name,
+		Port:            port,
+		Addresses:       addrs,
+		TXT:             txt,
+		GPUs:            n.GPUs,
+		CPU:             n.CPU,
+		Memory:          n.Memory,
+		Trusted:         n.Trusted,
+		Clustered:       n.Clustered(),
+		Models:          n.Models,
+		ModelsByEngine:  n.ModelsByEngine,
+		LoadedByEngine:  n.LoadedByEngine,
+		SlotsByEngine:   n.SlotsByEngine,
+		JITLoadByEngine: n.JITLoadByEngine,
 	}
 }
 
@@ -311,18 +317,20 @@ func (sn storedNode) toAvailable() AvailableNode {
 		candidates = nil
 	}
 	return AvailableNode{
-		ID:             n.ID,
-		Name:           n.ID,
-		HostUUID:       n.HostUUID,
-		IPAddress:      primary,
-		IPAddresses:    candidates,
-		Port:           n.Port,
-		LastSeen:       sn.lastSeen.Unix(),
-		Trusted:        n.Trusted,
-		Clustered:      n.Clustered,
-		Models:         n.Models,
-		ModelsByEngine: n.ModelsByEngine,
-		LoadedByEngine: n.LoadedByEngine,
+		ID:              n.ID,
+		Name:            n.ID,
+		HostUUID:        n.HostUUID,
+		IPAddress:       primary,
+		IPAddresses:     candidates,
+		Port:            n.Port,
+		LastSeen:        sn.lastSeen.Unix(),
+		Trusted:         n.Trusted,
+		Clustered:       n.Clustered,
+		Models:          n.Models,
+		ModelsByEngine:  n.ModelsByEngine,
+		LoadedByEngine:  n.LoadedByEngine,
+		SlotsByEngine:   n.SlotsByEngine,
+		JITLoadByEngine: n.JITLoadByEngine,
 	}
 }
 

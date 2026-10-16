@@ -54,6 +54,11 @@ func waitsForEngineReadiness(path, engine string) bool {
 	if path == controlLoadPath {
 		return engine == "ollama"
 	}
+	// A pinned load may unload a resident model, wait for it to leave, and then
+	// cold-load the target: always longer than the ordinary header budget.
+	if path == controlPinnedLoadPath {
+		return true
+	}
 	return path == controlStartPath || path == controlDeletePath
 }
 
@@ -128,13 +133,25 @@ func (c *remoteClient) getEngines(ctx context.Context) (json.RawMessage, error) 
 // postJSON POSTs body to a non-streaming ec endpoint and returns the raw JSON
 // response (e.g. an EngineStatus from start/stop).
 func (c *remoteClient) postJSON(ctx context.Context, path, engine string, body any) (json.RawMessage, error) {
-	b, err := json.Marshal(body)
+	data, status, err := c.post(ctx, path, engine, body)
 	if err != nil {
 		return nil, err
 	}
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("remote %s: HTTP %d: %s", path, status, strings.TrimSpace(string(data)))
+	}
+	return json.RawMessage(data), nil
+}
+
+// post is postJSON without the status check: it returns the body and status.
+func (c *remoteClient) post(ctx context.Context, path, engine string, body any) ([]byte, int, error) {
+	b, err := json.Marshal(body)
+	if err != nil {
+		return nil, 0, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(b))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	client := c.http
@@ -144,14 +161,11 @@ func (c *remoteClient) postJSON(ctx context.Context, path, engine string, body a
 	resp, err := client.Do(req)
 	if err != nil {
 		c.forgetAddress()
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("remote %s: HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(data)))
-	}
-	return json.RawMessage(data), nil
+	return data, resp.StatusCode, nil
 }
 
 // stream POSTs body to a streaming ec endpoint and consumes its NDJSON frames,

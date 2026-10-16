@@ -45,6 +45,10 @@ var allowedPlaceholders = map[string]bool{
 }
 
 var placeholderRe = regexp.MustCompile(`\{([a-zA-Z_][a-zA-Z0-9_]*)\}`)
+var optionalArgKeyRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+var recordPathRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$`)
+
 var resultMatchFieldPathRe = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_-]*(?:\.[a-zA-Z_][a-zA-Z0-9_-]*)*$`)
 var artifactNameRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 var sha256Re = regexp.MustCompile(`^[a-fA-F0-9]{64}$`)
@@ -253,10 +257,15 @@ type StopSpec struct {
 // placeholders (e.g. {model}); an HTTP action sends params in its declared
 // body or query location.
 type Action struct {
-	Description string            `json:"description,omitempty"`
-	HTTP        *ActionHTTP       `json:"http,omitempty"`
-	Cmd         []string          `json:"cmd,omitempty"`
-	RemovePath  *ActionRemovePath `json:"remove_path,omitempty"`
+	Description string      `json:"description,omitempty"`
+	HTTP        *ActionHTTP `json:"http,omitempty"`
+	Cmd         []string    `json:"cmd,omitempty"`
+	// OptionalArgs maps a caller param name to an argv fragment appended to Cmd
+	// only when that param is present, e.g. {"context_length": ["--context-length",
+	// "{context_length}"]}. The param value must be a non-negative integer and
+	// replaces {<param>} in the fragment. Cmd actions only.
+	OptionalArgs map[string][]string `json:"optional_args,omitempty"`
+	RemovePath   *ActionRemovePath   `json:"remove_path,omitempty"`
 	// ProgressProtocol selects a narrowly defined streaming adapter for an
 	// asynchronous pull HTTP action. Empty keeps the ordinary response-stream
 	// behavior; named protocols are validated so a typo cannot silently fall
@@ -293,6 +302,37 @@ type ActionResult struct {
 	// field) rather than returning a presence-only list (Ollama's /api/ps,
 	// every row of which is resident and so needs no Match).
 	Match *ResultMatch `json:"match,omitempty"`
+	// Record, when set, additionally extracts typed per-model capacity (see
+	// ResultRecord). With Array/Field set, every array row yields one record
+	// keyed by its Field. With both empty, the whole response is ONE record
+	// (a per-model query such as llama.cpp /props?model=).
+	Record *ResultRecord `json:"record,omitempty"`
+	// Each, when set, names a per-row array of instances (LM Studio's
+	// "loaded_instances"). Each row is expanded to one row per instance, named
+	// by that instance's EachField (default "id"), so residency, sizes and
+	// slots are per loaded instance rather than per model key. Rows with an
+	// empty array stay as they are.
+	Each      string `json:"each,omitempty"`
+	EachField string `json:"each_field,omitempty"`
+}
+
+// ResultRecord declares how to build a SlotInfo. Fields maps "slots", "ctx" and
+// "bytes" (resident size, used by model_sizes)
+// to dot-separated paths, where a numeric part indexes an array (LM Studio's
+// "loaded_instances.0.config.parallel"). Static supplies "slots" and "ctx"
+// constants for engines that expose no endpoint (Ollama serves 1 slot).
+type ResultRecord struct {
+	Fields map[string]string `json:"fields,omitempty"`
+	Static map[string]int    `json:"static,omitempty"`
+}
+
+// declares reports whether the record maps key by path or by static value.
+func (r *ResultRecord) declares(key string) bool {
+	if _, ok := r.Fields[key]; ok {
+		return true
+	}
+	_, ok := r.Static[key]
+	return ok
 }
 
 // ResultMatch is the optional row filter on an ActionResult. Exactly one of
@@ -305,6 +345,9 @@ type ResultMatch struct {
 	Field    string   `json:"field"`              // element field to test, e.g. "state" / "loaded_instances"
 	In       []string `json:"in,omitempty"`       // accepted string values, e.g. ["loaded"]
 	Nonempty bool     `json:"nonempty,omitempty"` // true → Field must be a nonempty JSON array
+	// LoadingIn lists string values that are not matched (not "loaded") but still
+	// occupy memory; strict residency counts them as occupied.
+	LoadingIn []string `json:"loading_in,omitempty"`
 }
 
 // ActionRemovePath deletes a filesystem path declared in the manifest.
@@ -896,6 +939,19 @@ func (a *Action) validate(name string) error {
 	if kinds != 1 {
 		return fmt.Errorf("action %q: exactly one of http, cmd, or remove_path is required", name)
 	}
+	if len(a.OptionalArgs) > 0 {
+		if !hasCmd {
+			return fmt.Errorf("action %q: optional_args requires a cmd action", name)
+		}
+		for k, frag := range a.OptionalArgs {
+			if !optionalArgKeyRe.MatchString(k) || allowedPlaceholders[k] || k == "model" {
+				return fmt.Errorf("action %q: optional_args key %q is invalid or reserved", name, k)
+			}
+			if len(frag) == 0 {
+				return fmt.Errorf("action %q: optional_args %q has an empty fragment", name, k)
+			}
+		}
+	}
 	if hasRemovePath {
 		if strings.TrimSpace(a.RemovePath.Path) == "" || strings.TrimSpace(a.RemovePath.Root) == "" {
 			return fmt.Errorf("action %q: remove_path.path and remove_path.root are required", name)
@@ -919,7 +975,24 @@ func (a *Action) validate(name string) error {
 			return fmt.Errorf("action %q: unsupported progress_protocol %q", name, a.ProgressProtocol)
 		}
 	}
-	if a.Result != nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") {
+	if r := a.Result; r != nil && r.Record != nil {
+		if (strings.TrimSpace(r.Array) == "") != (strings.TrimSpace(r.Field) == "") {
+			return fmt.Errorf("action %q: result.array and result.field must both be set or both empty with result.record", name)
+		}
+		for k, path := range r.Record.Fields {
+			if (k != "slots" && k != "ctx" && k != "bytes") || !recordPathRe.MatchString(path) {
+				return fmt.Errorf("action %q: result.record.fields %q=%q invalid (keys slots|ctx|bytes, dot path)", name, k, path)
+			}
+		}
+		for k := range r.Record.Static {
+			if k != "slots" && k != "ctx" && k != "bytes" {
+				return fmt.Errorf("action %q: result.record.static key %q invalid (want slots, ctx or bytes)", name, k)
+			}
+		}
+		if !r.Record.declares("slots") && !r.Record.declares("bytes") {
+			return fmt.Errorf("action %q: result.record requires a slots or bytes field or static value", name)
+		}
+	} else if a.Result != nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") {
 		return fmt.Errorf("action %q: result.array and result.field are required when result is set", name)
 	}
 	if a.Result != nil && a.Result.Match != nil {

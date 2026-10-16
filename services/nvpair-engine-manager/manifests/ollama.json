@@ -102,6 +102,16 @@
       "http": { "method": "GET", "path": "/api/ps" },
       "result": { "array": "models", "field": "name" }
     },
+    "slots": {
+      "description": "Loaded-model capacity: Ollama serves one slot per model here (static).",
+      "http": { "method": "GET", "path": "/api/ps" },
+      "result": { "array": "models", "field": "name", "record": { "static": { "slots": 1 } } }
+    },
+    "model_sizes": {
+      "description": "Resident size in bytes of each loaded model (/api/ps models[].size).",
+      "http": { "method": "GET", "path": "/api/ps" },
+      "result": { "array": "models", "field": "name", "record": { "fields": { "bytes": "size" } } }
+    },
     "pull_model": {
       "description": "Pull a model by name (params: {\"name\": \"<model>\"}).",
       "http": { "method": "POST", "path": "/api/pull", "body_schema": { "name": "string" } }

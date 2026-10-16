@@ -417,6 +417,10 @@ func (m *Manager) runAction(ctx context.Context, msg *Message) {
 			m.codec.RespondError(msg.ID, -32000, userMsg)
 			return
 		}
+	} else if loadActions[p.Action] {
+		res, err = m.exec.guardedLoadAction(ctx, p.Engine, p.Action, p.Params)
+	} else if p.Action == "unload_model" {
+		res, err = m.exec.canonicalUnload(ctx, p.Engine, p.Params)
 	} else {
 		res, err = m.exec.Action(ctx, p.Engine, p.Action, p.Params)
 	}

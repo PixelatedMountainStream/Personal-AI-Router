@@ -240,6 +240,11 @@ func (e *Executor) bringUpProcess(ctx context.Context, st *engineState, engine s
 	if err := validateEffectiveLaunch(rt, launch, vars["host"], vars["port"]); err != nil {
 		return err
 	}
+	release, err := e.gateStartupLoad(ctx, engine, launch.Args)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	diagnostics := newStartupOutput(launchDiagnosticArgs(rt), launch.Env)
 	defer diagnostics.close()
@@ -300,6 +305,8 @@ func (e *Executor) bringUpCommand(ctx context.Context, st *engineState, engine s
 	st.proc = nil
 	st.mu.Unlock()
 	started := false
+	release := func() {}
+	defer func() { release() }()
 	cleanup := func(startErr error) error {
 		if !started {
 			return startErr
@@ -327,6 +334,11 @@ func (e *Executor) bringUpCommand(ctx context.Context, st *engineState, engine s
 			if err := validateEffectiveLaunch(rt, launch, vars["host"], vars["port"]); err != nil {
 				return cleanup(err)
 			}
+			rel, err := e.gateStartupLoad(ctx, engine, launch.Args)
+			if err != nil {
+				return cleanup(err)
+			}
+			release = rel
 		}
 		argv := append([]string{launch.Bin}, launch.Args...)
 		run := e.runCommand
