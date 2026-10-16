@@ -404,11 +404,11 @@ func TestExtractRecords(t *testing.T) {
 		want map[string]SlotInfo
 	}{
 		{"lmstudio nested path", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":4,"context_length":131072}}]}]}`, lm,
-			map[string]SlotInfo{"a": {4, 131072}}},
+			map[string]SlotInfo{"a": {Slots: 4, CtxPerSlot: 131072}}},
 		{"lmstudio missing path", `{"models":[{"key":"a","loaded_instances":[]}]}`, lm, map[string]SlotInfo{}},
 		{"lmstudio wrong type", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":"4"}}]}]}`, lm, map[string]SlotInfo{}},
 		{"lmstudio bad ctx type", `{"models":[{"key":"a","loaded_instances":[{"config":{"parallel":4,"context_length":"x"}}]}]}`, lm, map[string]SlotInfo{}},
-		{"ollama static", `{"models":[{"name":"q"}]}`, oll, map[string]SlotInfo{"q": {1, 0}}},
+		{"ollama static", `{"models":[{"name":"q"}]}`, oll, map[string]SlotInfo{"q": {Slots: 1}}},
 		{"no array", `{"data":[]}`, oll, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -420,7 +420,7 @@ func TestExtractRecords(t *testing.T) {
 	}
 
 	// llama.cpp single-object shape.
-	if si, ok := extractRecord(json.RawMessage(`{"total_slots":2,"default_generation_settings":{"n_ctx":8192}}`), llama); !ok || si != (SlotInfo{2, 8192}) {
+	if si, ok := extractRecord(json.RawMessage(`{"total_slots":2,"default_generation_settings":{"n_ctx":8192}}`), llama); !ok || si != (SlotInfo{Slots: 2, CtxPerSlot: 8192}) {
 		t.Fatalf("llamacpp = %v,%v", si, ok)
 	}
 	if _, ok := extractRecord(json.RawMessage(`{"default_generation_settings":{"n_ctx":8192}}`), llama); ok {
@@ -471,7 +471,7 @@ func TestBundledSlotsQueryThroughManifests(t *testing.T) {
 	}
 
 	res := ex.ModelsResult(context.Background())
-	if want := map[string]map[string]SlotInfo{"llamacpp": {"m": {2, 8192}}}; !reflect.DeepEqual(res.SlotsByEngine, want) {
+	if want := map[string]map[string]SlotInfo{"llamacpp": {"m": {Slots: 2, CtxPerSlot: 8192}}}; !reflect.DeepEqual(res.SlotsByEngine, want) {
 		t.Fatalf("SlotsByEngine = %v, want %v (failing engine must be omitted)", res.SlotsByEngine, want)
 	}
 	if propsQuery.Get("autoload") != "false" || propsQuery.Get("model") != "m" {

@@ -111,6 +111,10 @@ func TestPinnedRoutingAndPeers(t *testing.T) {
 	// "self" runs on the local executor; the ollama engine sees num_ctx.
 	var body string
 	ex := bundledEngineExec(t, "ollama", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/ps" || r.URL.Path == "/api/tags" {
+			_, _ = w.Write([]byte(`{"models":[]}`))
+			return
+		}
 		b := make([]byte, 512)
 		n, _ := r.Body.Read(b)
 		body = string(b[:n])

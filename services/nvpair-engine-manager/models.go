@@ -57,6 +57,9 @@ type ModelsResult struct {
 type SlotInfo struct {
 	Slots      int `json:"slots"`
 	CtxPerSlot int `json:"ctxPerSlot,omitempty"`
+	// Bytes is the model's resident size when a record declares "bytes"
+	// (model_sizes); internal, never part of the wire shape.
+	Bytes int64 `json:"-"`
 }
 
 // Models returns the union of model names served by every installed, running
@@ -262,11 +265,20 @@ func extractRecords(raw json.RawMessage, spec *ActionResult) (map[string]SlotInf
 // optional, but a present ctx of the wrong type or negative invalidates the record.
 func extractRecord(raw json.RawMessage, rec *ResultRecord) (SlotInfo, bool) {
 	var si SlotInfo
-	slots, ok := recordInt(raw, rec, "slots")
-	if !ok || slots < 1 {
-		return SlotInfo{}, false
+	if rec.declares("slots") || !rec.declares("bytes") {
+		slots, ok := recordInt(raw, rec, "slots")
+		if !ok || slots < 1 {
+			return SlotInfo{}, false
+		}
+		si.Slots = slots
 	}
-	si.Slots = slots
+	if rec.declares("bytes") {
+		b, ok := recordInt(raw, rec, "bytes")
+		if !ok || b < 0 {
+			return SlotInfo{}, false
+		}
+		si.Bytes = int64(b)
+	}
 	if ctx, ok := recordInt(raw, rec, "ctx"); ok {
 		if ctx < 0 {
 			return SlotInfo{}, false

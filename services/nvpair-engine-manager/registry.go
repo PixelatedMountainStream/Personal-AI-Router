@@ -309,13 +309,23 @@ type ActionResult struct {
 	Record *ResultRecord `json:"record,omitempty"`
 }
 
-// ResultRecord declares how to build a SlotInfo. Fields maps "slots" and "ctx"
+// ResultRecord declares how to build a SlotInfo. Fields maps "slots", "ctx" and
+// "bytes" (resident size, used by model_sizes)
 // to dot-separated paths, where a numeric part indexes an array (LM Studio's
 // "loaded_instances.0.config.parallel"). Static supplies "slots" and "ctx"
 // constants for engines that expose no endpoint (Ollama serves 1 slot).
 type ResultRecord struct {
 	Fields map[string]string `json:"fields,omitempty"`
 	Static map[string]int    `json:"static,omitempty"`
+}
+
+// declares reports whether the record maps key by path or by static value.
+func (r *ResultRecord) declares(key string) bool {
+	if _, ok := r.Fields[key]; ok {
+		return true
+	}
+	_, ok := r.Static[key]
+	return ok
 }
 
 // ResultMatch is the optional row filter on an ActionResult. Exactly one of
@@ -960,19 +970,17 @@ func (a *Action) validate(name string) error {
 			return fmt.Errorf("action %q: result.array and result.field must both be set or both empty with result.record", name)
 		}
 		for k, path := range r.Record.Fields {
-			if (k != "slots" && k != "ctx") || !recordPathRe.MatchString(path) {
-				return fmt.Errorf("action %q: result.record.fields %q=%q invalid (keys slots|ctx, dot path)", name, k, path)
+			if (k != "slots" && k != "ctx" && k != "bytes") || !recordPathRe.MatchString(path) {
+				return fmt.Errorf("action %q: result.record.fields %q=%q invalid (keys slots|ctx|bytes, dot path)", name, k, path)
 			}
 		}
 		for k := range r.Record.Static {
-			if k != "slots" && k != "ctx" {
-				return fmt.Errorf("action %q: result.record.static key %q invalid (want slots or ctx)", name, k)
+			if k != "slots" && k != "ctx" && k != "bytes" {
+				return fmt.Errorf("action %q: result.record.static key %q invalid (want slots, ctx or bytes)", name, k)
 			}
 		}
-		if _, ok := r.Record.Fields["slots"]; !ok {
-			if _, ok := r.Record.Static["slots"]; !ok {
-				return fmt.Errorf("action %q: result.record requires a slots field or static value", name)
-			}
+		if !r.Record.declares("slots") && !r.Record.declares("bytes") {
+			return fmt.Errorf("action %q: result.record requires a slots or bytes field or static value", name)
 		}
 	} else if a.Result != nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") {
 		return fmt.Errorf("action %q: result.array and result.field are required when result is set", name)

@@ -98,13 +98,7 @@ func (e *Executor) PinnedLoad(ctx context.Context, req PinnedRequest) (PinnedRes
 	if _, _, err := modelLoadWire(req.Engine, req.Model, req.LoadOpts); err != nil {
 		return PinnedResult{}, err
 	}
-	if _, err := e.ModelLoadWith(ctx, req.Engine, req.Model, req.LoadOpts); err != nil {
-		if pinnedStatus(err) != http.StatusInternalServerError {
-			return PinnedResult{}, err
-		}
-		return PinnedResult{}, &pinnedError{Status: http.StatusBadGateway, Message: err.Error()}
-	}
-	return PinnedResult{Engine: req.Engine, Model: req.Model, Applied: req.LoadOpts, Unloaded: []Victim{}}, nil
+	return e.exclusiveLoad(ctx, req)
 }
 
 // handlePinnedLoad is the ec peer route.

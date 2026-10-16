@@ -36,6 +36,7 @@ func main() {
 	controlPort := flag.Int("control-port", 0, "if >0 and this node is clustered, serve the cluster-scoped mTLS remote-control surface (ec: /v1/engines + remote install/pull/start/stop) on this port")
 	reservedPort := flag.Int("reserved-port", 0, "local engine port reserved by the parent proxy; 0 disables the reservation")
 	clusterDir := flag.String("cluster-dir", "", "cluster identity/pin directory; when set and this node holds a cluster identity, the ec remote-control surface (--control-port) turns on with pin-based mTLS")
+	largeModelGiB := flag.Int("large-model-gib", defaultLargeModelGiB, "resident size in GiB from which a model counts as large for pinned-load exclusivity (no two large models on one node)")
 	loadedPollSec := flag.Int("loaded-poll-interval", defaultLoadedPollSeconds, "seconds between loaded-model polls that drive engine:models-changed pushes; 0 disables the watcher")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	uninstallManaged := flag.Bool("uninstall-managed", false, "remove every engine PAIR installed, preserving downloaded models, then exit; for the platform uninstallers")
@@ -102,6 +103,9 @@ func main() {
 	exec.overrideDir = manifestDir
 	// Loaded-model watcher cadence. Integer seconds keeps parity with the other
 	// flags, so the smallest positive interval is 1s; <=0 disables the watcher.
+	if *largeModelGiB > 0 {
+		exec.largeModelBytes = int64(*largeModelGiB) << 30
+	}
 	if *loadedPollSec <= 0 {
 		exec.loadedPollInterval = 0
 	} else {

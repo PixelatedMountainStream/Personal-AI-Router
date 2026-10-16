@@ -300,6 +300,12 @@ The value must be a non-negative integer (rendered from its literal text) and
 replaces `{<param>}` in the fragment; `model` and the runner placeholders are
 reserved keys. LM Studio's `load_model` uses it for `context_length` and `parallel`.
 
+An optional **`model_sizes`** action (HTTP, `result.record.fields.bytes` = path to
+the resident size in bytes) lets pinned-load exclusivity classify a loaded model
+as large; `bytes` is a third `result.record` key beside `slots` and `ctx`, and a
+record may declare `bytes` without `slots`. Ollama reads `/api/ps` `size`, LM
+Studio `/api/v1/models` `size_bytes`; llama.cpp declares none (name rule applies).
+
 An optional **`model_resolution`** expands or resolves the `{model}`
 placeholder before the action runs:
 
