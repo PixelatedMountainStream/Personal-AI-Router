@@ -47,7 +47,6 @@ class Fixture(unittest.TestCase):
         self.write("local/UPSTREAM_VERSION.txt", f"sha={sha}\nlast_release_tag=v1\n")
         self.write("local/fork-surface.toml", TOML)
         self.write("local/FORK_SURFACE.md", LEGACY + DATA)
-        self.write("local/neutralized.txt", "")
         shutil.copytree(TOOL, self.root / "local/tools/importscan")
         git(self.root, "add", "-A")
         git(self.root, "commit", "-qm", "fork base")
@@ -82,6 +81,12 @@ class CheckForkSurface(Fixture):
         code, _, kinds = self.run_check()
         self.assertEqual(code, 1)
         self.assertIn("over_seam_budget", kinds)
+
+    def test_held_workflows_are_not_surface(self):
+        self.write("local/fork-surface.toml", TOML.replace("allow =", 'held = [".github/workflows/**"]\nallow ='))
+        self.write(".github/workflows/ci.yml", "name: x\n" * 50)
+        code, out, kinds = self.run_check()
+        self.assertEqual((code, kinds, out["files"]), (0, [], []))
 
     def test_malformed_record_is_tool_error(self):
         self.write("local/FORK_SURFACE.md", "### E1\nfiles: up/hook.go\nkind: bogus\nrecipe: r\n")

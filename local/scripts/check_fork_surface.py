@@ -23,7 +23,7 @@ import tomllib
 from pathlib import Path
 
 # Glob precedence when a path matches several lists (first wins).
-PRECEDENCE = ("ignore", "generated", "neutralized", "allow")
+PRECEDENCE = ("ignore", "held", "generated", "allow")
 ESCALATE_KINDS = {"over_line_budget", "over_file_budget", "not_allowlisted", "upstream_imports_fork",
                   "upstream_adds_ignored_path", "budget_raised", "fork_imports_upstream"}
 
@@ -239,9 +239,11 @@ def budget_raised(root, base, labels):
                     out.append({"kind": "budget_raised", "what": f"{of['path']}.{k} removed"})
                 elif nf[k] > v:
                     out.append({"kind": "budget_raised", "what": f"{of['path']}.{k}", "from": v, "to": nf[k]})
-        for key in ("allow", "legacy_added", "generated", "ignore"):
+        for key in ("allow", "legacy_added", "generated", "ignore", "held"):
             for e in sorted(set(new.get(key, [])) - set(old.get(key, []))):
                 out.append({"kind": "budget_raised", "what": f"{key} += {e}"})
+        for e in sorted(set(old.get("held", [])) - set(new.get("held", []))):   # un-holding workflows is a rule change
+            out.append({"kind": "budget_raised", "what": f"held -= {e}"})
     old_py = show("local/scripts/check_fork_surface.py")
     if old_py is not None and "surface-budget-raise" not in labels:
         cur_py = Path(__file__).read_text()
@@ -250,11 +252,6 @@ def budget_raised(root, base, labels):
             a, b = pat.search(old_py), pat.search(cur_py)
             if (a and a.group(0)) != (b and b.group(0)):
                 out.append({"kind": "budget_raised", "what": f"checker {name} changed"})
-    old_neu = show("local/neutralized.txt")
-    if old_neu is not None and "upstream-sync" not in labels:
-        old_set = {ln.strip() for ln in old_neu.splitlines() if ln.strip() and not ln.startswith("#")}
-        for e in sorted(set(read_lines(Path(root) / "local/neutralized.txt")) - old_set):
-            out.append({"kind": "budget_raised", "what": f"neutralized += {e}"})
     return out
 
 
@@ -269,7 +266,7 @@ def check(root, base=None, labels=(), new_upstream=None):
         raise ToolError(f"upstream sha not found: {sha} (fetch the upstream remote)")
     cfg = tomllib.loads((root / "local/fork-surface.toml").read_text())
     lists = {"ignore": cfg.get("ignore", []), "generated": cfg.get("generated", []),
-             "neutralized": read_lines(root / "local/neutralized.txt"), "allow": cfg.get("allow", [])}
+             "held": cfg.get("held", []), "allow": cfg.get("allow", [])}
     legacy = cfg.get("legacy_added", [])
     budget = cfg.get("budget", {})
     validate_caps(cfg)
@@ -289,7 +286,7 @@ def check(root, base=None, labels=(), new_upstream=None):
         cat = category(path)
         if path.endswith(".go") and cat != "ignore":
             scan_go.append(path)
-        if cat in ("ignore", "generated", "neutralized"):
+        if cat in ("ignore", "held", "generated"):
             continue
         if st["added"]:
             in_legacy = matches(path, legacy)

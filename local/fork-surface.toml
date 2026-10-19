@@ -10,7 +10,7 @@ ignore = [
   ".github/workflows/local-*.yml", ".github/workflows/upstream-sync.yml", ".claude/**",
 ]
 # Glob dialect: no brace expansion; `*` matches within one path segment; `**` matches zero or more
-# directories (implemented by the checker). Precedence: ignore > generated > neutralized > allow.
+# directories (implemented by the checker). Precedence: ignore > held > generated > allow.
 # Upstream files we may edit (the hooks). Every entry must be covered by a hook record's files: in local/FORK_SURFACE.md.
 # PR-A: all 43 files modified today (test files included); PR-C..E shrink this to the final 30.
 allow = [
@@ -60,8 +60,9 @@ allow = [
 ]
 # Taken from upstream on conflict; excluded from budgets.
 generated = ["services/versions.json", "CHANGELOG.md", "desktop/package.json", "desktop/package-lock.json"]
-# `neutralized` paths live in local/neutralized.txt, never in this file; this TOML is never machine-written.
-# ci.yml, build.yml and the release-intent files are never listed.
+# Held: kept byte-identical to the base branch by the sync (upstream workflow changes are ported by hand), so
+# they are excluded from not_allowlisted and the budgets. Changing this list needs surface-budget-raise.
+held = [".github/workflows/**"]
 
 # Added upstream-dir files not yet moved to local/ or local_*.go; PR-C/D/E delete entries.
 legacy_added = [

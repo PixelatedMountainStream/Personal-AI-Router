@@ -21,6 +21,9 @@ permissions:
     contents: read
     pull-requests: read
 
+# Sync PRs run candidate-controlled actions (.github/actions/setup): they may read caches, never write them.
+cache-mode: read
+
 concurrency:
     group: local-ci-${{ github.ref }}
     cancel-in-progress: true
