@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Config for local/scripts/sync_upstream.py. Spec: PLAN-pair-upstream-sync.md section 4.
+upstream_remote = "upstream"
+upstream_ref = "develop"
+base_branch = "develop"
+# A tag matching this (and newer than last_release_tag) flags the sync as a release.
+tag_pattern = '^v\d+\.\d+\.\d+$'
+
+# Modules built/vetted/tested by `sync_upstream.py check`.
+go_modules = [
+  "services/nvpair-proxy", "services/nvpair-engine-manager", "services/shared",
+  "services/nvpair-node-scanner", "services/nvpair-ui-broker", "services/nvpair-job-scheduler",
+  "services/nvpair-node-settings", "services/tests",
+]
+
+# Known failures skipped in the sync job only (local-ci.yml runs them unskipped).
+# Drop an entry once the first local-ci run shows it passing on ubuntu.
+[go_skip]
+"services/nvpair-engine-manager" = "TestUninstallTerminatesRunningInstance"  # #11, macOS-only procImage
+"services/tests" = "TestWorkloadManagerOutboundBroadcast"                      # #12, hard-coded port 14320

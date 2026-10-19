@@ -1,0 +1,204 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# upstream-sync: one daily PR merging NVIDIA develop into our develop, updated in place.
+# A PR whose range carries a new upstream tag is labelled `upstream-release`.
+# Spec: PLAN-pair-upstream-sync.md section 4. Ported from the codex fork's upstream-sync.yml.
+#
+# Secret UPSTREAM_SYNC_TOKEN (required): fine-grained PAT or App token scoped to this repo with
+# contents, workflows, pull-requests and issues. Never GITHUB_TOKEN: PRs it opens do not trigger
+# local-ci, and it cannot push workflow files.
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref or tag to sync (default: upstream/develop)"
+        required: false
+        type: string
+      force:
+        description: "Run the merge path even if upstream has not moved"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  BASE: develop
+  GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+  # Pin gh to this fork: the `upstream` remote added below would otherwise
+  # make gh target NVIDIA for pr/issue commands (codex fork PR #24).
+  GH_REPO: ${{ github.repository }}
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Require UPSTREAM_SYNC_TOKEN
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error title=UPSTREAM_SYNC_TOKEN missing::Create the secret (fine-grained PAT, this repo only: contents, workflows, pull-requests, issues)."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+          # No persisted GITHUB_TOKEN header: pushes below use UPSTREAM_SYNC_TOKEN.
+          persist-credentials: false
+
+      - name: Configure git and upstream remote
+        run: |
+          git config user.name "pair upstream-sync"
+          git config user.email "upstream-sync@users.noreply.github.com"
+          git remote add upstream https://github.com/NVIDIA/Personal-AI-Router.git
+          git fetch upstream --tags --quiet
+          git fetch origin --quiet
+          for l in "upstream-sync 0e8a16 Upstream sync" "upstream-release 1d76db Sync carries a new upstream tag" "sync-failing d93f0b Sync needs repair"; do
+            set -- $l; gh label create "$1" --color "$2" --description "${*:3}" 2>/dev/null || true
+          done
+
+      - name: Find the open sync PR
+        id: pr
+        run: |
+          json=$(gh pr list --label upstream-sync --state open --base "$BASE" --json number,headRefName --jq '.[0] // empty')
+          echo "number=$(jq -r '.number // empty' <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "branch=$(jq -r '.headRefName // empty' <<<"$json")" >> "$GITHUB_OUTPUT"
+          # Merge into the open PR's branch so human commits are preserved.
+          [ -n "$json" ] && git checkout -q -B "$(jq -r .headRefName <<<"$json")" "origin/$(jq -r .headRefName <<<"$json")"
+          exit 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/nvpair-proxy/go.mod
+          cache-dependency-path: services/nvpair-proxy/go.sum
+
+      - name: Status
+        id: status
+        env:
+          REF_INPUT: ${{ inputs.ref }}
+          FORCE_INPUT: ${{ inputs.force }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          args=(--base "origin/$BASE")
+          [ -n "$REF_INPUT" ] && args+=(--ref "$REF_INPUT")
+          [ "$FORCE_INPUT" = "true" ] && args+=(--force)
+          [ -n "$PR_NUMBER" ] && args+=(--pending)
+          set +e
+          python3 local/scripts/sync_upstream.py status "${args[@]}" | tee status.json
+          code=${PIPESTATUS[0]}
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "mode=$(jq -r '.mode // "none"' status.json)" >> "$GITHUB_OUTPUT"
+          # Exit 3 (sha= regression) or 2 must not pass silently.
+          [ "$code" = "0" ] || { echo "::error title=status failed::exit $code, see status.json"; exit "$code"; }
+
+      - name: Merge
+        id: merge
+        if: steps.status.outputs.mode == 'sync' || steps.status.outputs.mode == 'bump'
+        env:
+          REF_INPUT: ${{ inputs.ref }}
+          FORCE_INPUT: ${{ inputs.force }}
+          MODE: ${{ steps.status.outputs.mode }}
+          PR_BRANCH: ${{ steps.pr.outputs.branch }}
+        run: |
+          args=()
+          [ -n "$REF_INPUT" ] && args+=(--ref "$REF_INPUT")
+          [ "$FORCE_INPUT" = "true" ] && args+=(--force)
+          [ "$MODE" = "bump" ] && args+=(--bump-only)
+          [ -n "$PR_BRANCH" ] && args+=(--reuse --branch "$PR_BRANCH")
+          set +e
+          python3 local/scripts/sync_upstream.py merge "${args[@]}" | tee merge.json
+          code=${PIPESTATUS[0]}
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "branch=$(jq -r '.branch // empty' merge.json)" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Re-apply workflow neutralization before any push
+        if: steps.merge.outputs.code == '0'
+        run: python3 local/scripts/sync_upstream.py neutralize --commit
+
+      - name: Check
+        id: check
+        if: steps.merge.outputs.code == '0'
+        run: |
+          set +e
+          python3 local/scripts/sync_upstream.py check | tee check.json
+          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Report
+        id: report
+        if: steps.status.outputs.mode == 'sync' || steps.status.outputs.mode == 'bump'
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # A merge that stopped midway (conflicts, failed rewrite) is recorded, then abandoned.
+          git merge --abort 2>/dev/null || true
+          [ -f check.json ] || echo '{}' > check.json
+          python3 local/scripts/sync_upstream.py report --status status.json --merge merge.json \
+            --check check.json --run-url "$RUN_URL" --out report.md | tee report.json
+          for k in outcome title draft issue issue_title; do
+            echo "$k=$(jq -r ".$k" report.json)" >> "$GITHUB_OUTPUT"
+          done
+          echo "labels=$(jq -r '.labels | join(",")' report.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish (PR and issue)
+        if: steps.report.outputs.outcome != ''
+        env:
+          MERGE_CODE: ${{ steps.merge.outputs.code }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          OUTCOME: ${{ steps.report.outputs.outcome }}
+          TITLE: ${{ steps.report.outputs.title }}
+          DRAFT: ${{ steps.report.outputs.draft }}
+          WANT_ISSUE: ${{ steps.report.outputs.issue }}
+          ISSUE_TITLE: ${{ steps.report.outputs.issue_title }}
+          LABELS: ${{ steps.report.outputs.labels }}
+        run: |
+          # The branch exists only when the merge committed (exit 0); otherwise the open PR, if any, is updated in place.
+          if [ "$MERGE_CODE" = "0" ]; then
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+            PR_BRANCH="$BRANCH"
+          fi
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr edit "$PR_NUMBER" --title "$TITLE" --body-file report.md --add-label "$LABELS"
+            if [ "$OUTCOME" = "clean" ]; then
+              gh pr edit "$PR_NUMBER" --remove-label sync-failing || true
+              gh pr ready "$PR_NUMBER" || true
+            elif [ "$DRAFT" = "true" ]; then
+              gh pr ready "$PR_NUMBER" --undo || true
+            fi
+          elif [ "$MERGE_CODE" = "0" ]; then
+            extra=(); [ "$DRAFT" = "true" ] && extra+=(--draft)
+            gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file report.md \
+              --label "$LABELS" "${extra[@]}"
+          fi
+          if [ "$WANT_ISSUE" = "true" ]; then
+            n=$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number')
+            if [ -n "$n" ]; then
+              gh issue edit "$n" --title "$ISSUE_TITLE" --add-label "$LABELS"
+              gh issue comment "$n" --body-file report.md
+            else
+              gh issue create --label "$LABELS" --title "$ISSUE_TITLE" --body-file report.md
+            fi
+          fi
+          # A failing or escalated sync still fails the run so it is visible.
+          [ "$OUTCOME" = "clean" ]
