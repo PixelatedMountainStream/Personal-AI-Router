@@ -25,11 +25,11 @@ on:
         type: boolean
         default: false
 
+# Least privilege by default; the two privileged jobs raise it. Candidate (merged) code is only ever
+# executed in the `check` job, which has read-only permissions and no PAT. The privileged jobs run
+# sync_upstream.py copied from `develop` before the candidate is checked out, never the candidate's copy.
 permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-  actions: write
+  contents: read
 
 concurrency:
   group: upstream-sync
@@ -37,15 +37,23 @@ concurrency:
 
 env:
   BASE: develop
-  GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
-  # Pin gh to this fork: the `upstream` remote added below would otherwise
-  # make gh target NVIDIA for pr/issue commands (codex fork PR #24).
-  GH_REPO: ${{ github.repository }}
 
 jobs:
-  sync:
+  merge:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 30
+    permissions: { contents: write, pull-requests: write, issues: write }
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+      # Pin gh to this fork: the `upstream` remote added below would otherwise
+      # make gh target NVIDIA for pr/issue commands (codex fork PR #24).
+      GH_REPO: ${{ github.repository }}
+    outputs:
+      status_code: ${{ steps.status.outputs.code }}
+      mode: ${{ steps.status.outputs.mode }}
+      code: ${{ steps.merge.outputs.code }}
+      candidate: ${{ steps.bundle.outputs.candidate }}
+      pr_labels: ${{ steps.pr.outputs.labels }}
     steps:
       - name: Require UPSTREAM_SYNC_TOKEN
         run: |
@@ -58,11 +66,14 @@ jobs:
         with:
           ref: develop
           fetch-depth: 0
-          # No persisted GITHUB_TOKEN header: pushes below use UPSTREAM_SYNC_TOKEN.
+          # No persisted GITHUB_TOKEN header: pushes use UPSTREAM_SYNC_TOKEN in the publish job.
           persist-credentials: false
 
-      - name: Configure git and upstream remote
+      - name: Trust develop's scripts, configure git
         run: |
+          # Copied before any candidate branch is checked out: this is the only code that runs with the PAT.
+          cp -R local/scripts "$RUNNER_TEMP/trusted"
+          mkdir -p "$RUNNER_TEMP/out"
           git config user.name "pair upstream-sync"
           git config user.email "upstream-sync@users.noreply.github.com"
           git remote add upstream https://github.com/NVIDIA/Personal-AI-Router.git
@@ -75,41 +86,36 @@ jobs:
       - name: Find the open sync PR
         id: pr
         run: |
-          json=$(gh pr list --label upstream-sync --state open --base "$BASE" --json number,headRefName --jq '.[0] // empty')
-          echo "number=$(jq -r '.number // empty' <<<"$json")" >> "$GITHUB_OUTPUT"
-          echo "branch=$(jq -r '.headRefName // empty' <<<"$json")" >> "$GITHUB_OUTPUT"
-          [ -n "$json" ] && echo "labels=$(gh pr view "$(jq -r .number <<<"$json")" --json labels --jq '[.labels[].name] | join(",")')" >> "$GITHUB_OUTPUT"
+          # Only a same-repo PR from an upstream-sync/* branch is ever treated as the sync PR.
+          json=$(gh pr list --label upstream-sync --state open --base "$BASE" \
+            --json number,headRefName,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false and (.headRefName | startswith("upstream-sync/")))] | .[0] // empty')
+          [ -z "$json" ] && exit 0
+          n=$(jq -r .number <<<"$json"); b=$(jq -r .headRefName <<<"$json")
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+          echo "branch=$b" >> "$GITHUB_OUTPUT"
+          echo "labels=$(gh pr view "$n" --json labels --jq '[.labels[].name] | join(",")')" >> "$GITHUB_OUTPUT"
           # Merge into the open PR's branch so human commits are preserved.
-          [ -n "$json" ] && git checkout -q -B "$(jq -r .headRefName <<<"$json")" "origin/$(jq -r .headRefName <<<"$json")"
-          exit 0
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: services/nvpair-proxy/go.mod
-          cache-dependency-path: services/nvpair-proxy/go.sum
+          git checkout -q -B "$b" "origin/$b"
 
       - name: Status
         id: status
         env:
           REF_INPUT: ${{ inputs.ref }}
           FORCE_INPUT: ${{ inputs.force }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_BRANCH: ${{ steps.pr.outputs.branch }}
         run: |
-          args=(--base "origin/$BASE")
+          # Measured from the pending PR branch when there is one, so later tags update it in place.
+          args=(--root "$GITHUB_WORKSPACE" status --base HEAD --tags-base "origin/$BASE")
           [ -n "$REF_INPUT" ] && args+=(--ref "$REF_INPUT")
           [ "$FORCE_INPUT" = "true" ] && args+=(--force)
-          [ -n "$PR_NUMBER" ] && args+=(--pending)
           set +e
-          python3 local/scripts/sync_upstream.py status "${args[@]}" | tee status.json
-          code=${PIPESTATUS[0]}
+          python3 "$RUNNER_TEMP/trusted/sync_upstream.py" "${args[@]}" > "$RUNNER_TEMP/out/status.json"
+          code=$?
+          cat "$RUNNER_TEMP/out/status.json"
           echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "mode=$(jq -r '.mode // "none"' status.json)" >> "$GITHUB_OUTPUT"
-          # Exit 3 (sha= regression) or 2 must not pass silently.
-          [ "$code" = "0" ] || { echo "::error title=status failed::exit $code, see status.json"; exit "$code"; }
+          echo "mode=$(jq -r '.mode // "none"' "$RUNNER_TEMP/out/status.json")" >> "$GITHUB_OUTPUT"
+          exit 0   # a failed status is reported by the publish job, never silently dropped
 
       - name: Merge
         id: merge
@@ -120,58 +126,139 @@ jobs:
           MODE: ${{ steps.status.outputs.mode }}
           PR_BRANCH: ${{ steps.pr.outputs.branch }}
         run: |
-          args=()
+          args=(--root "$GITHUB_WORKSPACE" merge)
           [ -n "$REF_INPUT" ] && args+=(--ref "$REF_INPUT")
           [ "$FORCE_INPUT" = "true" ] && args+=(--force)
           [ "$MODE" = "bump" ] && args+=(--bump-only)
           [ -n "$PR_BRANCH" ] && args+=(--reuse --branch "$PR_BRANCH")
           set +e
-          python3 local/scripts/sync_upstream.py merge "${args[@]}" | tee merge.json
-          code=${PIPESTATUS[0]}
+          python3 "$RUNNER_TEMP/trusted/sync_upstream.py" "${args[@]}" > "$RUNNER_TEMP/out/merge.json"
+          code=$?
+          cat "$RUNNER_TEMP/out/merge.json"
           echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "branch=$(jq -r '.branch // empty' merge.json)" >> "$GITHUB_OUTPUT"
-          echo "committed=$(jq -r '.committed // false' merge.json)" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Re-apply workflow neutralization before any push
         if: steps.merge.outputs.code == '0'
-        run: python3 local/scripts/sync_upstream.py neutralize --commit
+        run: python3 "$RUNNER_TEMP/trusted/sync_upstream.py" --root "$GITHUB_WORKSPACE" neutralize --commit
+
+      - name: Bundle the candidate
+        id: bundle
+        run: |
+          if { [ "$(jq -r '.committed // false' "$RUNNER_TEMP/out/merge.json" 2>/dev/null)" = "true" ] || [ "${{ steps.merge.outputs.code }}" = "0" ]; } \
+             && [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BASE")" ] \
+             && [ "${{ steps.status.outputs.mode }}" != "none" ]; then
+            git merge --abort 2>/dev/null || true
+            git bundle create "$RUNNER_TEMP/out/cand.bundle" HEAD --not "origin/$BASE"
+            echo "candidate=true" >> "$GITHUB_OUTPUT"
+          fi
+          jq -n --arg b "$(git branch --show-current)" '{branch:$b}' > "$RUNNER_TEMP/out/branch.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sync-merge
+          path: ${{ runner.temp }}/out
+
+  check:
+    needs: merge
+    if: needs.merge.outputs.candidate == 'true' && needs.merge.outputs.code == '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Runs candidate code: read-only token, no PAT, no persisted credentials.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-merge
+          path: ${{ runner.temp }}/in
+
+      - name: Check out the candidate
+        run: |
+          git fetch "$RUNNER_TEMP/in/cand.bundle" HEAD:refs/heads/candidate
+          git checkout -q candidate
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: services/nvpair-proxy/go.mod
+          cache-dependency-path: services/nvpair-proxy/go.sum
 
       - name: Check
-        id: check
-        if: steps.merge.outputs.code == '0'
         env:
-          PR_LABELS: ${{ steps.pr.outputs.labels }}
+          PR_LABELS: ${{ needs.merge.outputs.pr_labels }}
         run: |
-          # Labels already on the open sync PR (e.g. surface-budget-raise) reach the budget_raised rule.
-          PR_LABEL_ARGS=""; for l in ${PR_LABELS//,/ }; do PR_LABEL_ARGS="$PR_LABEL_ARGS --label $l"; done
+          # Labels on the open sync PR (e.g. surface-budget-raise) reach the budget_raised rule.
+          args=(); for l in ${PR_LABELS//,/ }; do args+=(--label "$l"); done
+          mkdir -p "$RUNNER_TEMP/check"
           set +e
-          python3 local/scripts/sync_upstream.py check --base "origin/$BASE" $PR_LABEL_ARGS | tee check.json
-          echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-          exit 0
+          python3 local/scripts/sync_upstream.py check --base "origin/$BASE" "${args[@]}" > "$RUNNER_TEMP/check/check.json"
+          cat "$RUNNER_TEMP/check/check.json"
+          exit 0   # the result file carries the verdict; a missing file is treated as a failure by report
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sync-check
+          path: ${{ runner.temp }}/check
+
+  publish:
+    needs: [merge, check]
+    if: >-
+      always() && needs.merge.result == 'success' &&
+      (needs.merge.outputs.mode == 'sync' || needs.merge.outputs.mode == 'bump' || needs.merge.outputs.status_code != '0')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions: { contents: write, pull-requests: write, issues: write }
+    env:
+      GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Trust develop's scripts
+        run: cp -R local/scripts "$RUNNER_TEMP/trusted"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sync-merge
+          path: ${{ runner.temp }}/in
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true   # absent when the merge failed or the check job did not run: report then escalates
+        with:
+          name: sync-check
+          path: ${{ runner.temp }}/in
 
       - name: Report
         id: report
-        if: steps.status.outputs.mode == 'sync' || steps.status.outputs.mode == 'bump'
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # A merge that stopped midway (conflicts, failed rewrite) is recorded, then abandoned.
-          git merge --abort 2>/dev/null || true
-          [ -f check.json ] || echo '{}' > check.json
-          python3 local/scripts/sync_upstream.py report --status status.json --merge merge.json \
-            --check check.json --run-url "$RUN_URL" --out report.md | tee report.json
+          in="$RUNNER_TEMP/in"
+          python3 "$RUNNER_TEMP/trusted/sync_upstream.py" --root "$GITHUB_WORKSPACE" report --status "$in/status.json" \
+            --merge "$in/merge.json" --check "$in/check.json" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/report.json"
+          cat "$RUNNER_TEMP/report.json"
           for k in outcome title draft issue issue_title; do
-            echo "$k=$(jq -r ".$k" report.json)" >> "$GITHUB_OUTPUT"
+            echo "$k=$(jq -r ".$k" "$RUNNER_TEMP/report.json")" >> "$GITHUB_OUTPUT"
           done
-          echo "labels=$(jq -r '.labels | join(",")' report.json)" >> "$GITHUB_OUTPUT"
+          echo "labels=$(jq -r '.labels | join(",")' "$RUNNER_TEMP/report.json")" >> "$GITHUB_OUTPUT"
 
       - name: Publish (PR and issue)
-        if: steps.report.outputs.outcome != ''
         env:
-          COMMITTED: ${{ steps.merge.outputs.committed }}
-          BRANCH: ${{ steps.merge.outputs.branch }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
           OUTCOME: ${{ steps.report.outputs.outcome }}
           TITLE: ${{ steps.report.outputs.title }}
           DRAFT: ${{ steps.report.outputs.draft }}
@@ -179,32 +266,37 @@ jobs:
           ISSUE_TITLE: ${{ steps.report.outputs.issue_title }}
           LABELS: ${{ steps.report.outputs.labels }}
         run: |
-          # A conflicted merge is committed with its markers on the sync branch (never on develop): the draft
-          # sync-failing PR and failing checks block merging, and the next run finds the branch via the PR.
-          # No commit (tool error before committing): only the issue and any open PR are updated.
-          if [ "$COMMITTED" = "true" ]; then
-            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          in="$RUNNER_TEMP/in"; body="$RUNNER_TEMP/report.md"
+          BRANCH=$(jq -r '.branch // empty' "$in/branch.json" 2>/dev/null || true)
+          PR_NUMBER=$(gh pr list --label upstream-sync --state open --base "$BASE" --json number,headRefName,isCrossRepository \
+            --jq '[.[] | select(.isCrossRepository == false and (.headRefName | startswith("upstream-sync/")))] | .[0].number // empty')
+          if [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
+            git fetch "$in/cand.bundle" HEAD:refs/heads/candidate
+            # Never push anywhere but a sync branch (a conflicted merge is committed with markers; the draft PR blocks it).
+            dest="refs/heads/$BRANCH"
+            case "$dest" in refs/heads/upstream-sync/*) ;; *) echo "::error::refusing to push to $dest"; exit 1;; esac
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/candidate:$dest"
           fi
+          title=(); [ -n "$TITLE" ] && title=(--title "$TITLE")
           if [ -n "$PR_NUMBER" ]; then
-            gh pr edit "$PR_NUMBER" --title "$TITLE" --body-file report.md --add-label "$LABELS"
+            gh pr edit "$PR_NUMBER" "${title[@]}" --body-file "$body" --add-label "$LABELS"
             if [ "$OUTCOME" = "clean" ]; then
               gh pr edit "$PR_NUMBER" --remove-label sync-failing || true
               gh pr ready "$PR_NUMBER" || true
             elif [ "$DRAFT" = "true" ]; then
               gh pr ready "$PR_NUMBER" --undo || true
             fi
-          elif [ "$COMMITTED" = "true" ]; then
+          elif [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
             extra=(); [ "$DRAFT" = "true" ] && extra+=(--draft)
-            gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file report.md \
-              --label "$LABELS" "${extra[@]}"
+            gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$body" --label "$LABELS" "${extra[@]}"
           fi
           if [ "$WANT_ISSUE" = "true" ]; then
             n=$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number')
             if [ -n "$n" ]; then
               gh issue edit "$n" --title "$ISSUE_TITLE" --add-label "$LABELS"
-              gh issue comment "$n" --body-file report.md
+              gh issue comment "$n" --body-file "$body"
             else
-              gh issue create --label "$LABELS" --title "$ISSUE_TITLE" --body-file report.md
+              gh issue create --label "$LABELS" --title "$ISSUE_TITLE" --body-file "$body"
             fi
           fi
           # A failing or escalated sync still fails the run so it is visible.

@@ -140,30 +140,34 @@ def newer_tags(root, remote, cfg, last_tag, contained_in):
     return sorted(keep, key=tag_key)
 
 
-def plan(root, remote, cfg, ref, base, force, pending):
-    """Shared by status and merge. `base` is the ref whose UPSTREAM_VERSION the PR would build on."""
+def plan(root, remote, cfg, ref, base, force, tags_base=None):
+    """Shared by status and merge. `base` is the ref whose UPSTREAM_VERSION the PR would build on (the
+    open sync PR's branch when one exists); `tags_base` (develop) is where the reported tag list starts."""
     base_sha, last_tag = read_version(root, base)
     target = resolve_target(root, remote, cfg, ref)
     if target != base_sha and not is_ancestor(root, base_sha, target):
         raise Regression(f"upstream {target[:10]} is not a descendant of sha={base_sha[:10]}")
     new = target != base_sha
-    tags = newer_tags(root, remote, cfg, last_tag, target)
+    rtags = newer_tags(root, remote, cfg, last_tag, target)   # tags this branch has not recorded yet
+    tags = rtags
+    if tags_base:
+        tags = newer_tags(root, remote, cfg, read_version(root, tags_base)[1], target)
     if new or force:
         mode = "sync"
-    elif tags and not pending:
+    elif rtags:
         mode = "bump"
     else:
         mode = "none"
     commits = int(out(root, "rev-list", "--count", f"{base_sha}..{target}")) if new else 0
     return {"mode": mode, "new": new, "base_sha": base_sha, "target": target, "short": target[:10],
-            "commits": commits, "tags": tags, "newest_tag": tags[-1] if tags else "",
+            "commits": commits, "tags": tags, "rtags": rtags, "newest_tag": tags[-1] if tags else "",
             "release": bool(tags), "last_release_tag": last_tag, "remote": remote}
 
 
 def cmd_status(a, root):
     cfg = config(root)
     remote = resolve_remote(root, cfg, a.upstream_remote)
-    p = plan(root, remote, cfg, a.ref, a.base or "HEAD", a.force, a.pending)
+    p = plan(root, remote, cfg, a.ref, a.base or "HEAD", a.force, a.tags_base)
     return emit("status", True, 0, p["mode"] if p["mode"] != "none" else "none", **p)
 
 
@@ -268,19 +272,19 @@ def conflict_result(step, root, **kw):
 def cmd_merge(a, root):
     cfg = config(root)
     remote = resolve_remote(root, cfg, a.upstream_remote)
-    p = plan(root, remote, cfg, a.ref, "HEAD", a.force, False)
+    p = plan(root, remote, cfg, a.ref, "HEAD", a.force)
     old, last_tag = p["base_sha"], p["last_release_tag"]
     target = p["target"]
     stamp = a.date or datetime.now(timezone.utc).strftime("%Y%m%d")
     if a.bump_only:
-        if not p["tags"]:
+        if not p["rtags"]:
             return emit("merge", True, 0, "none: no new tag to record", **p)
         branch = a.branch or f"upstream-sync/{stamp}-{old[:10]}"
         if not a.reuse:
             git(root, "checkout", "-b", branch)
-        write_version(root, old, p["newest_tag"])
+        write_version(root, old, p["rtags"][-1])
         git(root, "add", "local/UPSTREAM_VERSION.txt")
-        git(root, "commit", "-s", "--no-verify", "-m", f"Record upstream release {p['newest_tag']}")
+        git(root, "commit", "-s", "--no-verify", "-m", f"Record upstream release {p['rtags'][-1]}")
         return emit("merge", True, 0, "run: sync_upstream.py check", branch=branch, committed=True, **p)
     branch = a.branch or f"upstream-sync/{stamp}-{target[:10]}"
     if not a.reuse:
@@ -297,9 +301,15 @@ def cmd_merge(a, root):
                 git(root, "rm", "-q", "--", c["path"])
     # Classify before committing: the commit clears the unmerged index entries.
     cs = unmerged(root)
-    neutralize(root, added_workflows(root, old, target))   # raises Escalate -> exit 2, nothing committed
-    write_version(root, target, p["newest_tag"] or last_tag)
-    git(root, "add", "-A")   # conflicted files go in with their markers: a human repairs on the draft PR branch
+    changed, _ = neutralize(root, added_workflows(root, old, target))   # Escalate -> exit 2, nothing committed
+    write_version(root, target, p["rtags"][-1] if p["rtags"] else last_tag)
+    # Stage only intended paths (the merge result is already in the index): conflicted files go in with
+    # their markers so a human can repair on the draft PR branch.
+    git(root, "add", "-A", "--", "local/UPSTREAM_VERSION.txt", *changed, *[c["path"] for c in cs])
+    merging = git(root, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0
+    if not merging and git(root, "diff", "--cached", "--quiet", check=False).returncode == 0:
+        return emit("merge", True, 0, "unchanged: nothing to commit; run: sync_upstream.py check",
+                    branch=branch, committed=False, **p)
     msg = f"Merge upstream develop@{target[:10]} into {branch}"
     if cs:
         msg += "\n\nUNRESOLVED CONFLICTS committed with markers; repair on this branch."
@@ -373,6 +383,9 @@ def cmd_check(a, root):
         v = json.loads(p.stdout).get("violations", []) or ([json.loads(p.stdout)["error"]] if p.returncode == 2 else [])
     except (ValueError, KeyError):
         v = [p.stderr.strip()[:300] or "check_fork_surface.py gave no JSON"]
+        escalate.append("malformed checker output")
+    if p.returncode not in (0, 1):   # tool error (2), regression (3) or crash: never a pass
+        escalate.append(f"checker exit {p.returncode}")
     if p.returncode and not v:
         v = [f"check_fork_surface.py exited {p.returncode}"]
     if a.base:   # old sha from the base branch, before this branch advanced it
@@ -380,8 +393,6 @@ def cmd_check(a, root):
         if old != new:
             v = v + added_ignored(root, old, new)
     escalate += [x for x in v if isinstance(x, dict) and x.get("kind") in cfs.ESCALATE_KINDS]
-    if p.returncode == 2:
-        escalate.append("tool error")
     d["surface_violations"] += [x if isinstance(x, str) else json.dumps(x) for x in v]
     steps.append({"step": "fork-surface", "ok": p.returncode == 0})
     changed, _ = neutralize(Path(root))
@@ -413,17 +424,21 @@ def load_json(path):
 def cmd_report(a, root):
     st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
     short, tags = st.get("short", "?"), st.get("tags", [])
-    if mg and not mg.get("ok", True):
+    if (st and not st.get("ok", False)) or not st:   # status failed (exit 2/3) or missing
         outcome = "escalate"
-    elif ck and ck.get("escalate"):
+    elif mg and not mg.get("ok", True):
         outcome = "escalate"
-    elif ck and not ck.get("ok", True):
+    elif "ok" not in ck or ck.get("escalate"):   # missing/malformed check result is never a pass
+        outcome = "escalate"
+    elif not ck.get("ok"):
         outcome = "failing"
     else:
         outcome = "clean"
     labels = ["upstream-sync"] + (["upstream-release"] if st.get("release") else []) \
         + ([] if outcome == "clean" else ["sync-failing"])
-    if st.get("release"):
+    if not st.get("ok", False):
+        title = ""   # leave an open PR's title alone
+    elif st.get("release"):
         title = f"Upstream release: {st['newest_tag']} (+develop@{short})"
     else:
         title = f"Upstream sync: develop@{short} ({st.get('commits', 0)} commits)"
@@ -437,6 +452,8 @@ def cmd_report(a, root):
                       ("surface_violations", "Surface violations")):
         items = ck.get(key, [])
         L += [f"### {name}", *([f"- `{x}`" for x in items] or ["- none"]), ""]
+    if not st.get("ok", False):
+        L += [f"Status failed: {st.get('next_action', 'no status result')}", ""]
     if mg and not mg.get("ok", True):
         L += [f"Merge: {mg.get('next_action', '')}", ""]
     if a.run_url:
@@ -446,7 +463,8 @@ def cmd_report(a, root):
         Path(a.out).write_text(md)
     return emit("report", True, 0, "publish", outcome=outcome, title=title, labels=labels,
                 draft=outcome == "escalate", issue=outcome == "escalate",
-                issue_title=f"Upstream sync needs repair: develop@{short}")
+                issue_title=f"Upstream sync needs repair: develop@{short}",
+                reason=st.get("next_action", "") if not st.get("ok", False) else "")
 
 
 def main(argv=None):
@@ -457,7 +475,7 @@ def main(argv=None):
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     s.add_argument("--ref"); s.add_argument("--force", action="store_true")
     s.add_argument("--base", help="ref whose UPSTREAM_VERSION the PR builds on (default HEAD)")
-    s.add_argument("--pending", action="store_true", help="an open upstream-sync PR exists")
+    s.add_argument("--tags-base", help="ref (develop) the reported tag list is measured from")
     m = sub.add_parser("merge"); m.set_defaults(fn=cmd_merge)
     m.add_argument("--ref"); m.add_argument("--force", action="store_true")
     m.add_argument("--bump-only", action="store_true"); m.add_argument("--reuse", action="store_true",

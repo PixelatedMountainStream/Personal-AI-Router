@@ -92,8 +92,6 @@ class Sync(unittest.TestCase):
     def test_tag_already_in_develop_gets_bump_only(self):
         git(self.up, "tag", "v1.0.5", self.c1)
         self.fetch()
-        code, st = self.sync("status", "--pending")
-        self.assertEqual(st["mode"], "none")           # a sync PR is pending: it carries the tag
         code, st = self.sync("status")
         self.assertEqual((st["mode"], st["new"], st["tags"]), ("bump", False, ["v1.0.5"]))
         code, mg = self.sync("merge", "--bump-only", "--date", "20261019")
@@ -188,6 +186,44 @@ class Sync(unittest.TestCase):
         sf.write_text(json.dumps(st))
         r = self.sync("report", "--status", str(sf), "--merge", str(mf))[1]
         self.assertEqual((r["draft"], r["issue"], "sync-failing" in r["labels"]), (True, True, True))
+
+    def test_pending_branch_picks_up_later_tag_and_reuse_is_noop_safe(self):
+        self.up_commit("a.txt", "2\n", tag="v1.1.0")
+        self.fetch()
+        code, mg = self.sync("merge", "--date", "20261019")
+        br = mg["branch"]
+        self.put(self.fork, "h.txt", "human\n")          # a human commit on the sync branch
+        git(self.fork, "add", "-A")
+        git(self.fork, "commit", "-qm", "human")
+        head = git(self.fork, "rev-parse", "HEAD")
+        # unchanged re-run: not an error, nothing committed
+        code, mg = self.sync("merge", "--reuse", "--branch", br, "--force")
+        self.assertEqual((code, mg["committed"]), (0, False))
+        self.assertEqual(git(self.fork, "rev-parse", "HEAD"), head)
+        # a later tag on an already-merged commit: bump in place on the pending branch
+        git(self.up, "tag", "v1.2.0")
+        self.fetch()
+        code, st = self.sync("status", "--base", "HEAD", "--tags-base", "develop")
+        self.assertEqual((st["mode"], st["tags"], st["rtags"]), ("bump", ["v1.1.0", "v1.2.0"], ["v1.2.0"]))
+        self.assertEqual(self.sync("merge", "--bump-only", "--reuse", "--branch", br)[0], 0)
+        self.assertEqual(self.version()[1], "last_release_tag=v1.2.0")
+        self.assertTrue((self.fork / "h.txt").exists())
+
+    def test_merge_stages_only_intended_paths(self):
+        self.up_commit("a.txt", "2\n")
+        self.fetch()
+        self.put(self.fork, "status.json", "{}")
+        self.sync("merge", "--date", "20261019")
+        self.assertEqual(git(self.fork, "ls-files", "status.json"), "")
+
+    def test_report_never_clean_on_missing_check_or_status_failure(self):
+        ok = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        mg = Path(self.tmp.name) / "mg.json"
+        mg.write_text(json.dumps({"ok": True}))
+        self.assertEqual(self.sync("report", "--status", self._dump(ok), "--merge", str(mg))[1]["outcome"], "escalate")
+        bad = {"ok": False, "step": "status", "next_action": "sha= regression"}
+        r = self.sync("report", "--status", self._dump(bad))[1]
+        self.assertEqual((r["outcome"], r["issue"], r["title"]), ("escalate", True, ""))
 
     def test_failed_rewrite_stops_before_commit(self):
         self.up_commit("a.txt", "2\n", {".github/workflows/bad.yml": "name: bad\njobs: {}\n"})
