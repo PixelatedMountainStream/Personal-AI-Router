@@ -159,6 +159,15 @@ jobs:
              && [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BASE")" ] \
              && [ "$MODE" != "none" ]; then
             git merge --abort 2>/dev/null || true
+            # A PAT push triggers workflows, so a candidate that touches .github/workflows/** is never bundled
+            # unless every change is a verified workflow_dispatch-only neutralization (publish re-checks).
+            set +e
+            python3 "$RUNNER_TEMP/trusted/sync_upstream.py" --root "$GITHUB_WORKSPACE" workflow-guard \
+              --base "origin/$BASE" --cand HEAD > "$RUNNER_TEMP/out/guard.json"
+            guard=$?
+            set -e
+            cat "$RUNNER_TEMP/out/guard.json"
+            [ "$guard" = "0" ] || exit 0   # workflow_review: no bundle, no push; report opens the issue
             git bundle create "$RUNNER_TEMP/out/cand.bundle" HEAD --not "origin/$BASE"
             echo "candidate=true" >> "$GITHUB_OUTPUT"
             echo "cand_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -202,6 +211,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Actions has no job-level `cache-mode: none` (no such key exists). Equivalent: setup-go `cache: false`,
+      # setup-python caches nothing by default, and this job uses no actions/cache, so nothing is restored
+      # from or saved to the repo cache that the privileged jobs could later read.
       - uses: actions/setup-go@v5
         with:
           go-version-file: services/nvpair-proxy/go.mod
@@ -213,7 +225,7 @@ jobs:
           PR_LABELS: ${{ needs.merge.outputs.pr_labels }}
         run: |
           # Labels on the open sync PR (e.g. surface-budget-raise) reach the budget_raised rule.
-          args=(); for l in ${PR_LABELS//,/ }; do args+=(--label "$l"); done
+          args=(); IFS=, read -ra labels <<<"$PR_LABELS"; for l in "${labels[@]}"; do [ -n "$l" ] && args+=(--label "$l"); done
           mkdir -p "$RUNNER_TEMP/check"
           set +e
           python3 local/scripts/sync_upstream.py check --base "origin/$BASE" "${args[@]}" > "$RUNNER_TEMP/check/check.json"
@@ -268,7 +280,7 @@ jobs:
         run: |
           in="$RUNNER_TEMP/in"
           python3 "$RUNNER_TEMP/trusted/sync_upstream.py" --root "$GITHUB_WORKSPACE" report --status "$in/status.json" \
-            --merge "$in/merge.json" --check "$RUNNER_TEMP/chk/check.json" --check-code "$CHECK_CODE" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/report.json"
+            --merge "$in/merge.json" --guard "$in/guard.json" --check "$RUNNER_TEMP/chk/check.json" --check-code "$CHECK_CODE" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/report.json"
           cat "$RUNNER_TEMP/report.json"
           for k in outcome title draft issue issue_title; do
             echo "$k=$(jq -r ".$k" "$RUNNER_TEMP/report.json")" >> "$GITHUB_OUTPUT"
@@ -290,18 +302,22 @@ jobs:
           in="$RUNNER_TEMP/in"; body="$RUNNER_TEMP/report.md"
           PR_NUMBER=$(gh pr list --label upstream-sync --state open --base "$BASE" --json number,headRefName,isCrossRepository \
             --jq '[.[] | select(.isCrossRepository == false and (.headRefName | startswith("upstream-sync/")))] | .[0].number // empty')
-          if [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
+          if [ "$OUTCOME" != "workflow_review" ] && [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
             # Everything downloaded is data. Verify it against the privileged job's outputs before using it.
             echo "$BUNDLE_SHA256  $in/cand.bundle" | sha256sum -c - || { echo "::error::bundle hash mismatch"; exit 1; }
             git fetch "$in/cand.bundle" HEAD:refs/heads/candidate
             [ "$(git rev-parse refs/heads/candidate)" = "$CAND_SHA" ] || { echo "::error::candidate sha mismatch"; exit 1; }
+            # Re-derive touched workflow paths from the verified bundle with trusted code (NUL-delimited): a PAT push
+            # triggers workflows, so only verified workflow_dispatch-only neutralizations may change.
+            python3 "$RUNNER_TEMP/trusted/sync_upstream.py" --root "$GITHUB_WORKSPACE" workflow-guard \
+              --base "origin/$BASE" --cand "$CAND_SHA" || { echo "::error::candidate changes .github/workflows beyond neutralization; refusing to push"; exit 1; }
             # Never push anywhere but a sync branch (a conflicted merge is committed with markers; the draft PR blocks it).
             dest="refs/heads/$BRANCH"
             case "$dest" in refs/heads/upstream-sync/*) ;; *) echo "::error::refusing to push to $dest"; exit 1;; esac
             git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/candidate:$dest"
           fi
           title=(); [ -n "$TITLE" ] && title=(--title "$TITLE")
-          if [ -n "$PR_NUMBER" ]; then
+          if [ -n "$PR_NUMBER" ] && [ "$OUTCOME" != "workflow_review" ]; then
             gh pr edit "$PR_NUMBER" "${title[@]}" --body-file "$body" --add-label "$LABELS"
             if [ "$OUTCOME" = "clean" ]; then
               gh pr edit "$PR_NUMBER" --remove-label sync-failing || true
@@ -309,7 +325,7 @@ jobs:
             elif [ "$DRAFT" = "true" ]; then
               gh pr ready "$PR_NUMBER" --undo || true
             fi
-          elif [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
+          elif [ "$OUTCOME" != "workflow_review" ] && [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
             extra=(); [ "$DRAFT" = "true" ] && extra+=(--draft)
             gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$body" --label "$LABELS" "${extra[@]}"
           fi

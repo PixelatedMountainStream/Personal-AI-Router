@@ -55,6 +55,11 @@ def run(cmd, cwd, check=False):
     return p
 
 
+def nul_list(text):
+    """Paths from `git ... -z` output. Never split path lists on whitespace: names may contain it."""
+    return [x for x in text.split("\0") if x]
+
+
 def git(root, *args, check=True):
     return run(["git", *args], root, check)
 
@@ -96,7 +101,7 @@ def read_version(root, ref=None):
 def added_ignored(root, old, new):
     """Upstream-range additions under fork-owned (ignore) globs: they would be silently uncounted."""
     ignore = tomllib.loads((Path(root) / "local/fork-surface.toml").read_text()).get("ignore", [])
-    names = git(root, "diff", "--name-only", "--diff-filter=A", f"{old}..{new}").stdout.split()
+    names = nul_list(git(root, "diff", "-z", "--name-only", "--diff-filter=A", f"{old}..{new}").stdout)
     return [{"kind": "upstream_adds_ignored_path", "path": n} for n in names if cfs.matches(n, ignore)]
 
 
@@ -222,7 +227,8 @@ def neutralize(root, new_paths=()):
 
 
 def added_workflows(root, old, new):
-    names = git(root, "diff", "--name-only", "--diff-filter=A", f"{old}..{new}", "--", ".github/workflows").stdout.split()
+    names = nul_list(git(root, "diff", "-z", "--name-only", "--diff-filter=A", f"{old}..{new}",
+                         "--", ".github/workflows").stdout)
     res = []
     for n in names:
         base = Path(n).name
@@ -230,6 +236,40 @@ def added_workflows(root, old, new):
                 and not any(cfs.matches(base, [g]) for g in FORK_WORKFLOWS):
             res.append(n)
     return res
+
+
+def dispatch_only(text):
+    """True iff the file has exactly one top-level `on:` whose whole body is `workflow_dispatch:`."""
+    try:
+        return rewrite_on(text, "") == text
+    except Escalate:
+        return False
+
+
+def cmd_workflow_guard(a, root):
+    """Trusted check of what a candidate would push: any change under .github/workflows/ is blocked unless it is
+    an added/modified file that is verified workflow_dispatch-only (the script's own neutralization)."""
+    raw = nul_list(git(root, "diff", "-z", "--name-status", "--no-renames", f"{a.base}..{a.cand}",
+                       "--", ".github/workflows").stdout)
+    changes = list(zip(raw[0::2], raw[1::2]))   # [(status, path)]
+    blocked, allowed = [], []
+    for status, path in changes:
+        text = None
+        if status in ("A", "M"):
+            blob = git(root, "show", f"{a.cand}:{path}", check=False)
+            text = blob.stdout if blob.returncode == 0 else None
+        if text is not None and dispatch_only(text):
+            allowed.append(path)
+        else:
+            blocked.append({"path": path, "status": status})
+    commits = []
+    if blocked:
+        log = git(root, "log", "-z", "--format=%h %s", f"{a.base}..{a.cand}", "--", ".github/workflows").stdout
+        commits = nul_list(log)[:30]
+    ok = not blocked
+    return emit("workflow-guard", ok, 0 if ok else 1,
+                "none" if ok else "workflow_review: do not push; list these files and commits in the issue",
+                touched=[p for _, p in changes], allowed=allowed, blocked=blocked, commits=commits)
 
 
 def cmd_neutralize(a, root):
@@ -452,9 +492,12 @@ def load_json(path):
 
 def cmd_report(a, root):
     st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
+    guard = load_json(a.guard) if a.guard and Path(a.guard).exists() else None
     short, tags = st.get("short", "?"), st.get("tags", [])
     if (st and not st.get("ok", False)) or not st:   # status failed (exit 2/3) or missing
         outcome = "escalate"
+    elif guard is not None and (not guard or guard.get("ok") is not True):
+        outcome = "workflow_review" if guard.get("blocked") else "escalate"   # nothing is pushed
     elif mg and not mg.get("ok", True):
         outcome = "escalate"
     elif a.check_code not in (None, "", "0", "1") or not valid_check(ck) or ck.get("escalate"):
@@ -466,7 +509,9 @@ def cmd_report(a, root):
         outcome = "clean"
     labels = ["upstream-sync"] + (["upstream-release"] if st.get("release") else []) \
         + ([] if outcome == "clean" else ["sync-failing"])
-    if not st.get("ok", False):
+    if outcome == "workflow_review":
+        title = ""
+    elif not st.get("ok", False):
         title = ""   # leave an open PR's title alone
     elif st.get("release"):
         title = f"Upstream release: {st['newest_tag']} (+develop@{short})"
@@ -480,8 +525,12 @@ def cmd_report(a, root):
     L += ["### Conflicts by kind", *(f"- {k}: {n}" for k, n in kinds.items()), ""]
     for key, name in (("build_errors", "Build errors"), ("test_failures", "Test failures"),
                       ("surface_violations", "Surface violations")):
-        items = ck.get(key, [])
+        items = ck.get(key) if isinstance(ck.get(key), list) else []   # untrusted: null/odd values render as none
         L += [f"### {name}", *([f"- `{x}`" for x in items] or ["- none"]), ""]
+    if outcome == "workflow_review":
+        L += ["### Workflow changes need review (nothing was pushed)",
+              *(f"- `{b['path']}` ({b['status']})" for b in guard.get("blocked", [])),
+              "", "Upstream commits:", *(f"- {c}" for c in guard.get("commits", [])), ""]
     if not st.get("ok", False):
         L += [f"Status failed: {st.get('next_action', 'no status result')}", ""]
     if mg and not mg.get("ok", True):
@@ -492,7 +541,8 @@ def cmd_report(a, root):
     if a.out:
         Path(a.out).write_text(md)
     return emit("report", True, 0, "publish", outcome=outcome, title=title, labels=labels,
-                draft=outcome == "escalate", issue=outcome == "escalate",
+                draft=outcome in ("escalate", "workflow_review"), issue=outcome in ("escalate", "workflow_review"),
+                push=outcome != "workflow_review",
                 issue_title=f"Upstream sync needs repair: develop@{short}",
                 reason=st.get("next_action", "") if not st.get("ok", False) else "")
 
@@ -512,6 +562,8 @@ def main(argv=None):
     m.add_argument("--bump-only", action="store_true"); m.add_argument("--reuse", action="store_true",
                    help="stay on the current branch (the open sync PR's)")
     m.add_argument("--branch"); m.add_argument("--date", help="yyyymmdd (tests)")
+    g = sub.add_parser("workflow-guard"); g.set_defaults(fn=cmd_workflow_guard)
+    g.add_argument("--base", required=True); g.add_argument("--cand", required=True)
     n = sub.add_parser("neutralize"); n.set_defaults(fn=cmd_neutralize)
     n.add_argument("--commit", action="store_true")
     sub.add_parser("conflicts").set_defaults(fn=cmd_conflicts)
@@ -522,6 +574,7 @@ def main(argv=None):
     r = sub.add_parser("report"); r.set_defaults(fn=cmd_report)
     r.add_argument("--status"); r.add_argument("--merge"); r.add_argument("--check")
     r.add_argument("--check-code", help="exit code the check job captured (workflow passes it through)")
+    r.add_argument("--guard", help="workflow-guard result from the privileged merge job")
     r.add_argument("--run-url"); r.add_argument("--out")
     a = ap.parse_args(argv)
     try:
