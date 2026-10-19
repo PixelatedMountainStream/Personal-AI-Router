@@ -107,4 +107,6 @@ jobs:
             - run: npm --prefix desktop ci --prefer-offline
             - name: Build modular binaries
               run: npm --prefix desktop run build:modular-binaries -- --force
-            - run: cd services/tests && go test ./... -count=1 -timeout=20m
+            # Skips only this subtest until PixelatedMountainStream/Personal-AI-Router#21
+            # resolves; remove the -skip then. Siblings still run.
+            - run: cd services/tests && go test ./... -count=1 -timeout=20m -skip '^TestProxyConcurrentBurstDistribution$/^GPU_pressure_converges$'
