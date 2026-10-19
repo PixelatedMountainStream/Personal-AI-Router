@@ -78,6 +78,7 @@ jobs:
           json=$(gh pr list --label upstream-sync --state open --base "$BASE" --json number,headRefName --jq '.[0] // empty')
           echo "number=$(jq -r '.number // empty' <<<"$json")" >> "$GITHUB_OUTPUT"
           echo "branch=$(jq -r '.headRefName // empty' <<<"$json")" >> "$GITHUB_OUTPUT"
+          [ -n "$json" ] && echo "labels=$(gh pr view "$(jq -r .number <<<"$json")" --json labels --jq '[.labels[].name] | join(",")')" >> "$GITHUB_OUTPUT"
           # Merge into the open PR's branch so human commits are preserved.
           [ -n "$json" ] && git checkout -q -B "$(jq -r .headRefName <<<"$json")" "origin/$(jq -r .headRefName <<<"$json")"
           exit 0
@@ -129,6 +130,7 @@ jobs:
           code=${PIPESTATUS[0]}
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "branch=$(jq -r '.branch // empty' merge.json)" >> "$GITHUB_OUTPUT"
+          echo "committed=$(jq -r '.committed // false' merge.json)" >> "$GITHUB_OUTPUT"
           exit 0
 
       - name: Re-apply workflow neutralization before any push
@@ -138,9 +140,13 @@ jobs:
       - name: Check
         id: check
         if: steps.merge.outputs.code == '0'
+        env:
+          PR_LABELS: ${{ steps.pr.outputs.labels }}
         run: |
+          # Labels already on the open sync PR (e.g. surface-budget-raise) reach the budget_raised rule.
+          PR_LABEL_ARGS=""; for l in ${PR_LABELS//,/ }; do PR_LABEL_ARGS="$PR_LABEL_ARGS --label $l"; done
           set +e
-          python3 local/scripts/sync_upstream.py check | tee check.json
+          python3 local/scripts/sync_upstream.py check --base "origin/$BASE" $PR_LABEL_ARGS | tee check.json
           echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
           exit 0
 
@@ -163,7 +169,7 @@ jobs:
       - name: Publish (PR and issue)
         if: steps.report.outputs.outcome != ''
         env:
-          MERGE_CODE: ${{ steps.merge.outputs.code }}
+          COMMITTED: ${{ steps.merge.outputs.committed }}
           BRANCH: ${{ steps.merge.outputs.branch }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           OUTCOME: ${{ steps.report.outputs.outcome }}
@@ -173,10 +179,11 @@ jobs:
           ISSUE_TITLE: ${{ steps.report.outputs.issue_title }}
           LABELS: ${{ steps.report.outputs.labels }}
         run: |
-          # The branch exists only when the merge committed (exit 0); otherwise the open PR, if any, is updated in place.
-          if [ "$MERGE_CODE" = "0" ]; then
+          # A conflicted merge is committed with its markers on the sync branch (never on develop): the draft
+          # sync-failing PR and failing checks block merging, and the next run finds the branch via the PR.
+          # No commit (tool error before committing): only the issue and any open PR are updated.
+          if [ "$COMMITTED" = "true" ]; then
             git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
-            PR_BRANCH="$BRANCH"
           fi
           if [ -n "$PR_NUMBER" ]; then
             gh pr edit "$PR_NUMBER" --title "$TITLE" --body-file report.md --add-label "$LABELS"
@@ -186,7 +193,7 @@ jobs:
             elif [ "$DRAFT" = "true" ]; then
               gh pr ready "$PR_NUMBER" --undo || true
             fi
-          elif [ "$MERGE_CODE" = "0" ]; then
+          elif [ "$COMMITTED" = "true" ]; then
             extra=(); [ "$DRAFT" = "true" ] && extra+=(--draft)
             gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file report.md \
               --label "$LABELS" "${extra[@]}"

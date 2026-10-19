@@ -7,7 +7,7 @@
 Subcommands: status | merge | neutralize | conflicts | check | report.
 Each prints ONE JSON object {ok, step, conflicts[], build_errors[], test_failures[],
 surface_violations[], next_action, ...}. Exit codes: 0 ok, 1 needs repair, 2 escalate,
-3 sha= regression (upstream is not a descendant of local/UPSTREAM_VERSION sha=).
+3 sha= regression (upstream is not a descendant of local/UPSTREAM_VERSION.txt sha=).
 """
 import argparse
 import json
@@ -81,18 +81,25 @@ def parse_version(text):
     kv = dict(ln.split("=", 1) for ln in text.splitlines() if "=" in ln and not ln.startswith("#"))
     sha = kv.get("sha", "").strip()
     if not SHA_RE.fullmatch(sha):
-        raise Escalate("local/UPSTREAM_VERSION: missing or malformed sha=<40-hex>")
+        raise Escalate("local/UPSTREAM_VERSION.txt: missing or malformed sha=<40-hex>")
     return sha, kv.get("last_release_tag", "").strip()
 
 
 def read_version(root, ref=None):
     if ref:
-        return parse_version(out(root, "show", f"{ref}:local/UPSTREAM_VERSION"))
-    return parse_version((Path(root) / "local/UPSTREAM_VERSION").read_text())
+        return parse_version(out(root, "show", f"{ref}:local/UPSTREAM_VERSION.txt"))
+    return parse_version((Path(root) / "local/UPSTREAM_VERSION.txt").read_text())
+
+
+def added_ignored(root, old, new):
+    """Upstream-range additions under fork-owned (ignore) globs: they would be silently uncounted."""
+    ignore = tomllib.loads((Path(root) / "local/fork-surface.toml").read_text()).get("ignore", [])
+    names = git(root, "diff", "--name-only", "--diff-filter=A", f"{old}..{new}").stdout.split()
+    return [{"kind": "upstream_adds_ignored_path", "path": n} for n in names if cfs.matches(n, ignore)]
 
 
 def write_version(root, sha, tag):
-    (Path(root) / "local/UPSTREAM_VERSION").write_text(f"sha={sha}\nlast_release_tag={tag}\n")
+    (Path(root) / "local/UPSTREAM_VERSION.txt").write_text(f"sha={sha}\nlast_release_tag={tag}\n")
 
 
 # ---- upstream refs and tags -------------------------------------------------
@@ -272,9 +279,9 @@ def cmd_merge(a, root):
         if not a.reuse:
             git(root, "checkout", "-b", branch)
         write_version(root, old, p["newest_tag"])
-        git(root, "add", "local/UPSTREAM_VERSION")
+        git(root, "add", "local/UPSTREAM_VERSION.txt")
         git(root, "commit", "-s", "--no-verify", "-m", f"Record upstream release {p['newest_tag']}")
-        return emit("merge", True, 0, "run: sync_upstream.py check", branch=branch, **p)
+        return emit("merge", True, 0, "run: sync_upstream.py check", branch=branch, committed=True, **p)
     branch = a.branch or f"upstream-sync/{stamp}-{target[:10]}"
     if not a.reuse:
         git(root, "checkout", "-b", branch)
@@ -288,13 +295,20 @@ def cmd_merge(a, root):
                 git(root, "add", c["path"])
             else:
                 git(root, "rm", "-q", "--", c["path"])
-    if unmerged(root):
-        return conflict_result("merge", root, branch=branch, **p)
+    # Classify before committing: the commit clears the unmerged index entries.
+    cs = unmerged(root)
     neutralize(root, added_workflows(root, old, target))   # raises Escalate -> exit 2, nothing committed
     write_version(root, target, p["newest_tag"] or last_tag)
-    git(root, "add", "-A", "--", "local", ".github/workflows")
-    git(root, "commit", "-s", "--no-verify", "-m", f"Merge upstream develop@{target[:10]} into {branch}")
-    return emit("merge", True, 0, "run: sync_upstream.py check", branch=branch, **p)
+    git(root, "add", "-A")   # conflicted files go in with their markers: a human repairs on the draft PR branch
+    msg = f"Merge upstream develop@{target[:10]} into {branch}"
+    if cs:
+        msg += "\n\nUNRESOLVED CONFLICTS committed with markers; repair on this branch."
+    git(root, "commit", "-s", "--no-verify", "-m", msg)
+    if cs:
+        code = 2 if any(c["kind"] in ("other", "local") for c in cs) else 1
+        return emit("merge", False, code, "repair the committed conflict markers on this branch (draft PR)",
+                    conflicts=cs, branch=branch, committed=True, **p)
+    return emit("merge", True, 0, "run: sync_upstream.py check", branch=branch, committed=True, **p)
 
 
 def cmd_conflicts(a, root):
@@ -349,13 +363,22 @@ def cmd_check(a, root):
     if p.returncode:
         d["test_failures"] += tail_matches(p.stderr, r"FAIL|ERROR") or ["python unittest failed"]
     fs = Path(root) / "local/scripts/check_fork_surface.py"
-    p = run([sys.executable, str(fs), "--root", str(root)], root)
+    cmd = [sys.executable, str(fs), "--root", str(root)]
+    if a.base:   # budget_raised vs the PR base; sync PRs always carry upstream-sync
+        cmd += ["--base", a.base]
+        for lb in ["upstream-sync", *a.label]:
+            cmd += ["--label", lb]
+    p = run(cmd, root)
     try:
         v = json.loads(p.stdout).get("violations", []) or ([json.loads(p.stdout)["error"]] if p.returncode == 2 else [])
     except (ValueError, KeyError):
         v = [p.stderr.strip()[:300] or "check_fork_surface.py gave no JSON"]
     if p.returncode and not v:
         v = [f"check_fork_surface.py exited {p.returncode}"]
+    if a.base:   # old sha from the base branch, before this branch advanced it
+        old, new = read_version(root, a.base)[0], read_version(root)[0]
+        if old != new:
+            v = v + added_ignored(root, old, new)
     escalate += [x for x in v if isinstance(x, dict) and x.get("kind") in cfs.ESCALATE_KINDS]
     if p.returncode == 2:
         escalate.append("tool error")
@@ -445,6 +468,8 @@ def main(argv=None):
     sub.add_parser("conflicts").set_defaults(fn=cmd_conflicts)
     c = sub.add_parser("check"); c.set_defaults(fn=cmd_check)
     c.add_argument("--no-go", action="store_true")
+    c.add_argument("--base", help="PR base ref (e.g. origin/develop): enables budget_raised and the old-sha range check")
+    c.add_argument("--label", action="append", default=[], help="PR label (e.g. surface-budget-raise)")
     r = sub.add_parser("report"); r.set_defaults(fn=cmd_report)
     r.add_argument("--status"); r.add_argument("--merge"); r.add_argument("--check")
     r.add_argument("--run-url"); r.add_argument("--out")

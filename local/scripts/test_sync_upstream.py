@@ -57,7 +57,7 @@ class Sync(unittest.TestCase):
         return git(self.up, "rev-parse", "HEAD")
 
     def set_version(self, sha, tag):
-        self.put(self.fork, "local/UPSTREAM_VERSION", f"sha={sha}\nlast_release_tag={tag}\n")
+        self.put(self.fork, "local/UPSTREAM_VERSION.txt", f"sha={sha}\nlast_release_tag={tag}\n")
         git(self.fork, "add", "-A")
         git(self.fork, "commit", "-qm", "version")
 
@@ -70,7 +70,7 @@ class Sync(unittest.TestCase):
         return p.returncode, json.loads(p.stdout)
 
     def version(self):
-        return (self.fork / "local/UPSTREAM_VERSION").read_text().split()
+        return (self.fork / "local/UPSTREAM_VERSION.txt").read_text().split()
 
     def report(self, st, tmp_name="st.json"):
         f = Path(self.tmp.name) / tmp_name
@@ -161,6 +161,33 @@ class Sync(unittest.TestCase):
             self.assertNotIn("pull_request", txt)
         self.assertEqual((self.fork / "local/neutralized.txt").read_text(),
                          ".github/workflows/new.yml\n.github/workflows/x.yml\n")
+
+    def test_upstream_range_adding_ignored_path_is_flagged(self):
+        self.put(self.fork, "local/fork-surface.toml", 'ignore = ["local/**"]\n')
+        c2 = self.up_commit("a.txt", "2\n", {"local/sneaky.txt": "x\n"})
+        self.fetch()
+        self.assertEqual(su.added_ignored(self.fork, self.c1, c2),
+                         [{"kind": "upstream_adds_ignored_path", "path": "local/sneaky.txt"}])
+
+    def test_conflict_is_committed_on_branch_with_draft_and_issue(self):
+        self.put(self.fork, "local/fork-surface.toml", 'allow = ["a.txt"]\n')
+        self.put(self.fork, "a.txt", "fork\n")
+        git(self.fork, "add", "-A")
+        git(self.fork, "commit", "-qm", "fork edit")
+        self.up_commit("a.txt", "upstream\n")
+        self.fetch()
+        code, st = self.sync("status")
+        code, mg = self.sync("merge", "--date", "20261019")
+        self.assertEqual((code, mg["committed"], mg["conflicts"]), (1, True, [{"path": "a.txt", "kind": "hook"}]))
+        self.assertEqual(git(self.fork, "branch", "--show-current"), mg["branch"])
+        self.assertIn("<<<<<<<", (self.fork / "a.txt").read_text())
+        self.assertEqual(git(self.fork, "status", "--porcelain"), "")   # committed, not left mid-merge
+        mf = Path(self.tmp.name) / "m.json"
+        mf.write_text(json.dumps(mg))
+        sf = Path(self.tmp.name) / "s2.json"
+        sf.write_text(json.dumps(st))
+        r = self.sync("report", "--status", str(sf), "--merge", str(mf))[1]
+        self.assertEqual((r["draft"], r["issue"], "sync-failing" in r["labels"]), (True, True, True))
 
     def test_failed_rewrite_stops_before_commit(self):
         self.up_commit("a.txt", "2\n", {".github/workflows/bad.yml": "name: bad\njobs: {}\n"})
