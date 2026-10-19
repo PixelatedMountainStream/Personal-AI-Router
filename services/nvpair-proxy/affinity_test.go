@@ -242,12 +242,27 @@ func TestAffinity_SlotReleasedBeforeReporting(t *testing.T) {
 		req.Header.Set("thread-id", "conv")
 		f.handleHTTP(httptest.NewRecorder(), req)
 	}
-	done := make(chan struct{})
-	go func() { defer close(done); send() }()
-	<-g.blocked // response copied; first request is parked in reporting
-	send()
-	close(g.release)
-	<-done
+	var unblock sync.Once
+	open := func() { unblock.Do(func() { close(g.release) }) }
+	t.Cleanup(open) // a regression must fail fast, not leave a handler parked
+	wait := func(ch <-chan struct{}, what string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	run := func() <-chan struct{} {
+		c := make(chan struct{})
+		go func() { defer close(c); send() }()
+		return c
+	}
+	first := run()
+	wait(g.blocked, "first request to reach reporting") // response copied; parked in reporting
+	wait(run(), "second request to complete")
+	open()
+	wait(first, "first request to complete")
 	if len(g.done) != 2 || g.done[1][1] != affinityHit || g.done[1][0] != g.done[0][0] {
 		t.Fatalf("second turn was not an affinity hit on the same node: %v", g.done)
 	}

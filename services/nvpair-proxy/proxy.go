@@ -2018,8 +2018,9 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			finalStatus = sc.status
 			committedSC = sc
 			committed = true
-			// The response has been fully copied to the client, so the node's
-			// slot is free. Release now rather than after the reporting defer
+			// The upstream response has been copied to the ResponseWriter, so the
+			// node's slot is free (net/http may still flush afterward; releasing
+			// engine capacity is safe regardless). Release now rather than after the reporting defer
 			// below: a follow-up turn of the same conversation arriving in that
 			// window would see the bound node as full and yield off it (#17).
 			releaseClaim()
