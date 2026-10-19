@@ -54,6 +54,10 @@ jobs:
       code: ${{ steps.merge.outputs.code }}
       candidate: ${{ steps.bundle.outputs.candidate }}
       pr_labels: ${{ steps.pr.outputs.labels }}
+      # Identity of what publish may push comes from this privileged job's outputs, never from artifacts.
+      branch: ${{ steps.bundle.outputs.branch }}
+      cand_sha: ${{ steps.bundle.outputs.cand_sha }}
+      bundle_sha256: ${{ steps.bundle.outputs.bundle_sha256 }}
     steps:
       - name: Require UPSTREAM_SYNC_TOKEN
         run: |
@@ -104,11 +108,13 @@ jobs:
           REF_INPUT: ${{ inputs.ref }}
           FORCE_INPUT: ${{ inputs.force }}
           PR_BRANCH: ${{ steps.pr.outputs.branch }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
         run: |
           # Measured from the pending PR branch when there is one, so later tags update it in place.
           args=(--root "$GITHUB_WORKSPACE" status --base HEAD --tags-base "origin/$BASE")
           [ -n "$REF_INPUT" ] && args+=(--ref "$REF_INPUT")
           [ "$FORCE_INPUT" = "true" ] && args+=(--force)
+          [ -n "$PR_NUMBER" ] && args+=(--pending)   # nothing new + open PR => mode recheck (re-run checks)
           set +e
           python3 "$RUNNER_TEMP/trusted/sync_upstream.py" "${args[@]}" > "$RUNNER_TEMP/out/status.json"
           code=$?
@@ -144,15 +150,21 @@ jobs:
 
       - name: Bundle the candidate
         id: bundle
+        env:
+          MODE: ${{ steps.status.outputs.mode }}
+          MERGE_CODE: ${{ steps.merge.outputs.code }}
         run: |
-          if { [ "$(jq -r '.committed // false' "$RUNNER_TEMP/out/merge.json" 2>/dev/null)" = "true" ] || [ "${{ steps.merge.outputs.code }}" = "0" ]; } \
+          committed=$(jq -r '.committed // false' "$RUNNER_TEMP/out/merge.json" 2>/dev/null || echo false)
+          if { [ "$committed" = "true" ] || [ "$MERGE_CODE" = "0" ] || [ "$MODE" = "recheck" ]; } \
              && [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BASE")" ] \
-             && [ "${{ steps.status.outputs.mode }}" != "none" ]; then
+             && [ "$MODE" != "none" ]; then
             git merge --abort 2>/dev/null || true
             git bundle create "$RUNNER_TEMP/out/cand.bundle" HEAD --not "origin/$BASE"
             echo "candidate=true" >> "$GITHUB_OUTPUT"
+            echo "cand_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            echo "bundle_sha256=$(sha256sum "$RUNNER_TEMP/out/cand.bundle" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+            echo "branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
           fi
-          jq -n --arg b "$(git branch --show-current)" '{branch:$b}' > "$RUNNER_TEMP/out/branch.json"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -161,12 +173,14 @@ jobs:
 
   check:
     needs: merge
-    if: needs.merge.outputs.candidate == 'true' && needs.merge.outputs.code == '0'
+    if: needs.merge.outputs.candidate == 'true' && (needs.merge.outputs.code == '0' || needs.merge.outputs.mode == 'recheck')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    # Runs candidate code: read-only token, no PAT, no persisted credentials.
+    # Runs candidate code: read-only token, no PAT, no persisted credentials, no caches.
     permissions:
       contents: read
+    outputs:
+      code: ${{ steps.check.outputs.code }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -191,9 +205,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: services/nvpair-proxy/go.mod
-          cache-dependency-path: services/nvpair-proxy/go.sum
+          cache: false
 
       - name: Check
+        id: check
         env:
           PR_LABELS: ${{ needs.merge.outputs.pr_labels }}
         run: |
@@ -202,20 +217,22 @@ jobs:
           mkdir -p "$RUNNER_TEMP/check"
           set +e
           python3 local/scripts/sync_upstream.py check --base "origin/$BASE" "${args[@]}" > "$RUNNER_TEMP/check/check.json"
+          code=$?
           cat "$RUNNER_TEMP/check/check.json"
-          exit 0   # the result file carries the verdict; a missing file is treated as a failure by report
+          echo "code=$code" >> "$GITHUB_OUTPUT"   # passed through to report: exit 2/3 must escalate
+          exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: sync-check
-          path: ${{ runner.temp }}/check
+          name: sync-check-result   # only check.json: it is untrusted data in publish
+          path: ${{ runner.temp }}/check/check.json
 
   publish:
     needs: [merge, check]
     if: >-
       always() && needs.merge.result == 'success' &&
-      (needs.merge.outputs.mode == 'sync' || needs.merge.outputs.mode == 'bump' || needs.merge.outputs.status_code != '0')
+      (needs.merge.outputs.mode == 'sync' || needs.merge.outputs.mode == 'bump' || needs.merge.outputs.mode == 'recheck' || needs.merge.outputs.status_code != '0')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions: { contents: write, pull-requests: write, issues: write }
@@ -240,17 +257,18 @@ jobs:
       - uses: actions/download-artifact@v4
         continue-on-error: true   # absent when the merge failed or the check job did not run: report then escalates
         with:
-          name: sync-check
-          path: ${{ runner.temp }}/in
+          name: sync-check-result
+          path: ${{ runner.temp }}/chk   # separate directory: nothing from the check job can overwrite sync-merge files
 
       - name: Report
         id: report
         env:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CHECK_CODE: ${{ needs.check.outputs.code }}
         run: |
           in="$RUNNER_TEMP/in"
           python3 "$RUNNER_TEMP/trusted/sync_upstream.py" --root "$GITHUB_WORKSPACE" report --status "$in/status.json" \
-            --merge "$in/merge.json" --check "$in/check.json" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/report.json"
+            --merge "$in/merge.json" --check "$RUNNER_TEMP/chk/check.json" --check-code "$CHECK_CODE" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/report.json"
           cat "$RUNNER_TEMP/report.json"
           for k in outcome title draft issue issue_title; do
             echo "$k=$(jq -r ".$k" "$RUNNER_TEMP/report.json")" >> "$GITHUB_OUTPUT"
@@ -265,13 +283,18 @@ jobs:
           WANT_ISSUE: ${{ steps.report.outputs.issue }}
           ISSUE_TITLE: ${{ steps.report.outputs.issue_title }}
           LABELS: ${{ steps.report.outputs.labels }}
+          BRANCH: ${{ needs.merge.outputs.branch }}
+          CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
+          BUNDLE_SHA256: ${{ needs.merge.outputs.bundle_sha256 }}
         run: |
           in="$RUNNER_TEMP/in"; body="$RUNNER_TEMP/report.md"
-          BRANCH=$(jq -r '.branch // empty' "$in/branch.json" 2>/dev/null || true)
           PR_NUMBER=$(gh pr list --label upstream-sync --state open --base "$BASE" --json number,headRefName,isCrossRepository \
             --jq '[.[] | select(.isCrossRepository == false and (.headRefName | startswith("upstream-sync/")))] | .[0].number // empty')
           if [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
+            # Everything downloaded is data. Verify it against the privileged job's outputs before using it.
+            echo "$BUNDLE_SHA256  $in/cand.bundle" | sha256sum -c - || { echo "::error::bundle hash mismatch"; exit 1; }
             git fetch "$in/cand.bundle" HEAD:refs/heads/candidate
+            [ "$(git rev-parse refs/heads/candidate)" = "$CAND_SHA" ] || { echo "::error::candidate sha mismatch"; exit 1; }
             # Never push anywhere but a sync branch (a conflicted merge is committed with markers; the draft PR blocks it).
             dest="refs/heads/$BRANCH"
             case "$dest" in refs/heads/upstream-sync/*) ;; *) echo "::error::refusing to push to $dest"; exit 1;; esac

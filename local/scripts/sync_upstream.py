@@ -42,6 +42,8 @@ def emit(step, ok, code, next_action, **kw):
     out = {"ok": ok, "step": step, "conflicts": [], "build_errors": [],
            "test_failures": [], "surface_violations": [], "next_action": next_action}
     out.update(kw)
+    if code in (2, 3):   # escalate/regression: consumers must never see these as clean
+        out["escalate"] = True
     print(json.dumps(out, indent=2))
     return code
 
@@ -140,7 +142,7 @@ def newer_tags(root, remote, cfg, last_tag, contained_in):
     return sorted(keep, key=tag_key)
 
 
-def plan(root, remote, cfg, ref, base, force, tags_base=None):
+def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False):
     """Shared by status and merge. `base` is the ref whose UPSTREAM_VERSION the PR would build on (the
     open sync PR's branch when one exists); `tags_base` (develop) is where the reported tag list starts."""
     base_sha, last_tag = read_version(root, base)
@@ -156,6 +158,8 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None):
         mode = "sync"
     elif rtags:
         mode = "bump"
+    elif pending:
+        mode = "recheck"   # nothing new from upstream, but human commits may have landed: re-run checks
     else:
         mode = "none"
     commits = int(out(root, "rev-list", "--count", f"{base_sha}..{target}")) if new else 0
@@ -167,7 +171,7 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None):
 def cmd_status(a, root):
     cfg = config(root)
     remote = resolve_remote(root, cfg, a.upstream_remote)
-    p = plan(root, remote, cfg, a.ref, a.base or "HEAD", a.force, a.tags_base)
+    p = plan(root, remote, cfg, a.ref, a.base or "HEAD", a.force, a.tags_base, a.pending)
     return emit("status", True, 0, p["mode"] if p["mode"] != "none" else "none", **p)
 
 
@@ -411,6 +415,31 @@ def cmd_check(a, root):
 
 
 # ---- report -----------------------------------------------------------------
+KNOWN_KINDS = set(cfs.ESCALATE_KINDS) | {"over_file_lines", "over_file_hunks", "over_legacy_budget",
+                                         "over_seam_budget", "missing_hook_record", "missing_hook_test"}
+
+
+def valid_check(ck):
+    """check.json comes from the credential-free job: untrusted data. Strict schema or it is not a result."""
+    if not isinstance(ck, dict) or type(ck.get("ok")) is not bool or type(ck.get("escalate", False)) is not bool:
+        return False
+    for key in ("conflicts", "build_errors", "test_failures", "surface_violations"):
+        items = ck.get(key, [])
+        if not isinstance(items, list):
+            return False
+        for x in items:
+            if not isinstance(x, str):
+                return False
+            if key == "surface_violations":
+                try:
+                    d = json.loads(x)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and d.get("kind") not in KNOWN_KINDS:
+                    return False
+    return True
+
+
 def load_json(path):
     if not path:
         return {}
@@ -428,9 +457,10 @@ def cmd_report(a, root):
         outcome = "escalate"
     elif mg and not mg.get("ok", True):
         outcome = "escalate"
-    elif "ok" not in ck or ck.get("escalate"):   # missing/malformed check result is never a pass
+    elif a.check_code not in (None, "", "0", "1") or not valid_check(ck) or ck.get("escalate"):
+        # tool-error exit, missing or malformed check result is never a pass
         outcome = "escalate"
-    elif not ck.get("ok"):
+    elif not ck["ok"]:
         outcome = "failing"
     else:
         outcome = "clean"
@@ -475,6 +505,7 @@ def main(argv=None):
     s = sub.add_parser("status"); s.set_defaults(fn=cmd_status)
     s.add_argument("--ref"); s.add_argument("--force", action="store_true")
     s.add_argument("--base", help="ref whose UPSTREAM_VERSION the PR builds on (default HEAD)")
+    s.add_argument("--pending", action="store_true", help="an open sync PR exists: report mode recheck, not none")
     s.add_argument("--tags-base", help="ref (develop) the reported tag list is measured from")
     m = sub.add_parser("merge"); m.set_defaults(fn=cmd_merge)
     m.add_argument("--ref"); m.add_argument("--force", action="store_true")
@@ -490,6 +521,7 @@ def main(argv=None):
     c.add_argument("--label", action="append", default=[], help="PR label (e.g. surface-budget-raise)")
     r = sub.add_parser("report"); r.set_defaults(fn=cmd_report)
     r.add_argument("--status"); r.add_argument("--merge"); r.add_argument("--check")
+    r.add_argument("--check-code", help="exit code the check job captured (workflow passes it through)")
     r.add_argument("--run-url"); r.add_argument("--out")
     a = ap.parse_args(argv)
     try:

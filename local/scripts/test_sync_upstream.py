@@ -225,6 +225,28 @@ class Sync(unittest.TestCase):
         r = self.sync("report", "--status", self._dump(bad))[1]
         self.assertEqual((r["outcome"], r["issue"], r["title"]), ("escalate", True, ""))
 
+    def test_recheck_when_pending_and_nothing_new(self):
+        self.assertEqual(self.sync("status")[1]["mode"], "none")
+        self.assertEqual(self.sync("status", "--pending")[1]["mode"], "recheck")
+
+    def test_tool_errors_escalate_and_malformed_check_never_clean(self):
+        self.up_commit("a.txt", "2\n")
+        self.fetch()
+        self.set_version(git(self.up, "rev-parse", "HEAD"), "v1.0.0")
+        code, out = self.sync("status", "--ref", self.c1)          # regression -> exit 3
+        self.assertEqual((code, out["escalate"]), (3, True))
+        st = self._dump({"ok": True, "tags": [], "short": "abc", "commits": 1})
+        mg = Path(self.tmp.name) / "mg.json"
+        mg.write_text(json.dumps({"ok": True}))
+        good = {"ok": True, "escalate": False}
+        for ck, extra in [(good, []), ({"ok": "false"}, []), ({"ok": True, "escalate": "no"}, []),
+                          ({"ok": True, "surface_violations": ['{"kind": "made_up"}']}, []),
+                          (good, ["--check-code", "2"])]:
+            f = Path(self.tmp.name) / "ck.json"
+            f.write_text(json.dumps(ck))
+            r = self.sync("report", "--status", st, "--merge", str(mg), "--check", str(f), *extra)[1]
+            self.assertEqual(r["outcome"], "clean" if ck is good and not extra else "escalate", (ck, extra))
+
     def test_failed_rewrite_stops_before_commit(self):
         self.up_commit("a.txt", "2\n", {".github/workflows/bad.yml": "name: bad\njobs: {}\n"})
         self.fetch()
