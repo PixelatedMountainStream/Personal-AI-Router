@@ -3,11 +3,19 @@
 
 """Tiny fixture tests for sync_upstream.py on temp git repos. No gh, no network."""
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+# Self-contained git: a CI runner has no user.name/email, and init.defaultBranch may differ. Inherited by the
+# script under test, whose merge/commit calls need an identity.
+os.environ.update({"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_COUNT": "1",
+                   "GIT_CONFIG_KEY_0": "init.defaultBranch", "GIT_CONFIG_VALUE_0": "main"})
+os.environ["HOME"] = tempfile.mkdtemp()
 
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "sync_upstream.py"
@@ -21,6 +29,16 @@ WF = "name: x\non:\n  push:\n    branches: [main]\n\njobs:\n  a:\n    runs-on: u
 def git(path, *a):
     return subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t",
                            "-c", "commit.gpgsign=false", *a], check=True, capture_output=True, text=True).stdout.strip()
+
+
+class Out(dict):
+    """JSON result whose missing keys fail with the subprocess stderr and next_action, not a bare KeyError."""
+    def __init__(self, d, stderr):
+        super().__init__(d)
+        self.stderr = stderr
+
+    def __missing__(self, key):
+        raise AssertionError(f"missing {key!r}; next_action={self.get('next_action')!r}; stderr={self.stderr[-800:]!r}")
 
 
 class Sync(unittest.TestCase):
@@ -67,7 +85,11 @@ class Sync(unittest.TestCase):
     def sync(self, *args):
         p = subprocess.run([sys.executable, str(SCRIPT), "--root", str(self.fork), *args],
                            capture_output=True, text=True)
-        return p.returncode, json.loads(p.stdout)
+        try:
+            out = json.loads(p.stdout)
+        except ValueError:
+            self.fail(f"{args}: no JSON (exit {p.returncode}); stderr: {p.stderr[-800:]}")
+        return p.returncode, Out(out, p.stderr)
 
     def version(self):
         return (self.fork / "local/UPSTREAM_VERSION.txt").read_text().split()
