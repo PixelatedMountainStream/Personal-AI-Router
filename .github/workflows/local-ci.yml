@@ -14,9 +14,12 @@ name: Local CI
 on:
     pull_request:
         branches: [develop]
+        # labeled/unlabeled re-gate when surface-budget-raise or upstream-sync is toggled.
+        types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
     contents: read
+    pull-requests: read
 
 concurrency:
     group: local-ci-${{ github.ref }}
@@ -36,16 +39,18 @@ jobs:
                   go: 'true'
             - name: Fetch the pinned upstream sha and the base branch
               run: |
-                  sha=$(sed -n 's/^sha=//p' local/UPSTREAM_VERSION)
+                  sha=$(sed -n 's/^sha=//p' local/UPSTREAM_VERSION.txt)
                   git remote add upstream https://github.com/NVIDIA/Personal-AI-Router.git
                   git fetch --no-tags upstream "$sha" || git fetch --no-tags upstream
                   git cat-file -e "$sha^{commit}"
                   git fetch --no-tags origin "${{ github.base_ref }}"
             - name: Check fork surface
               env:
-                  PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+                  GH_TOKEN: ${{ github.token }}
               run: |
                   set +e
+                  # Read labels live (not from the event payload) so a re-run sees the current set.
+                  export PR_LABELS=$(gh pr view ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --json labels -q '[.labels[].name] | join(",")')
                   python3 local/scripts/check_fork_surface.py --base "origin/${{ github.base_ref }}" > surface.json
                   code=$?
                   { echo '### Fork surface'; echo '```json'; cat surface.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

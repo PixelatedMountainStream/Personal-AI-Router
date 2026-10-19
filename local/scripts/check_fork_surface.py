@@ -78,10 +78,10 @@ def read_lines(path):
 
 
 def parse_version(root):
-    kv = dict(ln.split("=", 1) for ln in read_lines(Path(root) / "local/UPSTREAM_VERSION") if "=" in ln)
+    kv = dict(ln.split("=", 1) for ln in read_lines(Path(root) / "local/UPSTREAM_VERSION.txt") if "=" in ln)
     sha = kv.get("sha", "")
     if not re.fullmatch(r"[0-9a-f]{40}", sha):
-        raise ToolError("local/UPSTREAM_VERSION: missing or malformed sha=<40-hex>")
+        raise ToolError("local/UPSTREAM_VERSION.txt: missing or malformed sha=<40-hex>")
     return sha
 
 
@@ -132,6 +132,15 @@ def parse_records(root):
     return out
 
 
+def validate_caps(cfg, where="local/fork-surface.toml"):
+    """Every max_* cap must be a plain integer (no floats, NaN, bools)."""
+    tables = [cfg.get("budget", {})] + list(cfg.get("file", []))
+    for t in tables:
+        for k, v in t.items():
+            if k.startswith("max_") and (not isinstance(v, int) or isinstance(v, bool)):
+                raise ToolError(f"{where}: {k} must be an integer, got {v!r}")
+
+
 def diff_stats(root, ref):
     """Per-path {status, lines, hunks} for `ref...HEAD`."""
     stats = {}
@@ -162,23 +171,21 @@ def importscan(root, files):
     return res
 
 
-def local_pkg_violations(root, cfg):
-    """Packages under <module>/local/... may import only stdlib, allowed prefixes, other local packages."""
+def local_pkg_violations(root, cfg, files, imports):
+    """Every .go file under a `local/` directory (any depth, tests and all platforms) may
+    import only stdlib, fork_allowed_imports, or other `local` packages."""
     allowed = cfg.get("go", {}).get("fork_allowed_imports", [])
     out, std = [], None
-    for gomod in git(root, "ls-files", "*go.mod").splitlines():
-        mod = Path(root) / Path(gomod).parent
-        if not (mod / "local").is_dir():
+    for path in files:
+        if not re.search(r"(^|/)local/", path) or path.startswith("local/"):
             continue
         if std is None:
-            std = set(run(root, "go", "list", "std").stdout.split())
-        r = run(root, "go", "list", "-f", '{{.ImportPath}} {{join .Imports " "}}', "./local/...", cwd=mod)
-        for ln in r.stdout.splitlines():
-            pkg, *imps = ln.split()
-            for imp in imps:
-                if imp in std or any(imp.startswith(p) for p in allowed) or re.search(r"(^|/)local(/|$)", imp):
-                    continue
-                out.append({"kind": "fork_imports_upstream", "package": pkg, "import": imp})
+            std = set(run(root, "go", "list", "std", cwd=Path(root) / "local/tools/importscan").stdout.split())
+        for imp in imports.get(path, []):
+            if imp == "C" or imp in std or any(imp.startswith(p) for p in allowed) \
+                    or re.search(r"(^|/)local(/|$)", imp):
+                continue
+            out.append({"kind": "fork_imports_upstream", "path": path, "import": imp})
     return out
 
 
@@ -196,27 +203,42 @@ def hook_test_violations(root, records):
 
 
 def _max_keys(d):
-    return {k: v for k, v in d.items() if k.startswith("max_") and isinstance(v, int)}
+    return {k: v for k, v in d.items() if k.startswith("max_")}
 
 
 def budget_raised(root, base, labels):
-    """Compare policy files against <base>; growth needs a label."""
+    """Compare policy files against <base>; growth or removal of any cap needs a label.
+
+    Only a policy file genuinely absent at base (bootstrap) is skipped; any other
+    read failure is a tool error."""
     def show(path):
-        r = run(root, "git", "-C", str(root), "show", f"{base}:{path}", check=False)
-        return r.stdout if r.returncode == 0 else None
+        if not git(root, "ls-tree", base, "--", path).strip():
+            return None
+        return git(root, "show", f"{base}:{path}")
 
     out = []
     old_toml = show("local/fork-surface.toml")
     if old_toml is not None and "surface-budget-raise" not in labels:
-        old, new = tomllib.loads(old_toml), tomllib.loads((Path(root) / "local/fork-surface.toml").read_text())
-        for k, v in _max_keys(new.get("budget", {})).items():
-            if k in old.get("budget", {}) and v > old["budget"][k]:
-                out.append({"kind": "budget_raised", "what": f"budget.{k}", "from": old["budget"][k], "to": v})
-        oldf = {f["path"]: f for f in old.get("file", [])}
-        for f in new.get("file", []):
-            for k, v in _max_keys(f).items():
-                if f["path"] in oldf and v > oldf[f["path"]].get(k, v):
-                    out.append({"kind": "budget_raised", "what": f"{f['path']}.{k}", "from": oldf[f['path']][k], "to": v})
+        old = tomllib.loads(old_toml)
+        validate_caps(old, f"{base}:local/fork-surface.toml")
+        new = tomllib.loads((Path(root) / "local/fork-surface.toml").read_text())
+        nb = new.get("budget", {})
+        for k, v in _max_keys(old.get("budget", {})).items():
+            if k not in nb:
+                out.append({"kind": "budget_raised", "what": f"budget.{k} removed"})
+            elif nb[k] > v:
+                out.append({"kind": "budget_raised", "what": f"budget.{k}", "from": v, "to": nb[k]})
+        newf = {f["path"]: f for f in new.get("file", [])}
+        for of in old.get("file", []):
+            nf = newf.get(of["path"])
+            if nf is None:
+                out.append({"kind": "budget_raised", "what": f"[[file]] {of['path']} removed"})
+                continue
+            for k, v in _max_keys(of).items():
+                if k not in nf:
+                    out.append({"kind": "budget_raised", "what": f"{of['path']}.{k} removed"})
+                elif nf[k] > v:
+                    out.append({"kind": "budget_raised", "what": f"{of['path']}.{k}", "from": v, "to": nf[k]})
         for key in ("allow", "legacy_added", "generated", "ignore"):
             for e in sorted(set(new.get(key, [])) - set(old.get(key, []))):
                 out.append({"kind": "budget_raised", "what": f"{key} += {e}"})
@@ -238,6 +260,8 @@ def budget_raised(root, base, labels):
 
 def check(root, base=None, labels=(), new_upstream=None):
     root = Path(root)
+    if base:  # resolve first: a bad ref is a tool error, never a silent pass
+        git(root, "rev-parse", "--verify", "--quiet", base + "^{commit}")
     sha = parse_version(root)
     try:
         git(root, "rev-parse", "--verify", "--quiet", sha + "^{commit}")
@@ -248,6 +272,7 @@ def check(root, base=None, labels=(), new_upstream=None):
              "neutralized": read_lines(root / "local/neutralized.txt"), "allow": cfg.get("allow", [])}
     legacy = cfg.get("legacy_added", [])
     budget = cfg.get("budget", {})
+    validate_caps(cfg)
     records = parse_records(root)
     rec_ids = {r["id"] for r in records}
     rec_files = {f for r in records for f in r["files"]}
@@ -318,13 +343,16 @@ def check(root, base=None, labels=(), new_upstream=None):
     # Go import rules.
     cfg_go = cfg.get("go", {})
     prefixes = cfg_go.get("fork_import_prefixes", [])
-    all_go = [p for p in git(root, "ls-files", "*.go").splitlines() if category(p) != "ignore"]
+    tracked_go = git(root, "ls-files", "*.go").splitlines()
     if prefixes:
-        for path, imps in sorted(importscan(root, all_go).items()):
-            for imp in imps:
+        imports = importscan(root, tracked_go)
+        for path in sorted(imports):
+            if category(path) == "ignore":
+                continue
+            for imp in imports[path]:
                 if any(imp.startswith(p) for p in prefixes):
                     viol.append({"kind": "upstream_imports_fork", "path": path, "import": imp})
-        viol += local_pkg_violations(root, cfg)
+        viol += local_pkg_violations(root, cfg, [p for p in tracked_go if category(p) == "ignore"], imports)
     viol += hook_test_violations(root, records)
 
     if new_upstream:

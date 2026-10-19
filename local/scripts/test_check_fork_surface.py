@@ -44,7 +44,7 @@ class Fixture(unittest.TestCase):
         git(self.root, "add", "-A")
         git(self.root, "commit", "-qm", "upstream")
         sha = git(self.root, "rev-parse", "HEAD")
-        self.write("local/UPSTREAM_VERSION", f"sha={sha}\nlast_release_tag=v1\n")
+        self.write("local/UPSTREAM_VERSION.txt", f"sha={sha}\nlast_release_tag=v1\n")
         self.write("local/fork-surface.toml", TOML)
         self.write("local/FORK_SURFACE.md", LEGACY + DATA)
         self.write("local/neutralized.txt", "")
@@ -114,6 +114,38 @@ class CheckForkSurface(Fixture):
         code, out, kinds = self.run_check()
         self.assertEqual(code, 1)
         self.assertEqual([(v["kind"], v["path"]) for v in out["violations"]], [("upstream_imports_fork", "up/hook.go")])
+
+    def test_added_non_local_go_file_fails(self):
+        self.write("up/extra.go", "package main\n")
+        code, out, kinds = self.run_check()
+        self.assertEqual((code, kinds), (1, ["not_allowlisted"]))
+
+    def test_max_seams_exceeded(self):
+        self.write("local/fork-surface.toml", TOML + '[[file]]\npath = "up/hook.go"\nmax_seams = 1\n')
+        self.write("local/FORK_SURFACE.md", LEGACY + DATA + "### E1\nfiles: up/data.json\nkind: data\nrecipe: r\n### E2\nfiles: up/data.json\nkind: data\nrecipe: r\n")
+        self.write("up/hook.go", "package main\nvar a int // fork:E1\nvar b int // fork:E2\n")
+        code, out, kinds = self.run_check()
+        self.assertEqual((code, kinds), (1, ["over_seam_budget"]))
+
+    def test_cap_removal_is_budget_raised(self):
+        self.write("local/fork-surface.toml", TOML.replace("max_lines = 10\n", ""))
+        code, _, kinds = self.run_check("--base", "base")
+        self.assertEqual((code, kinds), (1, ["budget_raised"]))
+
+    def test_float_cap_is_tool_error(self):
+        self.write("local/fork-surface.toml", TOML.replace("max_lines = 10", "max_lines = 1e9"))
+        code, out, _ = self.run_check()
+        self.assertEqual(code, 2)
+
+    def test_bad_base_is_tool_error(self):
+        code, out, _ = self.run_check("--base", "no-such-ref")
+        self.assertEqual(code, 2)
+
+    def test_nested_local_pkg_importing_upstream_fails(self):
+        self.write("up/shared/local/x/x.go", 'package x\nimport _ "up/thing"\n')
+        self.write("up/shared/local/x/x_test.go", 'package x\nimport _ "testing"\n')
+        code, out, kinds = self.run_check()
+        self.assertEqual([(v["kind"], v["path"]) for v in out["violations"]], [("fork_imports_upstream", "up/shared/local/x/x.go")])
 
 
 if __name__ == "__main__":
