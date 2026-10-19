@@ -1277,12 +1277,16 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			p.affinity.bind(affKey, nodeID) // failover landed elsewhere: follow it
 		}
 	}
-	defer func() {
+	// releaseClaim is idempotent: held is zeroed under resMu, so the deferred
+	// backstop (every early return, error, cancellation and panic) and the
+	// explicit early call once the response has been copied cannot double-drop.
+	releaseClaim := func() {
 		resMu.Lock()
 		defer resMu.Unlock()
 		p.releaseReservation(held)
 		held = reservation{}
-	}()
+	}
+	defer releaseClaim()
 	if matchedRoute, ok := f.profile.routeFor(r.Method, r.URL.Path); ok && matchedRoute.Role.isModelList() {
 		if len(candidates) > 0 {
 			_ = f.notify("proxy/request-started", RequestStartedEvent{
@@ -1476,7 +1480,9 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// reporter at all.
 	//
 	// Registered after the reservation release above, so on unwind this runs
-	// first and the node is still counted as loaded while we report.
+	// first. The claim is normally already released by then (right after the
+	// response copy); on a panic or early return it is still held while we
+	// report, and the backstop defer drops it afterwards.
 	defer func() {
 		aborted := recover()
 		// An aborted copy is operational detail, not a verdict on the job. A
@@ -2012,6 +2018,12 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			finalStatus = sc.status
 			committedSC = sc
 			committed = true
+			// The upstream response has been copied to the ResponseWriter, so the
+			// node's slot is free (net/http may still flush afterward; releasing
+			// engine capacity is safe regardless). Release now rather than after the reporting defer
+			// below: a follow-up turn of the same conversation arriving in that
+			// window would see the bound node as full and yield off it (#17).
+			releaseClaim()
 		}
 	}
 
