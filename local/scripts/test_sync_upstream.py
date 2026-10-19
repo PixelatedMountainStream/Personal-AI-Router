@@ -269,6 +269,15 @@ class Sync(unittest.TestCase):
         self.assertFalse((self.fork / ".github/workflows/evil task.yml").exists())
         self.assertEqual(self.guard()[0], 0)
 
+    def test_recheck_still_reports_held_changes(self):
+        self.up_commit("a.txt", "2\n", {".github/workflows/ci.yml": WF + "# up\n"})
+        self.fetch()
+        self.merge()                                  # on the sync branch, ci.yml held back
+        code, st = self.sync("status", "--pending", "--base", "HEAD", "--tags-base", "develop")
+        self.assertEqual((st["mode"], st["held"]["files"]), ("recheck", [{"status": "M", "path": ".github/workflows/ci.yml"}]))
+        r = self.sync("report", "--status", self._dump(st))[1]
+        self.assertIn("workflow-review", r["labels"])
+
     def test_guard_rejects_any_workflow_diff(self):
         self.up_commit("a.txt", "2\n")
         self.fetch()

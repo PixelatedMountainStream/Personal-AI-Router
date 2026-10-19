@@ -153,6 +153,10 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False):
     if target != base_sha and not is_ancestor(root, base_sha, target):
         raise Regression(f"upstream {target[:10]} is not a descendant of sha={base_sha[:10]}")
     new = target != base_sha
+    # Held workflow changes, cumulative from the base branch to the upstream ref, in every mode (-z, no YAML).
+    hold_from = read_version(root, tags_base or base)[0]
+    held = {"files": [{"status": st, "path": pth} for st, pth in workflow_changes(root, hold_from, target)],
+            "commits": nul_list(git(root, "log", "-z", "--format=%h %s", f"{hold_from}..{target}", "--", WF).stdout)[:30]}
     rtags = newer_tags(root, remote, cfg, last_tag, target)   # tags this branch has not recorded yet
     tags = rtags
     if tags_base:
@@ -167,7 +171,7 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False):
         mode = "none"
     commits = int(out(root, "rev-list", "--count", f"{base_sha}..{target}")) if new else 0
     return {"mode": mode, "new": new, "base_sha": base_sha, "target": target, "short": target[:10],
-            "commits": commits, "tags": tags, "rtags": rtags, "newest_tag": tags[-1] if tags else "",
+            "commits": commits, "tags": tags, "rtags": rtags, "held": held, "newest_tag": tags[-1] if tags else "",
             "release": bool(tags), "last_release_tag": last_tag, "remote": remote}
 
 
@@ -247,7 +251,7 @@ def conflict_result(step, root, **kw):
 def cmd_merge(a, root):
     cfg = config(root)
     remote = resolve_remote(root, cfg, a.upstream_remote)
-    p = plan(root, remote, cfg, a.ref, "HEAD", a.force)
+    p = plan(root, remote, cfg, a.ref, "HEAD", a.force, a.base_ref)
     old, last_tag = p["base_sha"], p["last_release_tag"]
     target = p["target"]
     stamp = a.date or datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -269,11 +273,6 @@ def cmd_merge(a, root):
     if m.returncode and not unmerged(root):
         raise Escalate(f"merge failed: {(m.stderr or m.stdout).strip()[:300]}")
     # Hold workflows at the base branch (cumulative over the whole PR range) and record what was held back.
-    hold_from = read_version(root, base_ref)[0]
-    held_files = [{"status": st, "path": pth} for st, pth in workflow_changes(root, hold_from, target)]
-    held_commits = nul_list(git(root, "log", "-z", "--format=%h %s", f"{hold_from}..{target}", "--", WF).stdout)[:30]
-    held = {"files": held_files, "commits": held_commits}
-    p["held"] = held
     hold_workflows(root, base_ref)
     for c in unmerged(root):
         if c["kind"] == "generated":   # take upstream's copy
@@ -442,7 +441,7 @@ def cmd_report(a, root):
         outcome = "failing"
     else:
         outcome = "clean"
-    held = mg.get("held") if isinstance(mg.get("held"), dict) else {}
+    held = next((h for h in (st.get("held"), mg.get("held")) if isinstance(h, dict) and h.get("files")), {})
     held_files = held.get("files") or []
     labels = ["upstream-sync"] + (["upstream-release"] if st.get("release") else []) \
         + (["workflow-review"] if held_files else []) \

@@ -35,6 +35,8 @@ concurrency:
   group: upstream-sync
   cancel-in-progress: false
 
+# Residual risk accepted: upstream ci.yml (untouched here) runs on sync PRs and may write caches; no path leads
+# from a cache to the PAT or to a push.
 env:
   BASE: develop
 
