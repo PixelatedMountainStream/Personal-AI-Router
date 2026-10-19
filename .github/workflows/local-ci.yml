@@ -1,0 +1,112 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fork-only CI (not upstream's ci.yml). Runs on PRs to `develop`.
+# Spec: PLAN-pair-upstream-sync.md sections 3.2, 4.3 and 5 (PR-A).
+#
+# Unlike the sync job (PR-B), these run the known-flaky tests unskipped so
+# #11 and #12 stay visible: TestUninstallTerminatesRunningInstance in
+# nvpair-engine-manager (#11) and TestWorkloadManagerOutboundBroadcast in
+# services/tests (#12). Whether they pass on ubuntu is unverified; if the first
+# run passes, nothing to do; if not, the sync job keeps its -skip with a comment.
+name: Local CI
+
+on:
+    pull_request:
+        branches: [develop]
+        # labeled/unlabeled re-gate when surface-budget-raise or upstream-sync is toggled.
+        types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+    contents: read
+    pull-requests: read
+
+concurrency:
+    group: local-ci-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    surface:
+        name: Fork surface
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+              with:
+                  fetch-depth: 0
+            - uses: ./.github/actions/setup
+              with:
+                  node: 'false'
+                  go: 'true'
+            - name: Fetch the pinned upstream sha and the base branch
+              run: |
+                  sha=$(sed -n 's/^sha=//p' local/UPSTREAM_VERSION.txt)
+                  git remote add upstream https://github.com/NVIDIA/Personal-AI-Router.git
+                  git fetch --no-tags upstream "$sha" || git fetch --no-tags upstream
+                  git cat-file -e "$sha^{commit}"
+                  git fetch --no-tags origin "${{ github.base_ref }}"
+            - name: Check fork surface
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set +e
+                  # Read labels live (not from the event payload) so a re-run sees the current set.
+                  export PR_LABELS=$(gh pr view ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --json labels -q '[.labels[].name] | join(",")')
+                  python3 local/scripts/check_fork_surface.py --base "origin/${{ github.base_ref }}" > surface.json
+                  code=$?
+                  { echo '### Fork surface'; echo '```json'; cat surface.json; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+                  exit $code
+
+    python:
+        name: Python tests
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+            - uses: ./.github/actions/setup
+              with:
+                  node: 'false'
+                  go: 'true'
+            - run: python3 -m unittest discover -s local/scripts -p 'test_*.py'
+
+    go-modules:
+        name: Go test (${{ matrix.module }})
+        runs-on: ubuntu-latest
+        timeout-minutes: 20
+        strategy:
+            fail-fast: false
+            matrix:
+                module:
+                    - nvpair-proxy
+                    - nvpair-engine-manager
+                    - shared
+                    - nvpair-node-scanner
+                    - nvpair-ui-broker
+                    - nvpair-job-scheduler
+                    - nvpair-node-settings
+        steps:
+            - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+            - uses: ./.github/actions/setup
+              with:
+                  node: 'false'
+                  go: 'true'
+            # Engine-manager orphan-reclaim tests need lsof and ss.
+            - run: sudo apt-get update -qq && sudo apt-get install -y -qq lsof iproute2
+            - name: Build, vet, test
+              working-directory: services/${{ matrix.module }}
+              run: go build ./... && go vet ./... && go test ./... -count=1 -timeout=10m
+
+    cross-process:
+        name: Go cross-process tests
+        runs-on: ubuntu-latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+            - uses: ./.github/actions/setup
+              with:
+                  go: 'true'
+            - run: sudo apt-get update -qq && sudo apt-get install -y -qq lsof iproute2
+            - run: npm --prefix desktop ci --prefer-offline
+            - name: Build modular binaries
+              run: npm --prefix desktop run build:modular-binaries -- --force
+            # Skips only this subtest until PixelatedMountainStream/Personal-AI-Router#21
+            # resolves; remove the -skip then. Siblings still run.
+            - run: cd services/tests && go test ./... -count=1 -timeout=20m -skip '^TestProxyConcurrentBurstDistribution$/^GPU_pressure_converges$'

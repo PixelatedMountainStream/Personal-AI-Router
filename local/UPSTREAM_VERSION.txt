@@ -1,0 +1,2 @@
+sha=7d1c29953cbc38714ebc920fd62129a9f583d549
+last_release_tag=v1.0.0

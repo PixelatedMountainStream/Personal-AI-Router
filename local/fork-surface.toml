@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fork-surface policy, enforced by local/scripts/check_fork_surface.py.
+# Spec: PLAN-pair-upstream-sync.md section 3.2.
+
+# Fork-owned paths: never counted as surface.
+ignore = [
+  "local/**", "services/**/local/**", "services/**/local_*.go",
+  ".github/workflows/local-*.yml", ".github/workflows/upstream-sync.yml", ".claude/**",
+]
+# Glob dialect: no brace expansion; `*` matches within one path segment; `**` matches zero or more
+# directories (implemented by the checker). Precedence: ignore > generated > neutralized > allow.
+# Upstream files we may edit (the hooks). Every entry must be covered by a hook record's files: in local/FORK_SURFACE.md.
+# PR-A: all 43 files modified today (test files included); PR-C..E shrink this to the final 30.
+allow = [
+  "services/nvpair-engine-manager/MANIFEST.md",
+  "services/nvpair-engine-manager/actions.go",
+  "services/nvpair-engine-manager/controllifecycle.go",
+  "services/nvpair-engine-manager/controlmodels.go",
+  "services/nvpair-engine-manager/controlserver.go",
+  "services/nvpair-engine-manager/executor.go",
+  "services/nvpair-engine-manager/httpserver.go",
+  "services/nvpair-engine-manager/lifecycle.go",
+  "services/nvpair-engine-manager/loadedwatch.go",
+  "services/nvpair-engine-manager/main.go",
+  "services/nvpair-engine-manager/manager.go",
+  "services/nvpair-engine-manager/manifests/llamacpp.json",
+  "services/nvpair-engine-manager/manifests/lmstudio.json",
+  "services/nvpair-engine-manager/manifests/ollama.json",
+  "services/nvpair-engine-manager/modelops.go",
+  "services/nvpair-engine-manager/models.go",
+  "services/nvpair-engine-manager/models_test.go",
+  "services/nvpair-engine-manager/registry.go",
+  "services/nvpair-engine-manager/remote.go",
+  "services/nvpair-engine-manager/remoteclient.go",
+  "services/nvpair-engine-manager/remotepeers.go",
+  "services/nvpair-engine-manager/spec.md",
+  "services/nvpair-engine-manager/status.go",
+  "services/nvpair-job-scheduler/schedule.go",
+  "services/nvpair-job-scheduler/schedule_test.go",
+  "services/nvpair-job-scheduler/state.go",
+  "services/nvpair-node-scanner/connreuse_test.go",
+  "services/nvpair-node-scanner/daemon.go",
+  "services/nvpair-node-scanner/directory.go",
+  "services/nvpair-node-scanner/enrich_hosts.go",
+  "services/nvpair-node-scanner/refresh_test.go",
+  "services/nvpair-node-settings/manager.go",
+  "services/nvpair-node-settings/manager_test.go",
+  "services/nvpair-proxy/facade.go",
+  "services/nvpair-proxy/main.go",
+  "services/nvpair-proxy/proxy.go",
+  "services/nvpair-proxy/reservation_test.go",
+  "services/nvpair-ui-broker/broker.go",
+  "services/nvpair-ui-broker/discovery.go",
+  "services/nvpair-ui-broker/discovery_test.go",
+  "services/shared/noderec/noderec.go",
+  "services/shared/schedulerwire/schedulerwire.go",
+  "services/shared/schedulerwire/schedulerwire_test.go",
+]
+# Taken from upstream on conflict; excluded from budgets.
+generated = ["services/versions.json", "CHANGELOG.md", "desktop/package.json", "desktop/package-lock.json"]
+# `neutralized` paths live in local/neutralized.txt, never in this file; this TOML is never machine-written.
+# ci.yml, build.yml and the release-intent files are never listed.
+
+# Added upstream-dir files not yet moved to local/ or local_*.go; PR-C/D/E delete entries.
+legacy_added = [
+  "services/nvpair-engine-manager/exclusive.go",
+  "services/nvpair-engine-manager/exclusive_test.go",
+  "services/nvpair-engine-manager/pinned.go",
+  "services/nvpair-engine-manager/pinned_test.go",
+  "services/nvpair-engine-manager/settingsoverrides.go",
+  "services/nvpair-engine-manager/settingsoverrides_test.go",
+  "services/nvpair-proxy/affinity.go",
+  "services/nvpair-proxy/affinity_test.go",
+  "services/nvpair-proxy/capacity.go",
+  "services/nvpair-proxy/capacity_test.go",
+  "services/nvpair-proxy/dircapacity.go",
+  "services/nvpair-proxy/dircapacity_test.go",
+  "services/nvpair-proxy/notloaded.go",
+  "services/nvpair-proxy/responses_normalize.go",
+  "services/nvpair-proxy/responses_normalize_test.go",
+  "services/nvpair-proxy/slotscore_test.go",
+  "services/shared/noderec/overrides.go",
+  "services/shared/noderec/slots_test.go",
+]
+
+[budget]            # ratchet, lowered per migration PR; raising it needs label surface-budget-raise (budget_raised)
+max_lines = 1889    # changed lines in modified upstream files only (measured on pms/develop)
+max_files = 43      # modified upstream files only
+max_legacy_added_lines = 3419   # separate shrinking budget for legacy_added
+
+# Optional per-file budgets for hot files are added by PR-F:
+# [[file]]
+# path = "services/nvpair-proxy/proxy.go"
+# max_lines = 30
+# max_hunks = 9
+# max_seams = 7
+
+[go]
+fork_import_prefixes = ["nvpair-proxy/local/", "nvpair-engine-manager/local/", "nvpair-shared/local/"]
+fork_allowed_imports = ["nvpair-shared/", "golang.org/x/"]   # plus stdlib and other local packages
