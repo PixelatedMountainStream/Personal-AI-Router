@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -175,5 +178,77 @@ func TestAffinityKey(t *testing.T) {
 	}
 	if got := affinityKey(req(nil), []byte(`{"model":"m"}`)); got != "" {
 		t.Fatalf("expected no key, got %q", got)
+	}
+}
+
+// reportGate is a slog handler that parks the first "proxy request complete"
+// record (the first statement of the handler's reporting defer, before any
+// codec write) so a test can act while that request is still in reporting. It
+// also records the node and affinity decision of every completion.
+type reportGate struct {
+	blocked chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	done    [][2]string // node_id, affinity
+}
+
+func (g *reportGate) Enabled(context.Context, slog.Level) bool { return true }
+func (g *reportGate) WithAttrs([]slog.Attr) slog.Handler       { return g }
+func (g *reportGate) WithGroup(string) slog.Handler            { return g }
+func (g *reportGate) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != "proxy request complete" {
+		return nil
+	}
+	var rec [2]string
+	r.Attrs(func(a slog.Attr) bool {
+		switch a.Key {
+		case "node_id":
+			rec[0] = a.Value.String()
+		case "affinity":
+			rec[1] = a.Value.String()
+		}
+		return true
+	})
+	g.mu.Lock()
+	g.done = append(g.done, rec)
+	first := len(g.done) == 1
+	g.mu.Unlock()
+	if first {
+		close(g.blocked)
+		<-g.release
+	}
+	return nil
+}
+
+// #17: the slot claim must be released once the response is copied, not after
+// reporting, or the next turn of the conversation yields off its bound node.
+func TestAffinity_SlotReleasedBeforeReporting(t *testing.T) {
+	tc := anyCase(t)
+	g := &reportGate{blocked: make(chan struct{}), release: make(chan struct{})}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(g))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	disc := NewDiscovery()
+	for _, id := range []string{"a", "b"} {
+		srv, _ := newCountingServer(t, 200, "ok")
+		disc.AddManual(nodeForModel(t, id, srv, tc.advertisedModel))
+	}
+	p := testProxy(tc.profile, disc, tc.profile.FacadePort)
+	p.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1}}
+	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b"}, Ranks: []schedulerwire.NodeRank{{ID: "a"}, {ID: "b", Rank: 1}}})
+	f := p.soleFacade()
+	send := func() {
+		req := tc.inferenceRequest()
+		req.Header.Set("thread-id", "conv")
+		f.handleHTTP(httptest.NewRecorder(), req)
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); send() }()
+	<-g.blocked // response copied; first request is parked in reporting
+	send()
+	close(g.release)
+	<-done
+	if len(g.done) != 2 || g.done[1][1] != affinityHit || g.done[1][0] != g.done[0][0] {
+		t.Fatalf("second turn was not an affinity hit on the same node: %v", g.done)
 	}
 }
