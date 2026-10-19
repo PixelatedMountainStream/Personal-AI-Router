@@ -4,7 +4,7 @@
 
 """Daily upstream sync for the PAIR fork (plan section 4). Stdlib only, no gh calls.
 
-Subcommands: status | merge | neutralize | conflicts | check | report.
+Subcommands: status | merge | workflow-guard | conflicts | check | report.
 Each prints ONE JSON object {ok, step, conflicts[], build_errors[], test_failures[],
 surface_violations[], next_action, ...}. Exit codes: 0 ok, 1 needs repair, 2 escalate,
 3 sha= regression (upstream is not a descendant of local/UPSTREAM_VERSION.txt sha=).
@@ -25,8 +25,6 @@ sys.path.insert(0, str(HERE))
 import check_fork_surface as cfs  # noqa: E402  (glob dialect + ESCALATE_KINDS shared with the checker)
 
 ROOT = HERE.parents[1]
-FORK_WORKFLOWS = ("local-*.yml", "local-*.yaml", "upstream-sync.yml")
-NEVER_REWRITE = {"ci.yml", "build.yml", "release-intent-apply.yml", "release-intent-check.yml"}
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
@@ -180,116 +178,49 @@ def cmd_status(a, root):
     return emit("status", True, 0, p["mode"] if p["mode"] != "none" else "none", **p)
 
 
-# ---- workflow neutralization ------------------------------------------------
-TOP_ON = re.compile(r"""^(?:on|"on"|'on')\s*:""")
+# ---- held workflows --------------------------------------------------------
+# .github/workflows/** is kept byte-identical to the base branch: a PAT push triggers workflows, and no YAML
+# parsing (line-based or otherwise) can safely tell a harmless trigger from a hostile one. Upstream changes
+# there are reported and ported by hand. No YAML is parsed anywhere in this script.
+WF = ".github/workflows"
 
 
-def rewrite_on(text, name):
-    """Replace the single top-level `on:` block (to the next top-level key) with workflow_dispatch only."""
-    lines = text.splitlines()
-    starts = [i for i, ln in enumerate(lines) if TOP_ON.match(ln)]
-    if len(starts) != 1:
-        raise Escalate(f"{name}: expected exactly one top-level `on:`, found {len(starts)}")
-    s = starts[0]
-    e = s + 1
-    while e < len(lines) and not (lines[e] and not lines[e][0].isspace() and lines[e][0] != "#"):
-        e += 1
-    while e > s + 1 and (not lines[e - 1].strip() or lines[e - 1].startswith("#")):
-        e -= 1   # keep blank/comment lines that precede the next key
-    new = lines[:s] + ["on:", "  workflow_dispatch:"] + lines[e:]
-    return "\n".join(new) + "\n"
+def workflow_changes(root, old, new):
+    """[(status, path)] for upstream's workflow changes, NUL-delimited, renames split into D + A."""
+    raw = nul_list(git(root, "diff", "-z", "--name-status", "--no-renames", f"{old}..{new}", "--", WF).stdout)
+    return list(zip(raw[0::2], raw[1::2]))
 
 
-def neutralized_list(root):
-    return cfs.read_lines(Path(root) / "local/neutralized.txt")
-
-
-def neutralize(root, new_paths=()):
-    """Rewrite every listed + newly added workflow. Returns (changed_paths, listed)."""
-    root = Path(root)
-    listed = sorted(set(neutralized_list(root)) | set(new_paths))
-    changed = []
-    for rel in listed:
-        f = root / rel
-        if not f.is_file():
-            continue
-        old = f.read_text()
-        new = rewrite_on(old, rel)
-        if new != old:
-            f.write_text(new)
-            changed.append(rel)
-    p = root / "local/neutralized.txt"
-    body = "".join(x + "\n" for x in listed)
-    if not p.exists() or p.read_text() != body:
-        p.write_text(body)
-        changed.append("local/neutralized.txt")
-    return changed, listed
-
-
-def added_workflows(root, old, new):
-    names = nul_list(git(root, "diff", "-z", "--name-only", "--diff-filter=A", f"{old}..{new}",
-                         "--", ".github/workflows").stdout)
-    res = []
-    for n in names:
-        base = Path(n).name
-        if n.count("/") == 2 and n.endswith((".yml", ".yaml")) and base not in NEVER_REWRITE \
-                and not any(cfs.matches(base, [g]) for g in FORK_WORKFLOWS):
-            res.append(n)
-    return res
-
-
-def dispatch_only(text):
-    """True iff the file has exactly one top-level `on:` whose whole body is `workflow_dispatch:`."""
-    try:
-        return rewrite_on(text, "") == text
-    except Escalate:
-        return False
+def hold_workflows(root, base):
+    """Restore .github/workflows/** to `base` in the index and tree; drop anything the merge added there."""
+    base_files = set(nul_list(git(root, "ls-tree", "-r", "-z", "--name-only", base, "--", WF).stdout))
+    index_files = set(nul_list(git(root, "ls-files", "-z", "--", WF).stdout))
+    for path in sorted(index_files - base_files):
+        git(root, "rm", "-q", "-f", "--", path)
+    if base_files:
+        git(root, "checkout", base, "--", WF)
+    left = nul_list(git(root, "diff", "-z", "--name-only", base, "--", WF).stdout)
+    if left:
+        raise Escalate(f"could not hold {WF}: still differs at {left[:3]}")
 
 
 def cmd_workflow_guard(a, root):
-    """Trusted check of what a candidate would push: any change under .github/workflows/ is blocked unless it is
-    an added/modified file that is verified workflow_dispatch-only (the script's own neutralization)."""
-    raw = nul_list(git(root, "diff", "-z", "--name-status", "--no-renames", f"{a.base}..{a.cand}",
-                       "--", ".github/workflows").stdout)
-    changes = list(zip(raw[0::2], raw[1::2]))   # [(status, path)]
-    blocked, allowed = [], []
-    for status, path in changes:
-        text = None
-        if status in ("A", "M"):
-            blob = git(root, "show", f"{a.cand}:{path}", check=False)
-            text = blob.stdout if blob.returncode == 0 else None
-        if text is not None and dispatch_only(text):
-            allowed.append(path)
-        else:
-            blocked.append({"path": path, "status": status})
-    commits = []
-    if blocked:
-        log = git(root, "log", "-z", "--format=%h %s", f"{a.base}..{a.cand}", "--", ".github/workflows").stdout
-        commits = nul_list(log)[:30]
-    ok = not blocked
-    return emit("workflow-guard", ok, 0 if ok else 1,
-                "none" if ok else "workflow_review: do not push; list these files and commits in the issue",
-                touched=[p for _, p in changes], allowed=allowed, blocked=blocked, commits=commits)
-
-
-def cmd_neutralize(a, root):
-    changed, listed = neutralize(root)
-    if changed and a.commit:
-        git(root, "add", "-A", "--", *changed)
-        git(root, "commit", "-s", "--no-verify", "-m", "Re-apply workflow neutralization")
-    return emit("neutralize", True, 0, "none", changed=changed, neutralized=listed)
+    """Purely structural: the candidate must have no diff at all under .github/workflows/ vs the base."""
+    touched = nul_list(git(root, "diff", "-z", "--name-only", a.base, a.cand, "--", WF).stdout)
+    ok = not touched
+    return emit("workflow-guard", ok, 0 if ok else 1, "none" if ok else "refuse to push: workflows differ from base",
+                touched=touched, blocked=[{"path": t} for t in touched])
 
 
 # ---- merge ------------------------------------------------------------------
 def policy(root):
     cfg = tomllib.loads((Path(root) / "local/fork-surface.toml").read_text())
     return {"ignore": cfg.get("ignore", []), "generated": cfg.get("generated", []),
-            "neutralized": neutralized_list(root), "allow": cfg.get("allow", [])}
+            "allow": cfg.get("allow", [])}
 
 
 def classify(path, pol):
-    for name, kind in (("ignore", "local"), ("generated", "generated"), ("neutralized", "neutralized"),
-                       ("allow", "hook")):
+    for name, kind in (("ignore", "local"), ("generated", "generated"), ("allow", "hook")):
         if cfs.matches(path, pol[name]):
             return kind
     return "other"
@@ -333,11 +264,19 @@ def cmd_merge(a, root):
     branch = a.branch or f"upstream-sync/{stamp}-{target[:10]}"
     if not a.reuse:
         git(root, "checkout", "-b", branch)
+    base_ref = a.base_ref or "HEAD"
     m = git(root, "merge", "--no-commit", "--no-ff", target, check=False)
     if m.returncode and not unmerged(root):
         raise Escalate(f"merge failed: {(m.stderr or m.stdout).strip()[:300]}")
+    # Hold workflows at the base branch (cumulative over the whole PR range) and record what was held back.
+    hold_from = read_version(root, base_ref)[0]
+    held_files = [{"status": st, "path": pth} for st, pth in workflow_changes(root, hold_from, target)]
+    held_commits = nul_list(git(root, "log", "-z", "--format=%h %s", f"{hold_from}..{target}", "--", WF).stdout)[:30]
+    held = {"files": held_files, "commits": held_commits}
+    p["held"] = held
+    hold_workflows(root, base_ref)
     for c in unmerged(root):
-        if c["kind"] in ("generated", "neutralized"):   # take upstream's copy
+        if c["kind"] == "generated":   # take upstream's copy
             if git(root, "cat-file", "-e", f"{target}:{c['path']}", check=False).returncode == 0:
                 git(root, "checkout", target, "--", c["path"])
                 git(root, "add", c["path"])
@@ -345,11 +284,10 @@ def cmd_merge(a, root):
                 git(root, "rm", "-q", "--", c["path"])
     # Classify before committing: the commit clears the unmerged index entries.
     cs = unmerged(root)
-    changed, _ = neutralize(root, added_workflows(root, old, target))   # Escalate -> exit 2, nothing committed
     write_version(root, target, p["rtags"][-1] if p["rtags"] else last_tag)
     # Stage only intended paths (the merge result is already in the index): conflicted files go in with
     # their markers so a human can repair on the draft PR branch.
-    git(root, "add", "-A", "--", "local/UPSTREAM_VERSION.txt", *changed, *[c["path"] for c in cs])
+    git(root, "add", "-A", "--", "local/UPSTREAM_VERSION.txt", *[c["path"] for c in cs])
     merging = git(root, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0
     if not merging and git(root, "diff", "--cached", "--quiet", check=False).returncode == 0:
         return emit("merge", True, 0, "unchanged: nothing to commit; run: sync_upstream.py check",
@@ -439,11 +377,6 @@ def cmd_check(a, root):
     escalate += [x for x in v if isinstance(x, dict) and x.get("kind") in cfs.ESCALATE_KINDS]
     d["surface_violations"] += [x if isinstance(x, str) else json.dumps(x) for x in v]
     steps.append({"step": "fork-surface", "ok": p.returncode == 0})
-    changed, _ = neutralize(Path(root))
-    if changed:
-        git(root, "checkout", "--", *changed, check=False)   # leave the tree as found; report the drift
-        d["surface_violations"].append(f"workflow neutralization drift: {', '.join(changed)}")
-    steps.append({"step": "neutralized", "ok": not changed})
     ok = not (d["build_errors"] or d["test_failures"] or d["surface_violations"] or skipped)
     if escalate:
         code, nxt = 2, "ESCALATE: fork-surface escalate kind; do not auto-repair"
@@ -493,11 +426,13 @@ def load_json(path):
 def cmd_report(a, root):
     st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
     guard = load_json(a.guard) if a.guard and Path(a.guard).exists() else None
+    no_push = False
     short, tags = st.get("short", "?"), st.get("tags", [])
     if (st and not st.get("ok", False)) or not st:   # status failed (exit 2/3) or missing
         outcome = "escalate"
     elif guard is not None and (not guard or guard.get("ok") is not True):
-        outcome = "workflow_review" if guard.get("blocked") else "escalate"   # nothing is pushed
+        outcome = "escalate"   # the guard failing is a tool/tamper error: nothing is pushed
+        no_push = True
     elif mg and not mg.get("ok", True):
         outcome = "escalate"
     elif a.check_code not in (None, "", "0", "1") or not valid_check(ck) or ck.get("escalate"):
@@ -507,18 +442,19 @@ def cmd_report(a, root):
         outcome = "failing"
     else:
         outcome = "clean"
+    held = mg.get("held") if isinstance(mg.get("held"), dict) else {}
+    held_files = held.get("files") or []
     labels = ["upstream-sync"] + (["upstream-release"] if st.get("release") else []) \
+        + (["workflow-review"] if held_files else []) \
         + ([] if outcome == "clean" else ["sync-failing"])
-    if outcome == "workflow_review":
-        title = ""
-    elif not st.get("ok", False):
+    if not st.get("ok", False):
         title = ""   # leave an open PR's title alone
     elif st.get("release"):
         title = f"Upstream release: {st['newest_tag']} (+develop@{short})"
     else:
         title = f"Upstream sync: develop@{short} ({st.get('commits', 0)} commits)"
     cs = mg.get("conflicts", [])
-    kinds = {k: sum(1 for c in cs if c["kind"] == k) for k in ("generated", "neutralized", "hook", "local", "other")}
+    kinds = {k: sum(1 for c in cs if c["kind"] == k) for k in ("generated", "hook", "local", "other")}
     L = [f"## {title}", "", f"Result: {'PASS' if outcome == 'clean' else 'FAIL'} ({outcome})", ""]
     if tags:
         L += ["### Upstream tags included", *(f"- {t}" for t in tags), ""]
@@ -527,10 +463,13 @@ def cmd_report(a, root):
                       ("surface_violations", "Surface violations")):
         items = ck.get(key) if isinstance(ck.get(key), list) else []   # untrusted: null/odd values render as none
         L += [f"### {name}", *([f"- `{x}`" for x in items] or ["- none"]), ""]
-    if outcome == "workflow_review":
-        L += ["### Workflow changes need review (nothing was pushed)",
-              *(f"- `{b['path']}` ({b['status']})" for b in guard.get("blocked", [])),
-              "", "Upstream commits:", *(f"- {c}" for c in guard.get("commits", [])), ""]
+    if held_files:
+        L += ["### Held workflow changes (kept identical to develop; port by hand)",
+              *(f"- `{h['path']}` ({h['status']})" for h in held_files),
+              "", "Upstream commits:", *(f"- {c}" for c in held.get("commits", [])), ""]
+    if no_push:
+        L += ["### Workflow guard failed (nothing was pushed)",
+              *(f"- `{b['path']}`" for b in guard.get("blocked", [])), ""]
     if not st.get("ok", False):
         L += [f"Status failed: {st.get('next_action', 'no status result')}", ""]
     if mg and not mg.get("ok", True):
@@ -541,9 +480,10 @@ def cmd_report(a, root):
     if a.out:
         Path(a.out).write_text(md)
     return emit("report", True, 0, "publish", outcome=outcome, title=title, labels=labels,
-                draft=outcome in ("escalate", "workflow_review"), issue=outcome in ("escalate", "workflow_review"),
-                push=outcome != "workflow_review",
-                issue_title=f"Upstream sync needs repair: develop@{short}",
+                draft=outcome == "escalate", issue=outcome == "escalate" or bool(held_files),
+                push=not no_push,
+                issue_title=(f"Upstream sync needs repair: develop@{short}" if outcome == "escalate"
+                             else f"Upstream workflow changes held for manual porting: develop@{short}"),
                 reason=st.get("next_action", "") if not st.get("ok", False) else "")
 
 
@@ -561,11 +501,10 @@ def main(argv=None):
     m.add_argument("--ref"); m.add_argument("--force", action="store_true")
     m.add_argument("--bump-only", action="store_true"); m.add_argument("--reuse", action="store_true",
                    help="stay on the current branch (the open sync PR's)")
+    m.add_argument("--base-ref", help="branch whose workflows are held (workflow passes origin/develop)")
     m.add_argument("--branch"); m.add_argument("--date", help="yyyymmdd (tests)")
     g = sub.add_parser("workflow-guard"); g.set_defaults(fn=cmd_workflow_guard)
     g.add_argument("--base", required=True); g.add_argument("--cand", required=True)
-    n = sub.add_parser("neutralize"); n.set_defaults(fn=cmd_neutralize)
-    n.add_argument("--commit", action="store_true")
     sub.add_parser("conflicts").set_defaults(fn=cmd_conflicts)
     c = sub.add_parser("check"); c.set_defaults(fn=cmd_check)
     c.add_argument("--no-go", action="store_true")

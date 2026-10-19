@@ -133,33 +133,6 @@ class Sync(unittest.TestCase):
             self.assertEqual(code, 3, cmd)
         self.assertEqual(self.version()[0], f"sha={c2}")
 
-    def test_rewrite_on_block(self):
-        out = su.rewrite_on(WF, "x")
-        self.assertEqual(out, "name: x\non:\n  workflow_dispatch:\n\njobs:\n  a:\n    runs-on: ubuntu-latest\n")
-        self.assertEqual(su.rewrite_on(out, "x"), out)   # idempotent
-        self.assertEqual(su.rewrite_on("on: [push]\njobs: {}\n", "x"), "on:\n  workflow_dispatch:\njobs: {}\n")
-        for bad in ("jobs: {}\n", "on: push\non: pull_request\n"):
-            with self.assertRaises(su.Escalate):
-                su.rewrite_on(bad, "x")
-
-    def test_upstream_adds_trigger_to_neutralized_file_stays_dispatch_only(self):
-        self.put(self.fork, "local/neutralized.txt", ".github/workflows/x.yml\n")
-        git(self.fork, "add", "-A")
-        git(self.fork, "commit", "-qm", "list")
-        self.up_commit("a.txt", "2\n", {
-            ".github/workflows/x.yml": WF.replace("on:\n", "on:\n  pull_request:\n"),
-            ".github/workflows/new.yml": WF})
-        self.fetch()
-        code, mg = self.sync("merge", "--date", "20261019")
-        self.assertEqual(code, 0, mg)
-        for name in ("x.yml", "new.yml"):
-            txt = (self.fork / ".github/workflows" / name).read_text()
-            self.assertIn("on:\n  workflow_dispatch:\n", txt)
-            self.assertNotIn("push:", txt.split("jobs:")[0])
-            self.assertNotIn("pull_request", txt)
-        self.assertEqual((self.fork / "local/neutralized.txt").read_text(),
-                         ".github/workflows/new.yml\n.github/workflows/x.yml\n")
-
     def test_upstream_range_adding_ignored_path_is_flagged(self):
         self.put(self.fork, "local/fork-surface.toml", 'ignore = ["local/**"]\n')
         c2 = self.up_commit("a.txt", "2\n", {"local/sneaky.txt": "x\n"})
@@ -247,40 +220,6 @@ class Sync(unittest.TestCase):
             r = self.sync("report", "--status", st, "--merge", str(mg), "--check", str(f), *extra)[1]
             self.assertEqual(r["outcome"], "clean" if ck is good and not extra else "escalate", (ck, extra))
 
-    def guard(self):
-        return self.sync("workflow-guard", "--base", "develop", "--cand", "HEAD")
-
-    def review(self, guard):
-        g = Path(self.tmp.name) / "g.json"
-        g.write_text(json.dumps(guard))
-        st = self._dump({"ok": True, "tags": [], "short": "abc", "commits": 1})
-        return self.sync("report", "--status", st, "--guard", str(g))[1]
-
-    def test_upstream_edit_to_ci_yml_is_workflow_review_no_push(self):
-        self.up_commit("a.txt", "2\n", {".github/workflows/ci.yml": WF.replace("on:\n", "on:\n  pull_request:\n")})
-        self.fetch()
-        self.sync("merge", "--date", "20261019")
-        code, g = self.guard()
-        self.assertEqual((code, [b["path"] for b in g["blocked"]]), (1, [".github/workflows/ci.yml"]))
-        r = self.review(g)
-        self.assertEqual((r["outcome"], r["push"], r["issue"]), ("workflow_review", False, True))
-
-    def test_upstream_added_local_workflow_is_workflow_review(self):
-        self.up_commit("a.txt", "2\n", {".github/workflows/local-x.yml": WF})
-        self.fetch()
-        self.sync("merge", "--date", "20261019")
-        code, g = self.guard()
-        self.assertEqual((code, g["blocked"]), (1, [{"path": ".github/workflows/local-x.yml", "status": "A"}]))
-
-    def test_neutralized_new_workflow_with_space_in_name_is_pushable(self):
-        self.up_commit("a.txt", "2\n", {".github/workflows/evil task.yml": WF})
-        self.fetch()
-        self.assertEqual(self.sync("merge", "--date", "20261019")[0], 0)
-        self.assertEqual((self.fork / "local/neutralized.txt").read_text(), ".github/workflows/evil task.yml\n")
-        self.assertIn("on:\n  workflow_dispatch:\n", (self.fork / ".github/workflows/evil task.yml").read_text())
-        code, g = self.guard()
-        self.assertEqual((code, g["allowed"], g["blocked"]), (0, [".github/workflows/evil task.yml"], []))
-
     def test_null_list_in_check_escalates_and_renders(self):
         st = self._dump({"ok": True, "tags": [], "short": "abc", "commits": 1})
         mg = Path(self.tmp.name) / "mg.json"
@@ -290,14 +229,60 @@ class Sync(unittest.TestCase):
         code, r = self.sync("report", "--status", st, "--merge", str(mg), "--check", str(ck))
         self.assertEqual((code, r["outcome"]), (0, "escalate"))
 
-    def test_failed_rewrite_stops_before_commit(self):
-        self.up_commit("a.txt", "2\n", {".github/workflows/bad.yml": "name: bad\njobs: {}\n"})
+    def merge(self):
+        return self.sync("merge", "--base-ref", "develop", "--date", "20261019")
+
+    def guard(self):
+        return self.sync("workflow-guard", "--base", "develop", "--cand", "HEAD")
+
+    def test_upstream_edit_to_ci_yml_is_held_reported_and_pushable(self):
+        self.up_commit("a.txt", "2\n", {".github/workflows/ci.yml": WF.replace("on:\n", "on:\n  pull_request:\n")})
         self.fetch()
-        head = git(self.fork, "rev-parse", "HEAD")
-        code, mg = self.sync("merge", "--date", "20261019")
-        self.assertEqual(code, 2)
-        self.assertEqual(self.version()[0], f"sha={self.c1}")
-        self.assertEqual(git(self.fork, "rev-parse", "HEAD"), head)   # nothing committed
+        code, mg = self.merge()
+        self.assertEqual(code, 0, mg)
+        self.assertEqual((self.fork / ".github/workflows/ci.yml").read_text(), WF)   # held at base
+        self.assertEqual(mg["held"]["files"], [{"status": "M", "path": ".github/workflows/ci.yml"}])
+        self.assertTrue(mg["held"]["commits"])
+        self.assertEqual(self.guard()[0], 0)                                        # no workflow diff: pushable
+        f = Path(self.tmp.name)
+        (f / "m.json").write_text(json.dumps(mg))
+        (f / "c.json").write_text(json.dumps({"ok": True, "escalate": False}))
+        r = self.sync("report", "--status", self._dump({"ok": True, "tags": [], "short": "abc", "commits": 1}),
+                      "--merge", str(f / "m.json"), "--check", str(f / "c.json"), "--check-code", "0")[1]
+        self.assertEqual((r["outcome"], r["issue"], r["push"], "workflow-review" in r["labels"]),
+                         ("clean", True, True, True))
+
+    def test_added_workflow_with_yaml_tricks_is_held(self):
+        trick = 'name: "multi\n  on: [push]"\n"on": push\njobs: {}\n'
+        self.up_commit("a.txt", "2\n", {".github/workflows/x2.yml": trick})
+        self.fetch()
+        code, mg = self.merge()
+        self.assertEqual(mg["held"]["files"], [{"status": "A", "path": ".github/workflows/x2.yml"}])
+        self.assertFalse((self.fork / ".github/workflows/x2.yml").exists())
+        self.assertEqual(self.guard()[0], 0)
+
+    def test_filename_with_space_is_held(self):
+        self.up_commit("a.txt", "2\n", {".github/workflows/evil task.yml": WF})
+        self.fetch()
+        code, mg = self.merge()
+        self.assertEqual(mg["held"]["files"], [{"status": "A", "path": ".github/workflows/evil task.yml"}])
+        self.assertFalse((self.fork / ".github/workflows/evil task.yml").exists())
+        self.assertEqual(self.guard()[0], 0)
+
+    def test_guard_rejects_any_workflow_diff(self):
+        self.up_commit("a.txt", "2\n")
+        self.fetch()
+        self.merge()
+        self.put(self.fork, ".github/workflows/ci.yml", WF + "# x\n")
+        git(self.fork, "add", "-A")
+        git(self.fork, "commit", "-qm", "sneak")
+        code, g = self.guard()
+        self.assertEqual((code, g["touched"]), (1, [".github/workflows/ci.yml"]))
+        f = Path(self.tmp.name) / "g.json"
+        f.write_text(json.dumps(g))
+        r = self.sync("report", "--status", self._dump({"ok": True, "tags": [], "short": "a", "commits": 1}),
+                      "--guard", str(f))[1]
+        self.assertEqual((r["outcome"], r["push"]), ("escalate", False))
 
 
 if __name__ == "__main__":
