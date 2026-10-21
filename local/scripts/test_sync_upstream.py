@@ -4,6 +4,7 @@
 """Tiny fixture tests for sync_upstream.py on temp git repos. No gh, no network."""
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -272,7 +273,7 @@ class Sync(unittest.TestCase):
         r = self.sync("report", "--status", self._dump({"ok": True, "tags": [], "short": "abc", "commits": 1}),
                       "--merge", str(f / "m.json"), "--check", str(f / "c.json"), "--check-code", "0")[1]
         self.assertEqual((r["outcome"], r["issue"], r["push"], "workflow-review" in r["labels"]),
-                         ("clean", True, True, True))
+                         ("workflow_review", True, True, True))   # pushed, PR opened, never enrolled
 
     def test_added_workflow_with_yaml_tricks_is_held(self):
         trick = 'name: "multi\n  on: [push]"\n"on": push\njobs: {}\n'
@@ -314,6 +315,86 @@ class Sync(unittest.TestCase):
         r = self.sync("report", "--status", self._dump({"ok": True, "tags": [], "short": "a", "commits": 1}),
                       "--guard", str(f))[1]
         self.assertEqual((r["outcome"], r["push"]), ("escalate", False))
+
+    def results(self, st=None, mg=None, ck=None):
+        """Write status/merge/check JSON files; returns the CLI args that pass them."""
+        t = Path(self.tmp.name)
+        self.nres = getattr(self, "nres", 0) + 1   # unique names: one test builds several arg lists
+        args = []
+        for flag, name, d in (("--status", "st", st), ("--merge", "mg", mg), ("--check", "ck", ck)):
+            if d is not None:
+                (t / f"{name}{self.nres}.json").write_text(json.dumps(d))
+                args += [flag, str(t / f"{name}{self.nres}.json")]
+        return args
+
+    def test_outcome_table(self):
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        held = {"held": {"files": [{"status": "M", "path": ".github/workflows/ci.yml"}], "commits": []}}
+        ck, bad = {"ok": True, "escalate": False}, {"ok": False, "escalate": False}
+        for name, args, want in [
+                ("clean", self.results(st, {"ok": True}, ck), ("clean", [], True)),
+                ("failing", self.results(st, {"ok": True}, bad), ("failing", [], False)),
+                ("escalate", self.results({"ok": False}, None, ck), ("escalate", [], False)),
+                ("workflow_review", self.results({**st, **held}, {"ok": True}, ck), ("workflow_review", [], False)),
+                ("held+failing", self.results({**st, **held}, {"ok": True}, bad), ("failing", [], False)),
+                ("stalled", [*self.results(st, {"ok": True}, ck), "--stalled"], ("clean", ["enroll_stalled"], True))]:
+            code, o = self.sync("outcome", *args)
+            self.assertEqual((code, o["outcome"], o["extra"], o["enroll_eligible"]), (0, *want), name)
+
+    def test_report_outcome_and_enrollment_lines(self):
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        md = Path(self.tmp.name) / "r.md"
+        args = self.results(st, {"ok": True, "branch": "upstream-sync/20261019-abc"}, {"ok": False, "escalate": False})
+        r = self.sync("report", *args, "--out", str(md))[1]
+        self.assertEqual((r["issue_key"], r["issue_title"]),
+                         ("upstream-sync/20261019-abc failing", "Upstream sync needs attention: develop@abc [failing]"))
+        self.assertIn("\nOutcome: failing\nEnrollment: pending\n", md.read_text())
+        r = self.sync("report", *args, "--out", str(md), "--demo")[1]
+        self.assertEqual((r["labels"], r["title"]), (["sync-demo"], "Upstream sync demo: develop@abc (1 commits)"))
+        held = {"ok": True, "held": {"files": [{"status": "A", "path": ".github/workflows/n.yml"}], "commits": []}}
+        r = self.sync("report", *self.results(st, held, {"ok": True, "escalate": False}))[1]
+        self.assertEqual(r["issue_key"], "workflow-review workflow_review")
+
+    def test_required_checks_match_local_ci(self):
+        ci = (HERE.parents[1] / ".github/workflows/local-ci.yml").read_text()
+        names = re.findall(r"^ {8}name: (.+)$", ci, re.M)          # job-level names (8 spaces); steps are deeper
+        mods = re.search(r"^ +module:\n((?: +- .+\n)+)", ci, re.M).group(1).split()[1::2]
+        want = {n for n in names if "${{" not in n} | {n.replace("${{ matrix.module }}", m) for n in names
+                                                       if "${{" in n for m in mods}
+        self.assertEqual(set(su.tomllib.loads((HERE.parent / "upstream-sync.toml").read_text())["required_checks"]), want)
+
+    def make_sim(self, name="test/upstream-sim-1", files=None, parent=None):
+        """A simulated-upstream branch on origin (the fork's clone source), one commit past `parent`."""
+        git(self.up, "checkout", "-q", "-b", name, parent or self.c1)
+        sha = self.up_commit("sim.txt", "sim\n", files)
+        git(self.up, "checkout", "-q", "develop")
+        self.fetch()
+        git(self.fork, "fetch", "-q", "origin")
+        return sha
+
+    def test_demo_ref_validation_exits_2(self):
+        self.up_commit("a.txt", "2\n")                      # develop moves on; origin/develop is not sha=
+        self.make_sim("test/upstream-sim-2", parent="develop")   # parent != sha=
+        self.make_sim("test/other-1")
+        for ref in ("test/other-1", "test/upstream-sim-9", "test/upstream-sim-2", "test/upstream-sim-1x"):
+            for cmd in ("status", "merge"):
+                self.assertEqual(self.sync(cmd, "--demo-ref", ref)[0], 2, (cmd, ref))
+
+    def test_demo_merge_keeps_version_and_demo_prefix(self):
+        sim = self.make_sim()
+        code, st = self.sync("status", "--demo-ref", "test/upstream-sim-1")
+        self.assertEqual((code, st["mode"], st["target"], st["tags"], st["demo"]), (0, "sync", sim, [], True))
+        code, mg = self.sync("merge", "--demo-ref", "test/upstream-sim-1", "--date", "20261019")
+        self.assertEqual((code, mg["branch"]), (0, f"upstream-sync-demo/20261019-{sim[:10]}"))
+        self.assertEqual(self.version(), [f"sha={self.c1}", "last_release_tag=v1.0.0"])
+        self.assertTrue((self.fork / "sim.txt").exists())
+
+    def test_check_exempts_sync_demo_only_with_demo_ref(self):
+        self.put(self.fork, "local/fork-surface.toml", 'ignore = ["local/**"]\n')
+        sim = self.make_sim(files={"local/sync-demo/x.txt": "x\n", "local/sneaky.txt": "x\n"})
+        want = [{"kind": "upstream_adds_ignored_path", "path": p} for p in ("local/sneaky.txt", "local/sync-demo/x.txt")]
+        self.assertEqual(su.added_ignored(self.fork, self.c1, sim), want)
+        self.assertEqual(su.added_ignored(self.fork, self.c1, sim, su.DEMO_EXEMPT), want[:1])
 
 
 if __name__ == "__main__":
