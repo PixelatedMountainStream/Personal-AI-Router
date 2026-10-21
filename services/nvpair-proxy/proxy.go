@@ -218,11 +218,13 @@ type workloadParams struct {
 
 // bufferBodyAndModel reads the request body once and returns the raw bytes
 // (so each failover attempt can replay it — see the loop in handleHTTP) along
-// with the JSON "model" field for workload tracking. Inference bodies are
-// small (prompt + model), so full buffering is cheap. Returns (nil, "") when
-// the body is absent and an empty model when none is parseable. The caller
-// restores r.Body from the returned bytes before each forward attempt.
-func bufferBodyAndModel(r *http.Request) ([]byte, string) {
+// with the JSON "model" field for workload tracking. With nameFallback set, an
+// empty "model" falls back to "name", which is how /api/show clients name the
+// model. Inference bodies are small (prompt + model), so full buffering is
+// cheap. Returns (nil, "") when the body is absent and an empty model when none
+// is parseable. The caller restores r.Body from the returned bytes before each
+// forward attempt.
+func bufferBodyAndModel(r *http.Request, nameFallback bool) ([]byte, string) {
 	if r.Body == nil {
 		return nil, ""
 	}
@@ -233,9 +235,13 @@ func bufferBodyAndModel(r *http.Request) ([]byte, string) {
 	}
 	var probe struct {
 		Model string `json:"model"`
+		Name  string `json:"name"`
 	}
 	if err := json.Unmarshal(body, &probe); err != nil {
 		return body, ""
+	}
+	if probe.Model == "" && nameFallback {
+		return body, probe.Name
 	}
 	return body, probe.Model
 }
@@ -1221,6 +1227,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// whether a matching Started was seen.
 	reqID := strconv.FormatUint(f.nextRequestID.Add(1), 10)
 
+<<<<<<< HEAD
 	// Parse the request's model before choosing a node. Model eligibility only
 	// applies to inference routes; control endpoints retain their existing
 	// routing behavior even when their JSON happens to contain a model field.
@@ -1232,9 +1239,18 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			r.Header.Set("Content-Length", strconv.Itoa(len(nb)))
 		}
 	}
+=======
+	// Parse the request's model before choosing a node. Model eligibility
+	// applies to inference routes and model lookups (/api/show); other control
+	// endpoints retain their existing routing behavior even when their JSON
+	// happens to contain a model field.
+>>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 	isInf := isInferenceRequest(f.profile, r.Method, r.URL.Path)
+	role, routed := f.profile.roleFor(r.Method, r.URL.Path)
+	lookup := routed && role == roleModelLookupPOST
+	bodyBytes, model := bufferBodyAndModel(r, lookup)
 	routingModel := ""
-	if isInf {
+	if isInf || lookup {
 		routingModel = model
 	}
 	candidates, notLoaded := f.resolveCandidatesN(routingModel)
@@ -1307,6 +1323,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(candidates) == 0 {
 		rejectionBody := `{"error":"no active node selected or available"}`
 		rejectionError := "no active node"
+<<<<<<< HEAD
 		status := http.StatusBadGateway
 		if isInf && model != "" {
 			rejectionBody = `{"error":"no available node advertises the requested model"}`
@@ -1316,17 +1333,35 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				rejectionBody = `{"error":` + string(msg) + `}`
 				rejectionError = "no live node has model loaded"
 				status = http.StatusServiceUnavailable
+=======
+		rejectionStatus := http.StatusBadGateway
+		if routingModel != "" {
+			rejectionBody = `{"error":"no available node advertises the requested model"}`
+			rejectionError = "no node advertises requested model"
+			if lookup {
+				// A model lookup for a model nobody has is a not-found, as
+				// Ollama itself answers it, not a gateway failure.
+				rejectionStatus = http.StatusNotFound
+>>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 			}
 		}
 		slog.Warn("proxy request rejected",
 			"id", reqID, "method", r.Method, "path", r.URL.Path,
 			"remote", r.RemoteAddr, "reason", rejectionError)
+<<<<<<< HEAD
 		http.Error(w, rejectionBody, status)
+=======
+		http.Error(w, rejectionBody, rejectionStatus)
+>>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 		_ = f.notify("proxy/request", RequestEvent{
 			ID:       reqID,
 			Method:   r.Method,
 			Path:     r.URL.Path,
+<<<<<<< HEAD
 			Status:   status,
+=======
+			Status:   rejectionStatus,
+>>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 			Duration: time.Since(start).Milliseconds(),
 			Error:    rejectionError,
 		})
@@ -1334,7 +1369,8 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// shouldRetry reports whether an upstream status warrants failing over to
 	// the next candidate: busy/unavailable/gateway statuses, plus a 404 on an
-	// inference call (an advertised owner's inventory may have become stale).
+	// inference call or model lookup (an advertised owner's inventory may have
+	// become stale).
 	// Genuine client errors (400/401/422…) are not retried — they'd fail
 	// identically on every node.
 	shouldRetry := func(code int) bool {
@@ -1346,7 +1382,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			http.StatusGatewayTimeout:
 			return true
 		case http.StatusNotFound:
-			return isInf
+			return isInf || lookup
 		}
 		return code >= 500
 	}
