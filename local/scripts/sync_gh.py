@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-PR_FIELDS = "number,headRefName,headRefOid,isDraft,labels,autoMergeRequest,isCrossRepository"
+PR_FIELDS = "number,baseRefName,headRefName,headRefOid,isDraft,labels,autoMergeRequest,isCrossRepository"
 BAD_RULES = ("merge_queue", "pull_request", "required_linear_history")
 STALL = timedelta(hours=24)
 
@@ -66,7 +66,7 @@ def enabled_at(pr):
 
 def cmd_find_pr(a):
     label, prefix = ("sync-demo", "upstream-sync-demo/") if a.demo else ("upstream-sync", "upstream-sync/")
-    prs = gh_json("pr", "list", "--label", label, "--state", "open", "--limit", "50", "--json", PR_FIELDS) or []
+    prs = gh_json("pr", "list", "--base", "develop", "--label", label, "--state", "open", "--limit", "50", "--json", PR_FIELDS) or []
     prs = [p for p in prs if not p["isCrossRepository"] and p["headRefName"].startswith(prefix)]
     if not prs:
         return emit("find-pr", True, 0, number=None, branch=None, draft=None, labels=[],
@@ -146,6 +146,8 @@ def cmd_ready(a):
 
 
 def required_checks(config):
+    if not Path(config).is_file():
+        return None, f"config file not found: {config} (pass --config pointing at the trusted develop checkout)"
     try:
         v = tomllib.loads(Path(config).read_text()).get("required_checks")
     except (OSError, tomllib.TOMLDecodeError) as e:
@@ -179,27 +181,43 @@ def check_prereqs(a):
             if r.get(k) is not True:
                 reasons.append(f"repo {k} is not true")
     p, err = read_api(f"repos/{f}/branches/develop/protection")
+    ep = "branches/develop/protection"
     if err:
         reasons.append(err)
+    elif not isinstance(p, dict):
+        reasons.append(f"malformed {ep}")
     else:
-        rsc = p.get("required_status_checks") or {}
-        got = {c.get("context") for c in rsc.get("checks") or []}
-        if want is not None and got != want:
-            reasons.append(f"required checks differ: missing {sorted(want - got)}, extra {sorted(got - want)}")
-        if rsc.get("strict"):
-            reasons.append("protection requires up-to-date branches (strict)")
-        if (p.get("required_linear_history") or {}).get("enabled"):
-            reasons.append("protection requires linear history")
-        if p.get("required_pull_request_reviews"):
-            reasons.append("protection requires approving reviews")
+        rsc, lin, rv = p.get("required_status_checks"), p.get("required_linear_history"), p.get("required_pull_request_reviews")
+        checks = rsc.get("checks") if isinstance(rsc, dict) else None
+        if (not isinstance(rsc, dict) or not isinstance(rsc.get("strict"), bool) or not isinstance(checks, list)
+                or not all(isinstance(c, dict) for c in checks)
+                or not isinstance(lin, dict) or not isinstance(lin.get("enabled"), bool)
+                or not (rv is None or isinstance(rv, dict))):
+            reasons.append(f"malformed {ep}")
+        else:
+            got = {c.get("context") for c in checks}
+            if want is not None and got != want:
+                reasons.append(f"required checks differ: missing {sorted(want - got)}, extra {sorted(got - want)}")
+            if rsc["strict"]:
+                reasons.append("protection requires up-to-date branches (strict)")
+            if lin["enabled"]:
+                reasons.append("protection requires linear history")
+            if rv:
+                reasons.append("protection requires approving reviews")
     rules, err = read_api(f"repos/{f}/rules/branches/develop")
     if err:
         reasons.append(err)
+    elif not isinstance(rules, list) or not all(isinstance(x, dict) for x in rules):
+        reasons.append("malformed rules/branches/develop")
     else:
-        bad = sorted({x.get("type") for x in rules or [] if x.get("type") in BAD_RULES})
+        bad = sorted({x.get("type") for x in rules if x.get("type") in BAD_RULES})
         if bad:
             reasons.append(f"rules on develop: {bad}")
     pr = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS)
+    if pr.get("baseRefName") != "develop":
+        reasons.append(f"PR base is {pr.get('baseRefName')!r}, not 'develop'")
+    if pr.get("isCrossRepository") is not False:
+        reasons.append("PR is cross-repository")
     if pr["isDraft"]:
         reasons.append("PR is still a draft")
     return reasons
@@ -228,12 +246,12 @@ def cmd_enroll(a):
         if p.returncode:
             reasons.append(f"gh pr merge --auto failed: {(p.stderr or p.stdout).strip()[:200]}")
     ok = not reasons
+    if not ok:
+        disable_auto(a.pr)   # disarm first: a failing report edit must never leave an armed auto-merge
     line = f"Enrollment: enrolled at {a.head}" if ok else f"Enrollment: refused: {'; '.join(reasons)}"
     report = Path(a.body)
     report.write_text(set_enrollment_line(report.read_text() if report.exists() else "", line))
     gh("pr", "edit", str(a.pr), "--body-file", str(report))
-    if not ok:
-        disable_auto(a.pr)
     return emit("enroll", ok, 0 if ok else 1, outcome="enrolled" if ok else "enroll_refused",
                 reasons=reasons, kill_switch_only=reasons == [ks_reason])
 
@@ -281,7 +299,7 @@ def main(argv=None):
     s = add("enroll", cmd_enroll)
     s.add_argument("--pr", type=int, required=True); s.add_argument("--head", required=True)
     s.add_argument("--demo-ref", default=""); s.add_argument("--body", required=True, help="report.md")
-    s.add_argument("--config", default=str(ROOT / "local" / "upstream-sync.toml"))
+    s.add_argument("--config", required=True, help="trusted develop checkout's local/upstream-sync.toml")
     s = add("issue", cmd_issue)
     s.add_argument("--branch", required=True); s.add_argument("--outcome", required=True)
     s.add_argument("--title", required=True); s.add_argument("--body-file", required=True)

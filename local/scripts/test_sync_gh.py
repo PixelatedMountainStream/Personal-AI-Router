@@ -125,6 +125,57 @@ class T(unittest.TestCase):
         self.run_gh([entry(["pr", "view"], ghstub.pr())], "disable-auto", "--pr", "23")
         self.assertEqual(self.gh.calls("pr", "merge"), [])   # idempotent: nothing to disable
 
+    def test_enroll_refuses_other_base_or_cross_repo(self):
+        for kw in ({"base": "main"}, {"cross": True}):
+            rs = enroll_responses()
+            rs[1] = entry(["pr", "view"], ghstub.pr(**kw))
+            o = self.enroll(rs)
+            self.assertEqual(o["outcome"], "enroll_refused", kw)
+            self.assertEqual(self.gh.calls("pr", "merge", "23", "--auto"), [])
+
+    def test_find_pr_filters_base_develop(self):
+        self.run_gh([entry(["pr", "list"], [])], "find-pr")
+        self.assertEqual(self.gh.calls("pr", "list")[0][2:4], ["--base", "develop"])
+
+    def test_enroll_missing_config_refuses_with_reason(self):
+        report = TMP / "report.md"
+        report.write_text("Enrollment: pending\n")
+        o = self.run_gh(enroll_responses(), "enroll", "--pr", "23", "--head", HEAD, "--body", str(report),
+                        "--config", str(TMP / "nope.toml"), switch="1")
+        self.assertEqual(o["outcome"], "enroll_refused")
+        self.assertTrue(any("config file not found" in r for r in o["reasons"]), o["reasons"])
+
+    def test_required_checks_read_from_explicit_config(self):
+        other = TMP / "other.toml"
+        other.write_text('required_checks = ["only-this"]\n')
+        report = TMP / "report.md"
+        report.write_text("Enrollment: pending\n")
+        o = self.run_gh(enroll_responses(), "enroll", "--pr", "23", "--head", HEAD, "--body", str(report),
+                        "--config", str(other), switch="1")
+        self.assertEqual(o["outcome"], "enroll_refused")
+        self.assertIn("only-this", " ".join(o["reasons"]))
+
+    def test_enroll_malformed_responses_refuse(self):
+        good = ghstub.protection(CHECKS)
+        no_strict = json.loads(json.dumps(good)); del no_strict["required_status_checks"]["strict"]
+        no_lin = json.loads(json.dumps(good)); del no_lin["required_linear_history"]
+        for prot in (no_strict, no_lin, [], {"required_status_checks": None, "required_linear_history": {"enabled": False}}):
+            o = self.enroll(enroll_responses(prot=prot))
+            self.assertEqual(o["outcome"], "enroll_refused")
+            self.assertIn("malformed branches/develop/protection", o["reasons"])
+        for rules in (None, {"a": 1}, ["x"]):
+            rs = enroll_responses()
+            rs[4] = entry([API, f"{R}/rules/branches/develop"], rules)
+            o = self.enroll(rs)
+            self.assertIn("malformed rules/branches/develop", o["reasons"], rules)
+
+    def test_refusal_disarms_before_editing_body(self):
+        rs = enroll_responses(repo=ghstub.repo(auto=False))
+        rs[1] = entry(["pr", "view"], ghstub.pr(enabled_at=hours_ago(1)))
+        self.enroll(rs)
+        order = [c[:2] for c in self.gh.calls("pr")]
+        self.assertLess(order.index(["pr", "merge"]), order.index(["pr", "edit"]))
+
     def test_find_pr_demo_in_place_or_none(self):
         demo = ghstub.pr(branch="upstream-sync-demo/1", labels=("sync-demo",))
         fork_pr = ghstub.pr(number=30, branch="upstream-sync-demo/2", labels=("sync-demo",), cross=True)

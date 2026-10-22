@@ -67,6 +67,10 @@ jobs:
       branch: ${{ steps.bundle.outputs.branch }}
       cand_sha: ${{ steps.bundle.outputs.cand_sha }}
       bundle_sha256: ${{ steps.bundle.outputs.bundle_sha256 }}
+      # Digests of every metadata file publish parses; "absent" means the file must not exist.
+      status_sha256: ${{ steps.digests.outputs.status_sha256 }}
+      merge_sha256: ${{ steps.digests.outputs.merge_sha256 }}
+      guard_sha256: ${{ steps.digests.outputs.guard_sha256 }}
     steps:
       - name: Require UPSTREAM_SYNC_TOKEN
         run: |
@@ -190,6 +194,17 @@ jobs:
             echo "branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Digest the metadata
+        id: digests
+        run: |
+          # Computed here, in the privileged job, before the artifact leaves it: the check job runs candidate code
+          # and could replace the sync-merge artifact, so publish authenticates each parsed file against these.
+          for k in status merge guard; do
+            f="$RUNNER_TEMP/out/$k.json"
+            if [ -f "$f" ]; then h=$(sha256sum "$f" | cut -d' ' -f1); else h=absent; fi
+            echo "${k}_sha256=$h" >> "$GITHUB_OUTPUT"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: sync-merge
@@ -286,6 +301,25 @@ jobs:
           name: sync-check-result
           path: ${{ runner.temp }}/chk   # separate directory: nothing from the check job can overwrite sync-merge files
 
+      - name: Verify merge metadata
+        env:
+          STATUS_SHA256: ${{ needs.merge.outputs.status_sha256 }}
+          MERGE_SHA256: ${{ needs.merge.outputs.merge_sha256 }}
+          GUARD_SHA256: ${{ needs.merge.outputs.guard_sha256 }}
+        run: |
+          # Same pattern as the bundle check: nothing downloaded is parsed before it matches the privileged job's output.
+          in="$RUNNER_TEMP/in"
+          verify() {
+            if [ "$2" = "absent" ]; then
+              [ ! -e "$in/$1" ] || { echo "::error::$1 present but the merge job emitted none"; exit 1; }
+            else
+              [ -n "$2" ] && echo "$2  $in/$1" | sha256sum -c - || { echo "::error::$1 hash mismatch"; exit 1; }
+            fi
+          }
+          verify status.json "$STATUS_SHA256"
+          verify merge.json "$MERGE_SHA256"
+          verify guard.json "$GUARD_SHA256"
+
       - name: Report
         id: report
         env:
@@ -323,8 +357,9 @@ jobs:
           found=$(gh_sync find-pr "${find_args[@]}")
           PR_NUMBER=$(jq -r '.number // empty' <<<"$found")
           PR_DRAFT=$(jq -r '.draft // empty' <<<"$found")
-          # An armed auto-merge must never survive a push to its PR: disarm first (the PAT push would otherwise re-run checks under it).
-          if [ -n "$PR_NUMBER" ] && [ "$PUSH" = "true" ]; then
+          # An armed auto-merge must never survive a push to its PR (disarm first: the PAT push would otherwise re-run
+          # checks under it), nor any non-clean outcome, pushed or not (e.g. a workflow-guard escalate with push=false).
+          if [ -n "$PR_NUMBER" ] && { [ "$PUSH" = "true" ] || [ "$OUTCOME" != "clean" ]; }; then
             gh_sync disable-auto --pr "$PR_NUMBER"
           fi
           if [ "$PUSH" = "true" ] && [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
@@ -372,7 +407,7 @@ jobs:
           [ -n "$CAND_SHA" ] || { echo "::error::no candidate sha to enroll"; exit 0; }
           set +e
           python3 "$RUNNER_TEMP/trusted/sync_gh.py" enroll --pr "$PR_NUMBER" --head "$CAND_SHA" --demo-ref "$DEMO_REF" \
-            --body "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/enroll.json"
+            --config "$GITHUB_WORKSPACE/local/upstream-sync.toml" --body "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/enroll.json"
           code=$?
           set -e
           cat "$RUNNER_TEMP/enroll.json"

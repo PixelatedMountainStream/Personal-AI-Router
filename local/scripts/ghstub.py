@@ -99,8 +99,8 @@ def label(name):
 
 
 def pr(number=23, branch="upstream-sync/20261021-b494470a03", draft=False, labels=("upstream-sync",),
-       enabled_at=None, cross=False, head="f" * 40, state="OPEN"):
-    return {"number": number, "headRefName": branch, "headRefOid": head, "isDraft": draft,
+       enabled_at=None, cross=False, head="f" * 40, state="OPEN", base="develop"):
+    return {"number": number, "baseRefName": base, "headRefName": branch, "headRefOid": head, "isDraft": draft,
             "labels": [label(n) for n in labels], "isCrossRepository": cross, "state": state,
             "autoMergeRequest": None if not enabled_at else {
                 "authorEmail": None, "commitBody": None, "commitHeadline": None,

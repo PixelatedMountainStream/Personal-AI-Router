@@ -52,6 +52,12 @@ class T(unittest.TestCase):
                 self.assertIn(["pr", "merge", "23", "--disable-auto"], gh.calls("pr", "merge"))
                 self.assertFalse([x for x in gh.calls() if "sync-failing" in x])
 
+    def test_disarm_before_reporting_ops(self):
+        pr = ghstub.pr(branch=BR, head=HEAD, enabled_at="2026-10-21T10:00:00Z")
+        out, gh = self.run_ci(responses(pr))
+        order = [c[:2] for c in gh.calls() if c[0] in ("pr", "label", "issue")]
+        self.assertEqual(order.index(["pr", "merge"]), 1)   # right after the PR lookup, before label/edit/issue
+
     def test_failure_not_enrolled_skips_disable_auto(self):
         out, gh = self.run_ci(responses(ghstub.pr(branch=BR, head=HEAD)))
         self.assertEqual(gh.calls("pr", "merge"), [])

@@ -91,6 +91,9 @@ def run(a):
     sha = read_sha(fork, a.head_sha)
     has_label = LABEL in [x["name"] for x in pr.get("labels", [])]
     if a.conclusion in BAD:
+        disabled = bool(pr.get("autoMergeRequest"))
+        if disabled:   # disarm first: a failing label/issue operation must not leave auto-merge armed
+            gh("pr", "merge", str(n), "--disable-auto")
         gh("label", "create", LABEL, "--color", "d93f0b", "--description",
            "Local CI failed on an upstream-sync PR", "--force", check=False)
         gh("pr", "edit", str(n), "--add-label", LABEL)
@@ -107,9 +110,6 @@ def run(a):
             os.unlink(f.name)
         if p.returncode:
             raise GhError(f"sync_gh.py issue failed: {(p.stdout or p.stderr).strip()[:300]}")
-        disabled = bool(pr.get("autoMergeRequest"))
-        if disabled:
-            gh("pr", "merge", str(n), "--disable-auto")
         return emit(True, 0, "ci_failure", pr=n, conclusion=a.conclusion, sha=sha, label_added=True,
                     auto_merge_disabled=disabled)
     if a.conclusion == "success":
