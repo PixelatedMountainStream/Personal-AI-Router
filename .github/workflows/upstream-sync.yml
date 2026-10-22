@@ -99,7 +99,7 @@ jobs:
           git remote add upstream https://github.com/NVIDIA/Personal-AI-Router.git
           git fetch upstream --tags --quiet
           git fetch origin --quiet
-          for l in "upstream-sync 0e8a16 Upstream sync" "upstream-release 1d76db Sync carries a new upstream tag" "sync-failing d93f0b Sync needs repair" "workflow-review fbca04 Upstream workflow changes held for manual porting" "ci-failing b60205 Sync PR checks failing" "sync-demo c5def5 Simulated-upstream demo sync" "surface-budget-raise 5319e7 Raises the local surface budget"; do
+          for l in "upstream-sync 0e8a16 Upstream sync" "upstream-release 1d76db Sync carries a new upstream tag" "sync-failing d93f0b Sync needs repair" "workflow-review fbca04 Upstream workflow changes held for manual porting" "ci-failing b60205 Sync PR checks failing" "sync-demo c5def5 Simulated-upstream demo sync" "surface-budget-raise 5319e7 Raises the local surface budget" "sync-conflict e99695 Merge conflicts escalated; a human removes this after repairing"; do
             set -- $l; gh label create "$1" --color "$2" --description "${*:3}" 2>/dev/null || true
           done
 
@@ -119,6 +119,8 @@ jobs:
           echo "branch=$b" >> "$GITHUB_OUTPUT"
           echo "draft=$(jq -r .draft <<<"$json")" >> "$GITHUB_OUTPUT"
           echo "labels=$(jq -r '.labels | join(",")' <<<"$json")" >> "$GITHUB_OUTPUT"
+          # Snapshot of the enrollment time, taken BEFORE the disarm below, for the stalled check.
+          echo "enabled_at=$(jq -r '.auto_merge_enabled_at // empty' <<<"$json")" >> "$GITHUB_OUTPUT"
           # Disarm at once (same UPSTREAM_SYNC_TOKEN as the rest of this job: pull-requests write), before any checkout
           # or stalled reporting: a later tool error in this job must not leave the PR armed. Idempotent with publish.
           python3 "$RUNNER_TEMP/trusted/sync_gh.py" disable-auto --pr "$n"
@@ -129,8 +131,9 @@ jobs:
         if: steps.pr.outputs.number != ''
         env:
           PR_NUMBER: ${{ steps.pr.outputs.number }}
+          ENABLED_AT: ${{ steps.pr.outputs.enabled_at }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: python3 "$RUNNER_TEMP/trusted/sync_gh.py" stalled --pr "$PR_NUMBER" --run-url "$RUN_URL"
+        run: python3 "$RUNNER_TEMP/trusted/sync_gh.py" stalled --pr "$PR_NUMBER" --run-url "$RUN_URL" --enabled-at "$ENABLED_AT"
 
       - name: Status
         id: status

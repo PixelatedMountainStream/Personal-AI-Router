@@ -182,6 +182,13 @@ class Sync(unittest.TestCase):
         sf.write_text(json.dumps(st))
         r = self.sync("report", "--status", str(sf), "--merge", str(mf))[1]
         self.assertEqual((r["draft"], r["issue"], "sync-failing" in r["labels"]), (True, True, True))
+        self.assertIn("sync-conflict", r["labels"])   # conflict escalation: sticky label for a human to clear
+        ck = Path(self.tmp.name) / "ck.json"
+        ck.write_text(json.dumps({"ok": True, "escalate": False, "conflicts": [], "build_errors": [],
+                                  "test_failures": [], "surface_violations": []}))
+        r = self.sync("report", "--status", str(sf), "--check", str(ck), "--check-code", "0")[1]
+        self.assertEqual(r["outcome"], "clean")
+        self.assertNotIn("sync-conflict", r["labels"])
 
     def test_pending_branch_picks_up_later_tag_and_reuse_is_noop_safe(self):
         self.up_commit("a.txt", "2\n", tag="v1.1.0")

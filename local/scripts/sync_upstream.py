@@ -514,6 +514,22 @@ def derive_outcome(st, mg, guard, ck, check_code, stalled=False, veto=None):
     return "clean", extra
 
 
+def conflict_escalation(outcome, mg, ck):
+    """True when an escalate outcome stems from merge conflicts (merge-time or committed markers)."""
+    if outcome != "escalate":
+        return False
+    if mg.get("conflicts") or (isinstance(ck, dict) and ck.get("conflicts")):
+        return True
+    for x in (ck.get("surface_violations") if isinstance(ck, dict) else None) or []:
+        try:
+            d = json.loads(x) if isinstance(x, str) else x
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("kind") == "conflict_markers":
+            return True
+    return False
+
+
 def cmd_outcome(a, root):
     st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
     guard = load_json(a.guard) if a.guard and Path(a.guard).exists() else None
@@ -536,6 +552,8 @@ def cmd_report(a, root):
         labels = ["upstream-sync"] + (["upstream-release"] if st.get("release") else []) \
             + (["workflow-review"] if held_files else []) \
             + (["sync-failing"] if outcome in ("failing", "escalate") else [])
+    if conflict_escalation(outcome, mg, ck):   # sticky: only a human removes it, after repairing
+        labels.append("sync-conflict")
     if not st.get("ok", False):
         title = ""   # leave an open PR's title alone
     elif a.demo:

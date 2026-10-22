@@ -124,7 +124,7 @@ def cmd_issue(a):
 
 def cmd_stalled(a):
     p = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS)
-    at = enabled_at(p)
+    at = a.enabled_at or enabled_at(p)   # the pre-disarm snapshot wins: the PR is already disarmed here
     if not at:
         return emit("stalled", True, 0, stalled=False, age_hours=None, issue=None)
     age = datetime.now(timezone.utc) - datetime.fromisoformat(at.replace("Z", "+00:00"))
@@ -267,7 +267,7 @@ def check_prereqs(a):
         reasons.append("PR is cross-repository")
     if pr["isDraft"]:
         reasons.append("PR is still a draft")
-    for veto in ("workflow-review", "sync-failing", "ci-failing"):
+    for veto in ("workflow-review", "sync-failing", "ci-failing", "sync-conflict"):
         if veto in names(pr):
             reasons.append(f"PR carries the {veto} label")
     return reasons
@@ -299,12 +299,23 @@ def cmd_enroll(a):
         if p.returncode:
             reasons.append(f"gh pr merge --auto failed: {(p.stderr or p.stdout).strip()[:200]}")
     ok = not reasons
-    if not ok:
-        disable_auto(a.pr)   # disarm first: a failing report edit must never leave an armed auto-merge
-    line = f"Enrollment: enrolled at {a.head}" if ok else f"Enrollment: refused: {'; '.join(reasons)}"
-    report = Path(a.body)
-    report.write_text(set_enrollment_line(report.read_text() if report.exists() else "", line))
-    gh("pr", "edit", str(a.pr), "--body-file", str(report))
+    armed = ok   # auto-merge is on from here: any failure below must disarm it
+    try:
+        if not ok:
+            disable_auto(a.pr)   # disarm first: a failing report edit must never leave an armed auto-merge
+        line = f"Enrollment: enrolled at {a.head}" if ok else f"Enrollment: refused: {'; '.join(reasons)}"
+        report = Path(a.body)
+        report.write_text(set_enrollment_line(report.read_text() if report.exists() else "", line))
+        gh("pr", "edit", str(a.pr), "--body-file", str(report))
+    except Exception as e:
+        if not armed:
+            raise
+        try:
+            disable_auto(a.pr)
+        except Exception:
+            pass   # best effort: the workflow's next-run disarm and the red run remain
+        return emit("enroll", False, 1, outcome="enroll_refused", reasons=[f"post-arm error: {str(e)[:200]}"],
+                    kill_switch_only=False)
     return emit("enroll", ok, 0 if ok else 1, outcome="enrolled" if ok else "enroll_refused",
                 reasons=reasons, kill_switch_only=reasons == [ks_reason])
 
@@ -346,6 +357,7 @@ def main(argv=None):
     s.add_argument("--branch", help="exact head branch (a PR just created)")
     s = add("stalled", cmd_stalled)
     s.add_argument("--pr", type=int, required=True); s.add_argument("--run-url", required=True)
+    s.add_argument("--enabled-at", default="", help="enrollment timestamp snapshotted by find-pr before the disarm")
     s = add("disable-auto", cmd_disable_auto)
     s.add_argument("--pr", type=int, required=True)
     s = add("verify-pr", cmd_verify_pr)

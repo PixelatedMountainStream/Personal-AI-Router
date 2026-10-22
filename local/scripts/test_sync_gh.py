@@ -126,7 +126,7 @@ class T(unittest.TestCase):
         self.assertEqual(self.gh.calls("pr", "merge"), [])   # idempotent: nothing to disable
 
     def test_enroll_refuses_and_disarms_on_veto_labels(self):
-        for lab in ("workflow-review", "sync-failing", "ci-failing"):
+        for lab in ("workflow-review", "sync-failing", "ci-failing", "sync-conflict"):
             rs = enroll_responses()
             rs[1] = entry(["pr", "view"], ghstub.pr(labels=("upstream-sync", lab), enabled_at=hours_ago(1)))
             o = self.enroll(rs)
@@ -231,6 +231,36 @@ class T(unittest.TestCase):
                         "stalled", "--pr", "23", "--run-url", "u")
         self.assertFalse(o["stalled"])
         self.assertEqual(self.gh.calls("issue"), [])
+
+    def test_sync_conflict_label_persists_through_clean_run(self):
+        pr = ghstub.pr(labels=("upstream-sync", "sync-conflict"), enabled_at=hours_ago(1))   # clean run, label still on
+        rs = enroll_responses()
+        rs[1] = entry(["pr", "view"], pr)
+        o = self.enroll(rs)
+        self.assertEqual((self.code, o["outcome"]), (1, "enroll_refused"))
+        self.assertIn("PR carries the sync-conflict label", o["reasons"])
+        self.assertEqual(self.gh.calls("pr", "merge", "23", "--auto"), [])
+        self.assertTrue(self.gh.calls("pr", "merge", "23", "--disable-auto"))
+        self.run_gh([entry(["pr", "view"], ghstub.pr(draft=True, labels=("upstream-sync", "sync-conflict"))),
+                     entry(["pr", "ready"]), entry(["pr", "edit"])], "ready", "--pr", "23")
+        self.assertEqual(self.gh.calls("pr", "edit"), [])   # ready never removes it
+
+    def test_stalled_uses_pre_disarm_snapshot(self):
+        body = [entry(["issue", "list"], []), entry(["issue", "create"], "https://x/issues/9\n")]
+        o = self.run_gh([entry(["pr", "view"], ghstub.pr())] + body, "stalled", "--pr", "23", "--run-url", "u",
+                        "--enabled-at", hours_ago(30))   # PR already disarmed: autoMergeRequest is null
+        self.assertTrue(o["stalled"])
+        self.assertEqual(len(self.gh.calls("issue", "create")), 1)
+
+    def test_enroll_post_arm_failure_disarms_and_refuses(self):
+        rs = enroll_responses()
+        rs[1] = entry(["pr", "view"], ghstub.pr(enabled_at=hours_ago(1)))
+        rs[3] = entry(["pr", "edit"], code=1, stderr="edit boom")
+        o = self.enroll(rs)
+        self.assertEqual((self.code, o["outcome"], o["kill_switch_only"]), (1, "enroll_refused", False))
+        self.assertTrue(o["reasons"][0].startswith("post-arm error:"))
+        self.assertEqual(len(self.gh.calls("pr", "merge", "23", "--auto")), 1)
+        self.assertTrue(self.gh.calls("pr", "merge", "23", "--disable-auto"))
 
     def test_ready_removes_sync_failing(self):
         o = self.run_gh([entry(["pr", "view"], ghstub.pr(draft=True, labels=("upstream-sync", "sync-failing"))),
