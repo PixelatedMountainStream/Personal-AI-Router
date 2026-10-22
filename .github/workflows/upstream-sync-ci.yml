@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Reacts to a finished Local CI run on an upstream-sync/* PR (plan section 4.5). Runs the script from
+# develop only (never PR code); every event value reaches it through env, never through `run:`.
+name: Upstream sync CI
+
+on:
+  workflow_run:
+    workflows: ["Local CI"]
+    types: [completed]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync-ci
+  cancel-in-progress: false
+
+jobs:
+  react:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.head_repository.full_name == github.repository && startsWith(github.event.workflow_run.head_branch, 'upstream-sync/')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          persist-credentials: false
+      - name: React to Local CI result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_REPO: ${{ github.event.workflow_run.head_repository.full_name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: python3 local/scripts/sync_ci_event.py

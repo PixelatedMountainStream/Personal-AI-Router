@@ -15,7 +15,7 @@ on:
     pull_request:
         branches: [develop]
         # labeled/unlabeled re-gate when surface-budget-raise or upstream-sync is toggled.
-        types: [opened, synchronize, reopened, labeled, unlabeled]
+        types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 permissions:
     contents: read

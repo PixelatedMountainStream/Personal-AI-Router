@@ -24,6 +24,10 @@ on:
         required: false
         type: boolean
         default: false
+      demo_ref:
+        description: "Demo mode: origin test/upstream-sim-<n> branch standing in for upstream"
+        required: false
+        type: string
 
 # Least privilege by default; the two privileged jobs raise it. Candidate (merged) code is only ever
 # executed in the `check` job, which has read-only permissions and no PAT. The privileged jobs run
@@ -39,9 +43,12 @@ concurrency:
 # from a cache to the PAT or to a push.
 env:
   BASE: develop
+  DEMO_REF: ${{ inputs.demo_ref }}
 
 jobs:
   merge:
+    # While the kill switch is in demo mode the schedule is inert; only a manual (dispatch) demo run proceeds.
+    if: github.event_name != 'schedule' || vars.SYNC_AUTO_MERGE != 'demo'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions: { contents: write, pull-requests: write, issues: write }
@@ -56,10 +63,17 @@ jobs:
       code: ${{ steps.merge.outputs.code }}
       candidate: ${{ steps.bundle.outputs.candidate }}
       pr_labels: ${{ steps.pr.outputs.labels }}
+      # The original open sync PR (validated), carried to publish: publish never re-selects a PR.
+      pr_number: ${{ steps.pr.outputs.number }}
+      pr_branch: ${{ steps.pr.outputs.branch }}
       # Identity of what publish may push comes from this privileged job's outputs, never from artifacts.
       branch: ${{ steps.bundle.outputs.branch }}
       cand_sha: ${{ steps.bundle.outputs.cand_sha }}
       bundle_sha256: ${{ steps.bundle.outputs.bundle_sha256 }}
+      # Digests of every metadata file publish parses; "absent" means the file must not exist.
+      status_sha256: ${{ steps.digests.outputs.status_sha256 }}
+      merge_sha256: ${{ steps.digests.outputs.merge_sha256 }}
+      guard_sha256: ${{ steps.digests.outputs.guard_sha256 }}
     steps:
       - name: Require UPSTREAM_SYNC_TOKEN
         run: |
@@ -85,24 +99,41 @@ jobs:
           git remote add upstream https://github.com/NVIDIA/Personal-AI-Router.git
           git fetch upstream --tags --quiet
           git fetch origin --quiet
-          for l in "upstream-sync 0e8a16 Upstream sync" "upstream-release 1d76db Sync carries a new upstream tag" "sync-failing d93f0b Sync needs repair" "workflow-review fbca04 Upstream workflow changes held for manual porting"; do
+          for l in "upstream-sync 0e8a16 Upstream sync" "upstream-release 1d76db Sync carries a new upstream tag" "sync-failing d93f0b Sync needs repair" "workflow-review fbca04 Upstream workflow changes held for manual porting" "ci-failing b60205 Sync PR checks failing" "sync-demo c5def5 Simulated-upstream demo sync" "surface-budget-raise 5319e7 Raises the local surface budget" "sync-conflict e99695 Merge conflicts escalated; a human removes this after repairing"; do
             set -- $l; gh label create "$1" --color "$2" --description "${*:3}" 2>/dev/null || true
           done
 
       - name: Find the open sync PR
         id: pr
         run: |
-          # Only a same-repo PR from an upstream-sync/* branch is ever treated as the sync PR.
-          json=$(gh pr list --label upstream-sync --state open --base "$BASE" \
-            --json number,headRefName,isCrossRepository \
-            --jq '[.[] | select(.isCrossRepository == false and (.headRefName | startswith("upstream-sync/")))] | .[0] // empty')
-          [ -z "$json" ] && exit 0
-          n=$(jq -r .number <<<"$json"); b=$(jq -r .headRefName <<<"$json")
+          # Only a same-repo PR from an upstream-sync/* (demo: upstream-sync-demo/*) branch is ever treated as the sync PR.
+          find_args=(); [ -n "$DEMO_REF" ] && find_args+=(--demo)
+          json=$(python3 "$RUNNER_TEMP/trusted/sync_gh.py" find-pr "${find_args[@]}")
+          n=$(jq -r '.number // empty' <<<"$json")
+          [ -z "$n" ] && exit 0
+          b=$(jq -r .branch <<<"$json")
+          # Validated before it becomes a job output: publish trusts these two values.
+          [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::bad PR number from find-pr"; exit 1; }
+          [[ "$b" =~ ^upstream-sync(-demo)?/[A-Za-z0-9._-]+$ ]] || { echo "::error::bad PR branch from find-pr"; exit 1; }
           echo "number=$n" >> "$GITHUB_OUTPUT"
           echo "branch=$b" >> "$GITHUB_OUTPUT"
-          echo "labels=$(gh pr view "$n" --json labels --jq '[.labels[].name] | join(",")')" >> "$GITHUB_OUTPUT"
+          echo "draft=$(jq -r .draft <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "labels=$(jq -r '.labels | join(",")' <<<"$json")" >> "$GITHUB_OUTPUT"
+          # Snapshot of the enrollment time, taken BEFORE the disarm below, for the stalled check.
+          echo "enabled_at=$(jq -r '.auto_merge_enabled_at // empty' <<<"$json")" >> "$GITHUB_OUTPUT"
+          # Disarm at once (same UPSTREAM_SYNC_TOKEN as the rest of this job: pull-requests write), before any checkout
+          # or stalled reporting: a later tool error in this job must not leave the PR armed. Idempotent with publish.
+          python3 "$RUNNER_TEMP/trusted/sync_gh.py" disable-auto --pr "$n"
           # Merge into the open PR's branch so human commits are preserved.
           git checkout -q -B "$b" "origin/$b"
+
+      - name: Stalled enrollment
+        if: steps.pr.outputs.number != ''
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          ENABLED_AT: ${{ steps.pr.outputs.enabled_at }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 "$RUNNER_TEMP/trusted/sync_gh.py" stalled --pr "$PR_NUMBER" --run-url "$RUN_URL" --enabled-at "$ENABLED_AT"
 
       - name: Status
         id: status
@@ -116,6 +147,7 @@ jobs:
           args=(--root "$GITHUB_WORKSPACE" status --base HEAD --tags-base "origin/$BASE")
           [ -n "$REF_INPUT" ] && args+=(--ref "$REF_INPUT")
           [ "$FORCE_INPUT" = "true" ] && args+=(--force)
+          [ -n "$DEMO_REF" ] && args+=(--demo-ref "$DEMO_REF")
           [ -n "$PR_NUMBER" ] && args+=(--pending)   # nothing new + open PR => mode recheck (re-run checks)
           set +e
           python3 "$RUNNER_TEMP/trusted/sync_upstream.py" "${args[@]}" > "$RUNNER_TEMP/out/status.json"
@@ -137,6 +169,7 @@ jobs:
           args=(--root "$GITHUB_WORKSPACE" merge --base-ref "origin/$BASE")
           [ -n "$REF_INPUT" ] && args+=(--ref "$REF_INPUT")
           [ "$FORCE_INPUT" = "true" ] && args+=(--force)
+          [ -n "$DEMO_REF" ] && args+=(--demo-ref "$DEMO_REF")
           [ "$MODE" = "bump" ] && args+=(--bump-only)
           [ -n "$PR_BRANCH" ] && args+=(--reuse --branch "$PR_BRANCH")
           set +e
@@ -172,6 +205,17 @@ jobs:
             echo "bundle_sha256=$(sha256sum "$RUNNER_TEMP/out/cand.bundle" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
             echo "branch=$(git branch --show-current)" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Digest the metadata
+        id: digests
+        run: |
+          # Computed here, in the privileged job, before the artifact leaves it: the check job runs candidate code
+          # and could replace the sync-merge artifact, so publish authenticates each parsed file against these.
+          for k in status merge guard; do
+            f="$RUNNER_TEMP/out/$k.json"
+            if [ -f "$f" ]; then h=$(sha256sum "$f" | cut -d' ' -f1); else h=absent; fi
+            echo "${k}_sha256=$h" >> "$GITHUB_OUTPUT"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
@@ -222,6 +266,7 @@ jobs:
         run: |
           # Labels on the open sync PR (e.g. surface-budget-raise) reach the budget_raised rule.
           args=(); IFS=, read -ra labels <<<"$PR_LABELS"; for l in "${labels[@]}"; do [ -n "$l" ] && args+=(--label "$l"); done
+          [ -n "$DEMO_REF" ] && args+=(--demo-ref "$DEMO_REF")
           mkdir -p "$RUNNER_TEMP/check"
           set +e
           python3 local/scripts/sync_upstream.py check --base "origin/$BASE" "${args[@]}" > "$RUNNER_TEMP/check/check.json"
@@ -257,6 +302,16 @@ jobs:
       - name: Trust develop's scripts
         run: cp -R local/scripts "$RUNNER_TEMP/trusted"
 
+      # First, before any artifact is downloaded or verified: a tool/tamper failure below must not leave a carried
+      # PR armed. Re-arming happens only through the normal clean Enroll path.
+      - name: Disarm carried PR
+        if: always() && needs.merge.outputs.pr_number != ''
+        env:
+          PR_NUMBER: ${{ needs.merge.outputs.pr_number }}
+        run: |
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::bad carried PR number"; exit 1; }
+          python3 "$RUNNER_TEMP/trusted/sync_gh.py" disable-auto --pr "$PR_NUMBER"
+
       - uses: actions/download-artifact@v4
         with:
           name: sync-merge
@@ -268,37 +323,97 @@ jobs:
           name: sync-check-result
           path: ${{ runner.temp }}/chk   # separate directory: nothing from the check job can overwrite sync-merge files
 
+      - name: Verify merge metadata
+        env:
+          STATUS_SHA256: ${{ needs.merge.outputs.status_sha256 }}
+          MERGE_SHA256: ${{ needs.merge.outputs.merge_sha256 }}
+          GUARD_SHA256: ${{ needs.merge.outputs.guard_sha256 }}
+        run: |
+          # Same pattern as the bundle check: nothing downloaded is parsed before it matches the privileged job's output.
+          in="$RUNNER_TEMP/in"
+          verify() {
+            if [ "$2" = "absent" ]; then
+              [ ! -e "$in/$1" ] || { echo "::error::$1 present but the merge job emitted none"; exit 1; }
+            else
+              [ -n "$2" ] && echo "$2  $in/$1" | sha256sum -c - || { echo "::error::$1 hash mismatch"; exit 1; }
+            fi
+          }
+          verify status.json "$STATUS_SHA256"
+          verify merge.json "$MERGE_SHA256"
+          verify guard.json "$GUARD_SHA256"
+
+      - name: Head veto
+        id: veto
+        if: needs.merge.outputs.pr_number != ''
+        env:
+          PR_NUMBER: ${{ needs.merge.outputs.pr_number }}
+          CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
+        run: |
+          # An escalate/failing marker pinned to the PR head vetoes `clean` while that head is unchanged.
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::bad carried PR number"; exit 1; }
+          json=$(python3 "$RUNNER_TEMP/trusted/sync_gh.py" veto --pr "$PR_NUMBER" --cand "$CAND_SHA")
+          echo "outcome=$(jq -r .outcome <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r .head_sha <<<"$json")" >> "$GITHUB_OUTPUT"
+
       - name: Report
         id: report
         env:
+          VETO_OUTCOME: ${{ steps.veto.outputs.outcome }}
+          PR_HEAD_SHA: ${{ steps.veto.outputs.head_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CHECK_CODE: ${{ needs.check.outputs.code }}
+          CHECK_RESULT: ${{ needs.check.result }}
+          MERGE_BRANCH: ${{ needs.merge.outputs.branch }}
+          CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
+          ORIG_PR_BRANCH: ${{ needs.merge.outputs.pr_branch }}
         run: |
           in="$RUNNER_TEMP/in"
-          python3 "$RUNNER_TEMP/trusted/sync_upstream.py" --root "$GITHUB_WORKSPACE" report --status "$in/status.json" \
-            --merge "$in/merge.json" --guard "$in/guard.json" --check "$RUNNER_TEMP/chk/check.json" --check-code "$CHECK_CODE" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/report.json"
+          # Anything but a successful check job is never a pass: an empty exit code derives as failing.
+          [ "$CHECK_RESULT" = "success" ] || CHECK_CODE=""
+          args=(--root "$GITHUB_WORKSPACE" report --status "$in/status.json" --merge "$in/merge.json" --guard "$in/guard.json"
+            --check "$RUNNER_TEMP/chk/check.json" --check-code "$CHECK_CODE" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md")
+          [ -n "$VETO_OUTCOME" ] && args+=(--veto-outcome "$VETO_OUTCOME")
+          head="${CAND_SHA:-$PR_HEAD_SHA}"; [ -n "$head" ] && args+=(--head-sha "$head")
+          [ -n "$MERGE_BRANCH" ] && args+=(--branch "$MERGE_BRANCH")
+          [ -n "$ORIG_PR_BRANCH" ] && args+=(--pr-branch "$ORIG_PR_BRANCH")
+          [ -n "$DEMO_REF" ] && args+=(--demo)
+          python3 "$RUNNER_TEMP/trusted/sync_upstream.py" "${args[@]}" > "$RUNNER_TEMP/report.json"
           cat "$RUNNER_TEMP/report.json"
-          for k in outcome title draft issue push issue_title; do
+          for k in outcome title draft issue push issue_title issue_key; do
             echo "$k=$(jq -r ".$k" "$RUNNER_TEMP/report.json")" >> "$GITHUB_OUTPUT"
           done
           echo "labels=$(jq -r '.labels | join(",")' "$RUNNER_TEMP/report.json")" >> "$GITHUB_OUTPUT"
 
-      - name: Publish (PR and issue)
+      - name: Publish PR
+        id: publish
         env:
           OUTCOME: ${{ steps.report.outputs.outcome }}
           PUSH: ${{ steps.report.outputs.push }}
           TITLE: ${{ steps.report.outputs.title }}
           DRAFT: ${{ steps.report.outputs.draft }}
-          WANT_ISSUE: ${{ steps.report.outputs.issue }}
-          ISSUE_TITLE: ${{ steps.report.outputs.issue_title }}
           LABELS: ${{ steps.report.outputs.labels }}
           BRANCH: ${{ needs.merge.outputs.branch }}
+          PR_NUMBER: ${{ needs.merge.outputs.pr_number }}
+          PR_FOUND_BRANCH: ${{ needs.merge.outputs.pr_branch }}
           CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
           BUNDLE_SHA256: ${{ needs.merge.outputs.bundle_sha256 }}
         run: |
           in="$RUNNER_TEMP/in"; body="$RUNNER_TEMP/report.md"
-          PR_NUMBER=$(gh pr list --label upstream-sync --state open --base "$BASE" --json number,headRefName,isCrossRepository \
-            --jq '[.[] | select(.isCrossRepository == false and (.headRefName | startswith("upstream-sync/")))] | .[0].number // empty')
+          gh_sync() { python3 "$RUNNER_TEMP/trusted/sync_gh.py" "$@"; }
+          find_args=(); [ -n "$DEMO_REF" ] && find_args+=(--demo)
+          # The existing PR is the one the merge job carried (number + branch, validated there); it is never
+          # re-selected here. Its identity is re-verified by number before every mutation. A mismatch fails the
+          # run without touching any other PR.
+          [[ -z "$PR_NUMBER" || "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::bad carried PR number"; exit 1; }
+          verify_pr() { gh_sync verify-pr --pr "$PR_NUMBER" --branch "${PR_FOUND_BRANCH:-$BRANCH}" || { echo "::error::PR #$PR_NUMBER identity mismatch (branch/base/repo)"; exit 1; }; }
+          # An armed auto-merge must never survive a push to its PR (disarm first: the PAT push would otherwise re-run
+          # checks under it), nor any non-clean outcome, pushed or not (e.g. a workflow-guard escalate with push=false).
+          # Disarm is by the carried number and comes before any verification, so a failing verify cannot skip it.
+          if [ -n "$PR_NUMBER" ] && { [ "$PUSH" = "true" ] || [ "$OUTCOME" != "clean" ]; }; then
+            gh_sync disable-auto --pr "$PR_NUMBER"
+          fi
+          [ -z "$PR_NUMBER" ] || verify_pr
+          [ -z "$PR_NUMBER" ] || verify_pr
           if [ "$PUSH" = "true" ] && [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
             # Everything downloaded is data. Verify it against the privileged job's outputs before using it.
             echo "$BUNDLE_SHA256  $in/cand.bundle" | sha256sum -c - || { echo "::error::bundle hash mismatch"; exit 1; }
@@ -309,30 +424,130 @@ jobs:
               --base "origin/$BASE" --cand "$CAND_SHA" || { echo "::error::candidate differs from develop under .github/workflows; refusing to push"; exit 1; }
             # Never push anywhere but a sync branch (a conflicted merge is committed with markers; the draft PR blocks it).
             dest="refs/heads/$BRANCH"
-            case "$dest" in refs/heads/upstream-sync/*) ;; *) echo "::error::refusing to push to $dest"; exit 1;; esac
+            case "$dest" in refs/heads/upstream-sync/*|refs/heads/upstream-sync-demo/*) ;; *) echo "::error::refusing to push to $dest"; exit 1;; esac
+            [ -z "$PR_NUMBER" ] || verify_pr
+            # A conflict escalation on a carried PR must hold the sync-conflict label BEFORE the conflicted head is
+            # pushed, so a failed post-push edit cannot leave an unlabelled conflicted head. Abort without pushing.
+            case ",$LABELS," in *,sync-conflict,*) [ -z "$PR_NUMBER" ] || gh_sync mark-conflict --pr "$PR_NUMBER" || { echo "::error::could not set/verify sync-conflict on PR #$PR_NUMBER; not pushing"; exit 1; };; esac
             git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/candidate:$dest"
           fi
           title=(); [ -n "$TITLE" ] && title=(--title "$TITLE")
           if [ -n "$PR_NUMBER" ] && [ "$PUSH" = "true" ]; then
+            verify_pr
             gh pr edit "$PR_NUMBER" "${title[@]}" --body-file "$body" --add-label "$LABELS"
-            if [ "$OUTCOME" = "clean" ]; then
-              gh pr edit "$PR_NUMBER" --remove-label sync-failing || true
-              gh pr ready "$PR_NUMBER" || true
-            elif [ "$DRAFT" = "true" ]; then
+            if [ "$OUTCOME" != "clean" ] && [ "$DRAFT" = "true" ]; then
               gh pr ready "$PR_NUMBER" --undo || true
             fi
           elif [ "$PUSH" = "true" ] && [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
             extra=(); [ "$DRAFT" = "true" ] && extra+=(--draft)
             gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$body" --label "$LABELS" "${extra[@]}"
           fi
-          if [ "$WANT_ISSUE" = "true" ]; then
-            n=$(gh issue list --label upstream-sync --state open --json number --jq '.[0].number')
-            if [ -n "$n" ]; then
-              gh issue edit "$n" --title "$ISSUE_TITLE" --add-label "$LABELS"
-              gh issue comment "$n" --body-file "$body"
-            else
-              gh issue create --label "$LABELS" --title "$ISSUE_TITLE" --body-file "$body"
-            fi
+          # A clean existing PR is always made ready (the helper un-drafts only if needed and drops sync-failing).
+          if [ -n "$PR_NUMBER" ] && [ "$OUTCOME" = "clean" ]; then
+            verify_pr
+            gh_sync ready --pr "$PR_NUMBER"
           fi
-          # A failing or escalated sync still fails the run so it is visible.
-          [ "$OUTCOME" = "clean" ]
+          # A PR just created is looked up once, by the branch we pushed only, then verified; the carried one is kept.
+          if [ -z "$PR_NUMBER" ] && [ "$PUSH" = "true" ] && [ -n "$BRANCH" ]; then
+            found=$(gh_sync find-pr "${find_args[@]}" --branch "$BRANCH")
+            PR_NUMBER=$(jq -r '.number // empty' <<<"$found")
+            PR_FOUND_BRANCH=$(jq -r '.branch // empty' <<<"$found")
+            [ -z "$PR_NUMBER" ] || { [ "$PR_FOUND_BRANCH" = "$BRANCH" ] && verify_pr; } || { echo "::error::created PR does not match $BRANCH"; exit 1; }
+            # A new conflict PR: verify the label landed at creation; add it if missing, else fail the run.
+            case ",$LABELS," in *,sync-conflict,*) [ -z "$PR_NUMBER" ] || gh_sync mark-conflict --pr "$PR_NUMBER" || { echo "::error::sync-conflict missing on new PR #$PR_NUMBER"; exit 1; };; esac
+          fi
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "branch=${PR_FOUND_BRANCH:-$BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Enroll
+        id: enroll
+        if: steps.report.outputs.outcome == 'clean' && needs.check.result == 'success' && steps.publish.outputs.number != ''
+        env:
+          PR_NUMBER: ${{ steps.publish.outputs.number }}
+          PR_BRANCH: ${{ steps.publish.outputs.branch }}
+          CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # Kill switch: enroll_refused (kill_switch_only) unless this is 'on' (regular) or 'demo' (demo ref).
+          SYNC_AUTO_MERGE: ${{ vars.SYNC_AUTO_MERGE }}
+        run: |
+          echo "enrolled=false" >> "$GITHUB_OUTPUT"
+          [ -n "$CAND_SHA" ] || { echo "::error::no candidate sha to enroll"; exit 0; }
+          python3 "$RUNNER_TEMP/trusted/sync_gh.py" verify-pr --pr "$PR_NUMBER" --branch "$PR_BRANCH" \
+            || { echo "::error::PR #$PR_NUMBER identity mismatch (branch/base/repo); not enrolling"; exit 1; }
+          set +e
+          python3 "$RUNNER_TEMP/trusted/sync_gh.py" enroll --pr "$PR_NUMBER" --head "$CAND_SHA" --demo-ref "$DEMO_REF" \
+            --config "$GITHUB_WORKSPACE/local/upstream-sync.toml" --body "$RUNNER_TEMP/report.md" > "$RUNNER_TEMP/enroll.json"
+          code=$?
+          set -e
+          cat "$RUNNER_TEMP/enroll.json"
+          if [ "$code" = "0" ]; then
+            echo "enrolled=true" >> "$GITHUB_OUTPUT"
+          elif [ "$code" = "1" ]; then
+            # Refused. A kill-switch-only refusal is expected while the switch is off: no issue, but the run is still red.
+            if [ "$(jq -r '.kill_switch_only' "$RUNNER_TEMP/enroll.json")" != "true" ]; then
+              python3 "$RUNNER_TEMP/trusted/sync_gh.py" issue --branch "$PR_BRANCH" --outcome enroll_refused \
+                --title "Upstream sync needs attention: $PR_BRANCH [enroll_refused]" --body-file "$RUNNER_TEMP/report.md" \
+                --sha "$CAND_SHA" --run-url "$RUN_URL"
+            fi
+          else
+            echo "::error::sync_gh.py enroll failed (exit $code)"
+          fi
+
+      - name: File issue
+        if: steps.report.outputs.issue == 'true'
+        env:
+          ISSUE_KEY: ${{ steps.report.outputs.issue_key }}
+          ISSUE_TITLE: ${{ steps.report.outputs.issue_title }}
+          LABELS: ${{ steps.report.outputs.labels }}
+          CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Every non-clean outcome. issue_key is "<branch> <outcome>"; sync_gh adds the upstream-sync label itself.
+          key_branch="${ISSUE_KEY% *}"; key_outcome="${ISSUE_KEY##* }"
+          labels=(); IFS=, read -ra all <<<"$LABELS"; for l in "${all[@]}"; do [ -n "$l" ] && [ "$l" != "upstream-sync" ] && labels+=("$l"); done
+          args=(issue --branch "$key_branch" --outcome "$key_outcome" --title "$ISSUE_TITLE" --body-file "$RUNNER_TEMP/report.md"
+            --sha "${CAND_SHA:-unknown}" --run-url "$RUN_URL")
+          [ "${#labels[@]}" -gt 0 ] && args+=(--labels "${labels[@]}")
+          python3 "$RUNNER_TEMP/trusted/sync_gh.py" "${args[@]}"
+
+      - name: Sweep stale issues
+        if: always() && steps.report.outcome == 'success'
+        env:
+          OUTCOME: ${{ steps.report.outputs.outcome }}
+          LABELS: ${{ steps.report.outputs.labels }}
+        run: |
+          # Held-workflow drift issue closes only when this run saw none (no workflow-review label) and ran to a verdict.
+          args=(sweep)
+          case "$OUTCOME" in clean|failing) case ",$LABELS," in *,workflow-review,*) ;; *) args+=(--no-held-drift);; esac;; esac
+          python3 "$RUNNER_TEMP/trusted/sync_gh.py" "${args[@]}"
+
+      - name: Final exit
+        if: always()
+        env:
+          ENROLLED: ${{ steps.enroll.outputs.enrolled }}
+          OUTCOME: ${{ steps.report.outputs.outcome }}
+        run: |
+          # Green only when the PR ended enrolled (gap 6): every other run, including a kill-switch-only refusal, is red.
+          [ "$ENROLLED" = "true" ] && exit 0
+          echo "::error::sync outcome '$OUTCOME' did not end enrolled"
+          exit 1
+
+  # No-change runs (mode=none) skip publish; they still sweep stale issues and end green. The "red unless
+  # enrolled" rule above applies only to runs that produced or updated a sync PR.
+  sweep:
+    needs: [merge, publish]
+    if: always() && needs.merge.result == 'success' && needs.publish.result == 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: { contents: read, pull-requests: read, issues: write }
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: develop
+          persist-credentials: false
+
+      - name: Sweep stale issues
+        run: python3 local/scripts/sync_gh.py sweep   # no held-drift flag: nothing was evaluated in a no-change run
