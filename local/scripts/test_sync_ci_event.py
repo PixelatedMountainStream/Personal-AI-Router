@@ -58,6 +58,25 @@ class T(unittest.TestCase):
         order = [c[:2] for c in gh.calls() if c[0] in ("pr", "label", "issue")]
         self.assertEqual(order.index(["pr", "merge"]), 1)   # right after the PR lookup, before label/edit/issue
 
+    def test_disarm_survives_contents_error(self):
+        pr = ghstub.pr(branch=BR, head=HEAD, enabled_at="2026-10-21T10:00:00Z")
+        resp = [entry(["api"], "", 1)] + responses(pr)
+        gh = ghstub.Stub(resp)
+        env = gh.env()
+        env.update(GH_REPO="o/r", HEAD_BRANCH=BR, HEAD_SHA=HEAD, HEAD_REPO="o/r", CONCLUSION="failure", RUN_URL="u")
+        p = subprocess.run([sys.executable, str(HERE / "sync_ci_event.py")], capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn(["pr", "merge", "23", "--disable-auto"], gh.calls("pr", "merge"))
+
+    def test_ambiguous_or_other_base_noop(self):
+        for prs in ([ghstub.pr(branch=BR, head=HEAD), ghstub.pr(number=24, branch=BR, head=HEAD)],
+                    [ghstub.pr(branch=BR, head=HEAD, base="main")]):
+            resp = responses(None)
+            resp[0] = entry(["pr", "list"], prs)
+            out, gh = self.run_ci(resp)
+            self.assertEqual(out["action"], "noop")
+            self.assertEqual(gh.calls("pr", "merge"), [])
+
     def test_failure_not_enrolled_skips_disable_auto(self):
         out, gh = self.run_ci(responses(ghstub.pr(branch=BR, head=HEAD)))
         self.assertEqual(gh.calls("pr", "merge"), [])

@@ -169,6 +169,24 @@ class T(unittest.TestCase):
             o = self.enroll(rs)
             self.assertIn("malformed rules/branches/develop", o["reasons"], rules)
 
+    def test_enroll_strict_validation_refuses_and_disarms(self):
+        rs = enroll_responses(); rs[4] = entry([API, f"{R}/rules/branches/develop"], [{}])
+        self.assertIn("malformed rules/branches/develop", self.enroll(rs)["reasons"])
+        prot = ghstub.protection(CHECKS); prot["required_pull_request_reviews"] = {}
+        self.assertIn("protection reviews required", self.enroll(enroll_responses(prot=prot))["reasons"])
+        rs = enroll_responses(); rs[0] = entry([API, R], None)
+        o = self.enroll(rs)
+        self.assertEqual(o["outcome"], "enroll_refused")
+        self.assertIn(f"malformed {R}", o["reasons"])
+        self.assertTrue(self.gh.calls("pr", "view"))   # disarm path ran (pr view autoMergeRequest)
+
+    def test_verify_pr(self):
+        ok = self.run_gh([entry(["pr", "view"], ghstub.pr())], "verify-pr", "--pr", "23", "--branch", "upstream-sync/20261021-b494470a03")
+        self.assertEqual((self.code, ok["ok"]), (0, True))
+        for pr in (ghstub.pr(branch="upstream-sync/other"), ghstub.pr(base="main"), ghstub.pr(cross=True)):
+            self.run_gh([entry(["pr", "view"], pr)], "verify-pr", "--pr", "23", "--branch", "upstream-sync/20261021-b494470a03")
+            self.assertEqual(self.code, 1)
+
     def test_refusal_disarms_before_editing_body(self):
         rs = enroll_responses(repo=ghstub.repo(auto=False))
         rs[1] = entry(["pr", "view"], ghstub.pr(enabled_at=hours_ago(1)))

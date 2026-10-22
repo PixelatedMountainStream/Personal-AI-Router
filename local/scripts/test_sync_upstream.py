@@ -225,6 +225,14 @@ class Sync(unittest.TestCase):
         self.assertEqual(self.sync("status")[1]["mode"], "none")
         self.assertEqual(self.sync("status", "--pending")[1]["mode"], "recheck")
 
+    def test_inconsistent_check_is_failing(self):
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        for ck, code in (({"ok": True, "escalate": False}, "1"),
+                         ({"ok": True, "escalate": False, "test_failures": ["t"]}, "0"),
+                         ({"ok": True, "escalate": False, "build_errors": ["b"]}, "0")):
+            args = self.results(st, {"ok": True}, ck)
+            self.assertEqual(self.sync("outcome", *args, "--check-code", code)[1]["outcome"], "failing", (ck, code))
+
     def test_tool_errors_escalate_and_malformed_check_never_clean(self):
         self.up_commit("a.txt", "2\n")
         self.fetch()

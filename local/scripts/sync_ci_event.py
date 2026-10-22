@@ -23,7 +23,7 @@ HERE = Path(__file__).resolve().parent
 PREFIX = "upstream-sync/"
 LABEL = "ci-failing"
 BAD = ("failure", "cancelled", "timed_out")
-PR_FIELDS = "number,headRefOid,labels,autoMergeRequest,isCrossRepository"
+PR_FIELDS = "number,headRefOid,labels,autoMergeRequest,isCrossRepository,baseRefName"
 
 
 class GhError(Exception):
@@ -80,20 +80,21 @@ def run(a):
         return noop("branch is not an upstream-sync branch")
     if a.head_repo != os.environ.get("GH_REPO"):
         return noop("head repo is not the fork")
-    prs = gh_json("pr", "list", "--head", a.head_branch, "--state", "open", "--json", PR_FIELDS) or []
-    prs = [p for p in prs if not p.get("isCrossRepository")]
-    if not prs:
-        return noop("no open PR for branch")
-    pr = max(prs, key=lambda p: p["number"])
+    prs = gh_json("pr", "list", "--head", a.head_branch, "--base", "develop", "--state", "open",
+                  "--json", PR_FIELDS) or []
+    prs = [p for p in prs if not p.get("isCrossRepository") and p.get("baseRefName") == "develop"]
+    if len(prs) != 1:
+        return noop("no open PR for branch" if not prs else "ambiguous: multiple open PRs for branch")
+    pr = prs[0]
     n = pr["number"]
     if pr["headRefOid"] != a.head_sha:
         return noop("stale head", pr=n, pr_head=pr["headRefOid"])
+    disabled = bool(pr.get("autoMergeRequest"))
+    if a.conclusion in BAD and disabled:   # disarm first: before any other read or report op can fail
+        gh("pr", "merge", str(n), "--disable-auto")
     sha = read_sha(fork, a.head_sha)
     has_label = LABEL in [x["name"] for x in pr.get("labels", [])]
     if a.conclusion in BAD:
-        disabled = bool(pr.get("autoMergeRequest"))
-        if disabled:   # disarm first: a failing label/issue operation must not leave auto-merge armed
-            gh("pr", "merge", str(n), "--disable-auto")
         gh("label", "create", LABEL, "--color", "d93f0b", "--description",
            "Local CI failed on an upstream-sync PR", "--force", check=False)
         gh("pr", "edit", str(n), "--add-label", LABEL)

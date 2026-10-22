@@ -4,7 +4,7 @@
 
 """All `gh` calls of the PAIR upstream sync (plan section 4.4/4.5). Stdlib only; honours GH_REPO.
 
-Subcommands: find-pr | stalled | disable-auto | ready | enroll | issue | sweep.
+Subcommands: find-pr | verify-pr | stalled | disable-auto | ready | enroll | issue | sweep.
 Each prints ONE JSON object {ok, step, ...}. Exit codes: 0 ok, 1 the outcome is not clean (enroll
 refused, issue skipped), 2 a gh call failed. The workflow decides the run's exit status.
 """
@@ -69,10 +69,10 @@ def cmd_find_pr(a):
     prs = gh_json("pr", "list", "--base", "develop", "--label", label, "--state", "open", "--limit", "50", "--json", PR_FIELDS) or []
     prs = [p for p in prs if not p["isCrossRepository"] and p["headRefName"].startswith(prefix)]
     if not prs:
-        return emit("find-pr", True, 0, number=None, branch=None, draft=None, labels=[],
+        return emit("find-pr", True, 0, number=None, branch=None, draft=None, base=None, labels=[],
                     auto_merge_enabled_at=None, head_sha=None)
     p = max(prs, key=lambda x: x["number"])
-    return emit("find-pr", True, 0, number=p["number"], branch=p["headRefName"], draft=p["isDraft"],
+    return emit("find-pr", True, 0, number=p["number"], branch=p["headRefName"], draft=p["isDraft"], base=p["baseRefName"],
                 labels=names(p), auto_merge_enabled_at=enabled_at(p), head_sha=p["headRefOid"])
 
 
@@ -120,6 +120,16 @@ def cmd_stalled(a):
     r = file_issue(branch, "enroll_stalled", f"Upstream sync needs attention: {branch} [enroll_stalled]",
                    body, p["headRefOid"], a.run_url, [])
     return emit("stalled", True, 0, stalled=True, age_hours=hours, issue=r)
+
+
+def cmd_verify_pr(a):
+    """Re-verify a PR identity by number: branch, base develop, same repo. Mismatch -> exit 1 (fail the run)."""
+    p = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS)
+    p = p if isinstance(p, dict) else {}
+    why = [w for w, bad in ((f"head is {p.get('headRefName')!r}, not {a.branch!r}", p.get("headRefName") != a.branch),
+                            (f"base is {p.get('baseRefName')!r}, not 'develop'", p.get("baseRefName") != "develop"),
+                            ("PR is cross-repository", p.get("isCrossRepository") is not False)) if bad]
+    return emit("verify-pr", not why, 1 if why else 0, pr=a.pr, reasons=why)
 
 
 def disable_auto(pr):
@@ -176,6 +186,8 @@ def check_prereqs(a):
     r, err = read_api(f"repos/{f}")
     if err:
         reasons.append(err)
+    elif not isinstance(r, dict) or not all(isinstance(r.get(k), bool) for k in ("allow_auto_merge", "allow_merge_commit")):
+        reasons.append(f"malformed repos/{f}")
     else:
         for k in ("allow_auto_merge", "allow_merge_commit"):
             if r.get(k) is not True:
@@ -192,7 +204,7 @@ def check_prereqs(a):
         if (not isinstance(rsc, dict) or not isinstance(rsc.get("strict"), bool) or not isinstance(checks, list)
                 or not all(isinstance(c, dict) for c in checks)
                 or not isinstance(lin, dict) or not isinstance(lin.get("enabled"), bool)
-                or not (rv is None or isinstance(rv, dict))):
+                or not ("required_pull_request_reviews" not in p or isinstance(rv, dict))):
             reasons.append(f"malformed {ep}")
         else:
             got = {c.get("context") for c in checks}
@@ -202,18 +214,21 @@ def check_prereqs(a):
                 reasons.append("protection requires up-to-date branches (strict)")
             if lin["enabled"]:
                 reasons.append("protection requires linear history")
-            if rv:
-                reasons.append("protection requires approving reviews")
+            if "required_pull_request_reviews" in p:
+                reasons.append("protection reviews required")
     rules, err = read_api(f"repos/{f}/rules/branches/develop")
     if err:
         reasons.append(err)
-    elif not isinstance(rules, list) or not all(isinstance(x, dict) for x in rules):
+    elif not isinstance(rules, list) or not all(isinstance(x, dict) and isinstance(x.get("type"), str) for x in rules):
         reasons.append("malformed rules/branches/develop")
     else:
         bad = sorted({x.get("type") for x in rules if x.get("type") in BAD_RULES})
         if bad:
             reasons.append(f"rules on develop: {bad}")
     pr = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS)
+    if not isinstance(pr, dict) or not isinstance(pr.get("isDraft"), bool):
+        reasons.append("malformed pr view")
+        return reasons
     if pr.get("baseRefName") != "develop":
         reasons.append(f"PR base is {pr.get('baseRefName')!r}, not 'develop'")
     if pr.get("isCrossRepository") is not False:
@@ -235,7 +250,10 @@ def set_enrollment_line(body, line):
 
 
 def cmd_enroll(a):
-    reasons = check_prereqs(a)
+    try:
+        reasons = check_prereqs(a)
+    except (GhError, AttributeError, KeyError, TypeError, ValueError) as e:
+        reasons = [f"malformed prerequisite response: {str(e)[:100]}"]
     ks_reason = None
     if not kill_switch_ok(a.demo_ref):
         ks_reason = (f"kill switch SYNC_AUTO_MERGE={os.environ.get('SYNC_AUTO_MERGE')!r} does not permit "
@@ -294,6 +312,8 @@ def main(argv=None):
     s.add_argument("--pr", type=int, required=True); s.add_argument("--run-url", required=True)
     s = add("disable-auto", cmd_disable_auto)
     s.add_argument("--pr", type=int, required=True)
+    s = add("verify-pr", cmd_verify_pr)
+    s.add_argument("--pr", type=int, required=True); s.add_argument("--branch", required=True)
     s = add("ready", cmd_ready)
     s.add_argument("--pr", type=int, required=True)
     s = add("enroll", cmd_enroll)

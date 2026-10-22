@@ -471,7 +471,8 @@ def derive_outcome(st, mg, guard, ck, check_code, stalled=False):
     if check_code not in (None, "", "0", "1") or not valid_check(ck) or ck.get("escalate"):
         # tool-error exit, missing or malformed check result is never a pass
         return "escalate", extra
-    if not ck["ok"]:
+    dirty = any(ck.get(k) for k in ("build_errors", "test_failures", "surface_violations"))
+    if not ck["ok"] or check_code == "1" or dirty:   # clean needs exit 0 (absent only in tests), ok, empty failure fields
         return "failing", extra
     if held_of(st, mg).get("files"):
         return "workflow_review", extra
