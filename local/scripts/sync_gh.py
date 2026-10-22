@@ -4,7 +4,7 @@
 
 """All `gh` calls of the PAIR upstream sync (plan section 4.4/4.5). Stdlib only; honours GH_REPO.
 
-Subcommands: find-pr | verify-pr | stalled | disable-auto | veto | ready | enroll | issue | sweep.
+Subcommands: find-pr | verify-pr | stalled | disable-auto | veto | mark-conflict | ready | enroll | issue | sweep.
 Each prints ONE JSON object {ok, step, ...}. Exit codes: 0 ok, 1 the outcome is not clean (enroll
 refused, issue skipped), 2 a gh call failed. The workflow decides the run's exit status.
 """
@@ -169,6 +169,14 @@ def cmd_veto(a):
     if v and a.cand and a.cand != p.get("headRefOid"):
         v = None   # this run's candidate is a new head: the veto is cleared
     return emit("veto", True, 0, outcome=v or "", head_sha=p.get("headRefOid") or "")
+
+
+def cmd_mark_conflict(a):
+    """Add the sync-conflict label to a PR and verify it is present. Not present afterwards -> exit 1 (caller aborts)."""
+    gh("pr", "edit", str(a.pr), "--add-label", "sync-conflict")
+    p = gh_json("pr", "view", str(a.pr), "--json", "labels")
+    ok = "sync-conflict" in names(p if isinstance(p, dict) else {})
+    return emit("mark-conflict", ok, 0 if ok else 1, pr=a.pr, label_present=ok)
 
 
 def cmd_ready(a):
@@ -366,6 +374,8 @@ def main(argv=None):
     s.add_argument("--pr", type=int, required=True)
     s = add("veto", cmd_veto)
     s.add_argument("--pr", type=int, required=True); s.add_argument("--cand", default="")
+    s = add("mark-conflict", cmd_mark_conflict)
+    s.add_argument("--pr", type=int, required=True)
     s = add("enroll", cmd_enroll)
     s.add_argument("--pr", type=int, required=True); s.add_argument("--head", required=True)
     s.add_argument("--demo-ref", default=""); s.add_argument("--body", required=True, help="report.md")

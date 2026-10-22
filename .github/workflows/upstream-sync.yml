@@ -426,6 +426,9 @@ jobs:
             dest="refs/heads/$BRANCH"
             case "$dest" in refs/heads/upstream-sync/*|refs/heads/upstream-sync-demo/*) ;; *) echo "::error::refusing to push to $dest"; exit 1;; esac
             [ -z "$PR_NUMBER" ] || verify_pr
+            # A conflict escalation on a carried PR must hold the sync-conflict label BEFORE the conflicted head is
+            # pushed, so a failed post-push edit cannot leave an unlabelled conflicted head. Abort without pushing.
+            case ",$LABELS," in *,sync-conflict,*) [ -z "$PR_NUMBER" ] || gh_sync mark-conflict --pr "$PR_NUMBER" || { echo "::error::could not set/verify sync-conflict on PR #$PR_NUMBER; not pushing"; exit 1; };; esac
             git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/heads/candidate:$dest"
           fi
           title=(); [ -n "$TITLE" ] && title=(--title "$TITLE")
@@ -450,6 +453,8 @@ jobs:
             PR_NUMBER=$(jq -r '.number // empty' <<<"$found")
             PR_FOUND_BRANCH=$(jq -r '.branch // empty' <<<"$found")
             [ -z "$PR_NUMBER" ] || { [ "$PR_FOUND_BRANCH" = "$BRANCH" ] && verify_pr; } || { echo "::error::created PR does not match $BRANCH"; exit 1; }
+            # A new conflict PR: verify the label landed at creation; add it if missing, else fail the run.
+            case ",$LABELS," in *,sync-conflict,*) [ -z "$PR_NUMBER" ] || gh_sync mark-conflict --pr "$PR_NUMBER" || { echo "::error::sync-conflict missing on new PR #$PR_NUMBER"; exit 1; };; esac
           fi
           echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "branch=${PR_FOUND_BRANCH:-$BRANCH}" >> "$GITHUB_OUTPUT"

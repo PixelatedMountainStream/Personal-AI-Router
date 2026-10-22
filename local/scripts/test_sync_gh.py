@@ -269,6 +269,23 @@ class T(unittest.TestCase):
         self.assertEqual(self.gh.calls("pr", "edit"), [["pr", "edit", "23", "--remove-label", "sync-failing"]])
         self.assertIn("draft_after", o)
 
+    def test_mark_conflict_adds_and_verifies(self):
+        o = self.run_gh([entry(["pr", "edit"]), entry(["pr", "view"], {"labels": [ghstub.label("sync-conflict")]})],
+                        "mark-conflict", "--pr", "23")
+        self.assertEqual((self.code, o["label_present"]), (0, True))
+        self.assertEqual(self.gh.calls("pr", "edit"), [["pr", "edit", "23", "--add-label", "sync-conflict"]])
+
+    def test_mark_conflict_add_fails_is_nonzero_and_no_view(self):
+        self.run_gh([entry(["pr", "edit"], code=1, stderr="boom"), entry(["pr", "view"], {"labels": []})],
+                    "mark-conflict", "--pr", "23")
+        self.assertEqual(self.code, 2)
+        self.assertEqual(self.gh.calls("pr", "view"), [])
+
+    def test_mark_conflict_label_missing_is_nonzero(self):
+        o = self.run_gh([entry(["pr", "edit"]), entry(["pr", "view"], {"labels": [ghstub.label("upstream-sync")]})],
+                        "mark-conflict", "--pr", "23")
+        self.assertEqual((self.code, o["label_present"]), (1, False))
+
     def test_head_pinned_veto_blocks_ready_and_enroll_until_new_head(self):
         mark = lambda sha, o="escalate": f"report\n<!-- upstream-sync-veto: {sha} {o} -->\n"
         same = ghstub.pr(draft=True, labels=("upstream-sync", "sync-failing"), body=mark("f" * 40), enabled_at=hours_ago(1))
