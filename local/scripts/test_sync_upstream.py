@@ -409,6 +409,30 @@ class Sync(unittest.TestCase):
             for cmd in ("status", "merge"):
                 self.assertEqual(self.sync(cmd, "--demo-ref", ref)[0], 2, (cmd, ref))
 
+    def test_demo_ref_tag_without_branch_rejected(self):
+        git(self.up, "tag", "origin/test/upstream-sim-7", self.c1)
+        self.fetch()
+        for cmd in ("status", "merge"):
+            self.assertEqual(self.sync(cmd, "--demo-ref", "test/upstream-sim-7")[0], 2, cmd)
+        self.assertEqual(self.sync("check", "--no-go", "--demo-ref", "test/upstream-sim-7")[0], 2)
+
+    def test_check_escalates_committed_conflict_markers(self):
+        git(self.fork, "update-ref", "refs/remotes/origin/develop", "HEAD")
+        self.put(self.fork, "f.txt", "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> up\n")
+        self.put(self.fork, "doc.md", "Title\n=======\n")
+        git(self.fork, "add", "-A")
+        git(self.fork, "commit", "-qm", "conflicted")
+        code, ck = self.sync("check", "--no-go", "--base", "origin/develop")
+        self.assertEqual(code, 2)
+        self.assertTrue(ck["escalate"])
+        self.assertEqual([x for x in ck["surface_violations"] if "conflict_markers" in x],
+                         [json.dumps({"kind": "conflict_markers", "path": "f.txt"})])
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        ck["escalate"] = ck["escalate"]
+        args = self.results(st, {"ok": True}, ck)
+        o = self.sync("outcome", *args, "--check-code", "2")[1]
+        self.assertEqual((o["outcome"], o["enroll_eligible"]), ("escalate", False))
+
     def test_demo_merge_keeps_version_and_demo_prefix(self):
         sim = self.make_sim()
         code, st = self.sync("status", "--demo-ref", "test/upstream-sim-1")

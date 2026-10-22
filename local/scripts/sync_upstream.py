@@ -131,14 +131,21 @@ DEMO_REF_RE = re.compile(r"test/upstream-sim-[0-9]+")
 DEMO_EXEMPT = ["local/sync-demo/**"]
 
 
+def demo_full_ref(demo_ref):
+    return f"refs/remotes/origin/{demo_ref}"
+
+
 def resolve_demo(root, demo_ref, base_sha):
     """Commit of origin/<demo_ref>; its parent must be the current sha= or the demo is not a one-step sync."""
     if not DEMO_REF_RE.fullmatch(demo_ref):
         raise Escalate(f"demo ref {demo_ref!r} does not match test/upstream-sim-<n>")
-    p = git(root, "rev-parse", "-q", "--verify", f"origin/{demo_ref}^{{commit}}", check=False)
+    full = demo_full_ref(demo_ref)   # fully qualified: a tag named origin/<ref> must never shadow the branch
+    if git(root, "show-ref", "--verify", "-q", full, check=False).returncode:
+        raise Escalate(f"demo ref origin/{demo_ref} not found (fetch origin)")
+    p = git(root, "rev-parse", "-q", "--verify", f"{full}^{{commit}}", check=False)
     if p.returncode:
         raise Escalate(f"demo ref origin/{demo_ref} not found (fetch origin)")
-    parent = git(root, "rev-parse", "-q", "--verify", f"origin/{demo_ref}^", check=False).stdout.strip()
+    parent = git(root, "rev-parse", "-q", "--verify", f"{full}^", check=False).stdout.strip()
     if parent != base_sha:
         raise Escalate(f"demo ref origin/{demo_ref} parent {parent[:10] or '?'} is not sha={base_sha[:10]}")
     return p.stdout.strip()
@@ -347,6 +354,24 @@ def hook_tests(root):
     return res
 
 
+def conflict_marker_files(root, base):
+    """Text files changed in HEAD vs `base` that hold conflict markers (a lone `=======` is ignored: it is a
+    Markdown/RST underline unless paired with an opener/closer line). Binary files are skipped."""
+    names = nul_list(git(root, "diff", "-z", "--name-only", "--diff-filter=ACMR", f"{base}...HEAD").stdout)
+    bad = []
+    for n in names:
+        f = Path(root) / n
+        try:
+            data = f.read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data[:8192]:
+            continue
+        if re.search(rb"^<<<<<<< ", data, re.M) or re.search(rb"^>>>>>>> ", data, re.M):
+            bad.append(n)
+    return bad
+
+
 def cmd_check(a, root):
     cfg = config(root)
     d = {"build_errors": [], "test_failures": [], "surface_violations": []}
@@ -396,11 +421,19 @@ def cmd_check(a, root):
     if a.demo_ref:   # sha= does not advance in a demo: scan sha=..origin/<ref> explicitly
         if not DEMO_REF_RE.fullmatch(a.demo_ref):
             raise Escalate(f"demo ref {a.demo_ref!r} does not match test/upstream-sim-<n>")
-        v = v + added_ignored(root, read_version(root)[0], f"origin/{a.demo_ref}", DEMO_EXEMPT)
+        full = demo_full_ref(a.demo_ref)
+        if git(root, "show-ref", "--verify", "-q", full, check=False).returncode:
+            raise Escalate(f"demo ref origin/{a.demo_ref} not found (fetch origin)")
+        v = v + added_ignored(root, read_version(root)[0], full, DEMO_EXEMPT)
     elif a.base:   # old sha from the base branch, before this branch advanced it
         old, new = read_version(root, a.base)[0], read_version(root)[0]
         if old != new:
             v = v + added_ignored(root, old, new)
+    if a.base:   # every candidate (rechecks included) must be free of committed conflict markers
+        marked = conflict_marker_files(root, a.base)
+        if marked:
+            escalate.append("unresolved conflict markers")
+            v = v + [{"kind": "conflict_markers", "path": n} for n in marked]
     escalate += [x for x in v if isinstance(x, dict) and x.get("kind") in cfs.ESCALATE_KINDS]
     d["surface_violations"] += [x if isinstance(x, str) else json.dumps(x) for x in v]
     steps.append({"step": "fork-surface", "ok": p.returncode == 0})
