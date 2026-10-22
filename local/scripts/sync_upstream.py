@@ -491,7 +491,7 @@ def held_of(st, mg):
     return next((h for h in (st.get("held"), mg.get("held")) if isinstance(h, dict) and h.get("files")), {})
 
 
-def derive_outcome(st, mg, guard, ck, check_code, stalled=False):
+def derive_outcome(st, mg, guard, ck, check_code, stalled=False, veto=None):
     """(outcome, extra): clean | failing | escalate | workflow_review. Held drift is never clean (and so
     never enrolled); `extra` carries enroll_stalled, which does not change the outcome."""
     extra = ["enroll_stalled"] if stalled else []
@@ -509,13 +509,15 @@ def derive_outcome(st, mg, guard, ck, check_code, stalled=False):
         return "failing", extra
     if held_of(st, mg).get("files"):
         return "workflow_review", extra
+    if veto in ("escalate", "failing"):   # head-pinned veto: an unchanged head never turns clean
+        return veto, extra
     return "clean", extra
 
 
 def cmd_outcome(a, root):
     st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
     guard = load_json(a.guard) if a.guard and Path(a.guard).exists() else None
-    outcome, extra = derive_outcome(st, mg, guard, ck, a.check_code, a.stalled)
+    outcome, extra = derive_outcome(st, mg, guard, ck, a.check_code, a.stalled, a.veto_outcome)
     print(json.dumps({"outcome": outcome, "extra": extra, "enroll_eligible": outcome == "clean"}, indent=2))
     return 0
 
@@ -523,7 +525,7 @@ def cmd_outcome(a, root):
 def cmd_report(a, root):
     st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
     guard = load_json(a.guard) if a.guard and Path(a.guard).exists() else None
-    outcome, _ = derive_outcome(st, mg, guard, ck, a.check_code)
+    outcome, _ = derive_outcome(st, mg, guard, ck, a.check_code, veto=a.veto_outcome)
     no_push = guard_bad(guard)
     short, tags = st.get("short", "?"), st.get("tags", [])
     held = held_of(st, mg)
@@ -571,6 +573,8 @@ def cmd_report(a, root):
         L += [f"Merge: {mg.get('next_action', '')}", ""]
     if a.run_url:
         L += [f"Run: {a.run_url}", ""]
+    if outcome in ("escalate", "failing") and SHA_RE.fullmatch(a.head_sha or ""):
+        L += [f"<!-- upstream-sync-veto: {a.head_sha} {outcome} -->", ""]   # the body is rewritten each run: older markers go
     md = "\n".join(L)
     if a.out:
         Path(a.out).write_text(md)
@@ -616,8 +620,10 @@ def main(argv=None):
         x.add_argument("--status"); x.add_argument("--merge"); x.add_argument("--check")
         x.add_argument("--check-code", help="exit code the check job captured (workflow passes it through)")
         x.add_argument("--guard", help="workflow-guard result from the privileged merge job")
+        x.add_argument("--veto-outcome", choices=("escalate", "failing"), help="head-pinned veto still on the PR head")
     o.add_argument("--stalled", action="store_true", help="the open sync PR's auto-merge is stalled > 24h")
     r.add_argument("--run-url"); r.add_argument("--out")
+    r.add_argument("--head-sha", help="PR head this report describes (40-hex); pins the veto marker")
     r.add_argument("--branch", help="sync branch for issue_key when there is no merge result")
     r.add_argument("--pr-branch", help="branch of the original open sync PR (carried from the merge job); wins for issue_key")
     r.add_argument("--demo", action="store_true", help="demo labels/title: sync-demo only")

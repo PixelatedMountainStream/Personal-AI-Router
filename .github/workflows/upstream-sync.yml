@@ -119,6 +119,9 @@ jobs:
           echo "branch=$b" >> "$GITHUB_OUTPUT"
           echo "draft=$(jq -r .draft <<<"$json")" >> "$GITHUB_OUTPUT"
           echo "labels=$(jq -r '.labels | join(",")' <<<"$json")" >> "$GITHUB_OUTPUT"
+          # Disarm at once (same UPSTREAM_SYNC_TOKEN as the rest of this job: pull-requests write), before any checkout
+          # or stalled reporting: a later tool error in this job must not leave the PR armed. Idempotent with publish.
+          python3 "$RUNNER_TEMP/trusted/sync_gh.py" disable-auto --pr "$n"
           # Merge into the open PR's branch so human commits are preserved.
           git checkout -q -B "$b" "origin/$b"
 
@@ -336,13 +339,29 @@ jobs:
           verify merge.json "$MERGE_SHA256"
           verify guard.json "$GUARD_SHA256"
 
+      - name: Head veto
+        id: veto
+        if: needs.merge.outputs.pr_number != ''
+        env:
+          PR_NUMBER: ${{ needs.merge.outputs.pr_number }}
+          CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
+        run: |
+          # An escalate/failing marker pinned to the PR head vetoes `clean` while that head is unchanged.
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::bad carried PR number"; exit 1; }
+          json=$(python3 "$RUNNER_TEMP/trusted/sync_gh.py" veto --pr "$PR_NUMBER" --cand "$CAND_SHA")
+          echo "outcome=$(jq -r .outcome <<<"$json")" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$(jq -r .head_sha <<<"$json")" >> "$GITHUB_OUTPUT"
+
       - name: Report
         id: report
         env:
+          VETO_OUTCOME: ${{ steps.veto.outputs.outcome }}
+          PR_HEAD_SHA: ${{ steps.veto.outputs.head_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           CHECK_CODE: ${{ needs.check.outputs.code }}
           CHECK_RESULT: ${{ needs.check.result }}
           MERGE_BRANCH: ${{ needs.merge.outputs.branch }}
+          CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
           ORIG_PR_BRANCH: ${{ needs.merge.outputs.pr_branch }}
         run: |
           in="$RUNNER_TEMP/in"
@@ -350,6 +369,8 @@ jobs:
           [ "$CHECK_RESULT" = "success" ] || CHECK_CODE=""
           args=(--root "$GITHUB_WORKSPACE" report --status "$in/status.json" --merge "$in/merge.json" --guard "$in/guard.json"
             --check "$RUNNER_TEMP/chk/check.json" --check-code "$CHECK_CODE" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md")
+          [ -n "$VETO_OUTCOME" ] && args+=(--veto-outcome "$VETO_OUTCOME")
+          head="${CAND_SHA:-$PR_HEAD_SHA}"; [ -n "$head" ] && args+=(--head-sha "$head")
           [ -n "$MERGE_BRANCH" ] && args+=(--branch "$MERGE_BRANCH")
           [ -n "$ORIG_PR_BRANCH" ] && args+=(--pr-branch "$ORIG_PR_BRANCH")
           [ -n "$DEMO_REF" ] && args+=(--demo)

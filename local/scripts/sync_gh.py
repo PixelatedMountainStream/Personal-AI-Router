@@ -4,7 +4,7 @@
 
 """All `gh` calls of the PAIR upstream sync (plan section 4.4/4.5). Stdlib only; honours GH_REPO.
 
-Subcommands: find-pr | verify-pr | stalled | disable-auto | ready | enroll | issue | sweep.
+Subcommands: find-pr | verify-pr | stalled | disable-auto | veto | ready | enroll | issue | sweep.
 Each prints ONE JSON object {ok, step, ...}. Exit codes: 0 ok, 1 the outcome is not clean (enroll
 refused, issue skipped), 2 a gh call failed. The workflow decides the run's exit status.
 """
@@ -54,6 +54,21 @@ def fork():
 
 def marker(branch, outcome):
     return f"<!-- upstream-sync: {branch} {outcome} -->"
+
+
+VETO_RE = re.compile(r"<!-- upstream-sync-veto: ([0-9a-f]{40}) (escalate|failing) -->")
+
+
+def veto_of(body):
+    """(sha, outcome) of the last strictly-formed veto marker in a PR body, else None."""
+    found = VETO_RE.findall(body if isinstance(body, str) else "")
+    return found[-1] if found else None
+
+
+def vetoed_head(pr):
+    """The veto outcome when the body's veto sha is still the PR's current head, else None."""
+    v = veto_of(pr.get("body"))
+    return v[1] if v and v[0] == pr.get("headRefOid") else None
 
 
 def names(pr):
@@ -146,8 +161,21 @@ def cmd_disable_auto(a):
     return emit("disable-auto", True, 0, disabled=disable_auto(a.pr))
 
 
+def cmd_veto(a):
+    """Head-pinned veto: report whether this PR's head still carries an escalate/failing veto."""
+    p = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS + ",body")
+    p = p if isinstance(p, dict) else {}
+    v = vetoed_head(p)
+    if v and a.cand and a.cand != p.get("headRefOid"):
+        v = None   # this run's candidate is a new head: the veto is cleared
+    return emit("veto", True, 0, outcome=v or "", head_sha=p.get("headRefOid") or "")
+
+
 def cmd_ready(a):
-    p = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS)
+    p = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS + ",body")
+    v = vetoed_head(p)
+    if v:   # unchanged head after an escalate/failing run is never clean
+        return emit("ready", False, 1, draft_after=p["isDraft"], label_removed=False, vetoed=v)
     if p["isDraft"]:
         gh("pr", "ready", str(a.pr))
     removed = "sync-failing" in names(p)
@@ -227,10 +255,12 @@ def check_prereqs(a):
         bad = sorted({x.get("type") for x in rules if x.get("type") in BAD_RULES})
         if bad:
             reasons.append(f"rules on develop: {bad}")
-    pr = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS)
+    pr = gh_json("pr", "view", str(a.pr), "--json", PR_FIELDS + ",body")
     if not isinstance(pr, dict) or not isinstance(pr.get("isDraft"), bool):
         reasons.append("malformed pr view")
         return reasons
+    if vetoed_head(pr):
+        reasons.append(f"PR head {pr.get('headRefOid')} is vetoed ({vetoed_head(pr)}); a new head is required")
     if pr.get("baseRefName") != "develop":
         reasons.append(f"PR base is {pr.get('baseRefName')!r}, not 'develop'")
     if pr.get("isCrossRepository") is not False:
@@ -322,6 +352,8 @@ def main(argv=None):
     s.add_argument("--pr", type=int, required=True); s.add_argument("--branch", required=True)
     s = add("ready", cmd_ready)
     s.add_argument("--pr", type=int, required=True)
+    s = add("veto", cmd_veto)
+    s.add_argument("--pr", type=int, required=True); s.add_argument("--cand", default="")
     s = add("enroll", cmd_enroll)
     s.add_argument("--pr", type=int, required=True); s.add_argument("--head", required=True)
     s.add_argument("--demo-ref", default=""); s.add_argument("--body", required=True, help="report.md")

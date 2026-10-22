@@ -384,6 +384,25 @@ class Sync(unittest.TestCase):
         r = self.sync("report", *self.results(st, held, {"ok": True, "escalate": False}), "--check-code", "0")[1]
         self.assertEqual(r["issue_key"], "workflow-review workflow_review")
 
+    def test_veto_pins_marker_and_blocks_clean(self):
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        md = Path(self.tmp.name) / "v.md"
+        sha = "c" * 40
+        ok = self.results(st, {"ok": True, "branch": "upstream-sync/20261019-abc"}, {"ok": True, "escalate": False})
+        r = self.sync("report", *ok, "--check-code", "0", "--out", str(md), "--head-sha", sha)[1]
+        self.assertEqual(r["outcome"], "clean")
+        self.assertNotIn("upstream-sync-veto", md.read_text())
+        r = self.sync("report", *ok, "--check-code", "0", "--out", str(md), "--head-sha", sha, "--veto-outcome", "escalate")[1]
+        self.assertEqual((r["outcome"], r["draft"]), ("escalate", True))
+        self.assertIn(f"<!-- upstream-sync-veto: {sha} escalate -->", md.read_text())
+        bad = self.results(st, {"ok": True}, {"ok": False, "escalate": False})
+        self.sync("report", *bad, "--check-code", "0", "--out", str(md), "--head-sha", sha)
+        self.assertIn(f"<!-- upstream-sync-veto: {sha} failing -->", md.read_text())
+        self.sync("report", *bad, "--check-code", "0", "--out", str(md), "--head-sha", "zz")
+        self.assertNotIn("upstream-sync-veto", md.read_text())
+        o = self.sync("outcome", *ok, "--check-code", "0", "--veto-outcome", "failing")[1]
+        self.assertEqual((o["outcome"], o["enroll_eligible"]), ("failing", False))
+
     def test_required_checks_match_local_ci(self):
         ci = (HERE.parents[1] / ".github/workflows/local-ci.yml").read_text()
         names = re.findall(r"^ {8}name: (.+)$", ci, re.M)          # job-level names (8 spaces); steps are deeper

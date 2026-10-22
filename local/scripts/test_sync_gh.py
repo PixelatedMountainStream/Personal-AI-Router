@@ -239,6 +239,34 @@ class T(unittest.TestCase):
         self.assertEqual(self.gh.calls("pr", "edit"), [["pr", "edit", "23", "--remove-label", "sync-failing"]])
         self.assertIn("draft_after", o)
 
+    def test_head_pinned_veto_blocks_ready_and_enroll_until_new_head(self):
+        mark = lambda sha, o="escalate": f"report\n<!-- upstream-sync-veto: {sha} {o} -->\n"
+        same = ghstub.pr(draft=True, labels=("upstream-sync", "sync-failing"), body=mark("f" * 40), enabled_at=hours_ago(1))
+        o = self.run_gh([entry(["pr", "view"], same), entry(["pr", "ready"]), entry(["pr", "edit"])], "ready", "--pr", "23")
+        self.assertEqual((self.code, o["vetoed"], o["label_removed"]), (1, "escalate", False))
+        self.assertEqual(self.gh.calls("pr", "edit"), [])
+        self.assertEqual(self.gh.calls("pr", "ready"), [])
+        rs = enroll_responses()
+        rs[1] = entry(["pr", "view"], same)
+        o = self.enroll(rs)
+        self.assertEqual(o["outcome"], "enroll_refused")
+        self.assertTrue(any("vetoed" in r for r in o["reasons"]))
+        self.assertEqual(self.gh.calls("pr", "merge", "23", "--auto"), [])
+        self.assertTrue(self.gh.calls("pr", "merge", "23", "--disable-auto"))
+        o = self.run_gh([entry(["pr", "view"], same)], "veto", "--pr", "23")
+        self.assertEqual((o["outcome"], o["head_sha"]), ("escalate", "f" * 40))
+        o = self.run_gh([entry(["pr", "view"], same)], "veto", "--pr", "23", "--cand", "b" * 40)
+        self.assertEqual(o["outcome"], "")   # this run pushes a new head
+        # new head (human push): marker pinned to an older sha, and malformed markers, do not veto
+        for body in (mark("e" * 40), mark("f" * 40, "bogus"), mark("f" * 39)):
+            new = ghstub.pr(labels=("upstream-sync", "sync-failing"), body=body)
+            o = self.run_gh([entry(["pr", "view"], new), entry(["pr", "edit"])], "ready", "--pr", "23")
+            self.assertEqual((self.code, o["label_removed"]), (0, True))
+            self.assertEqual(self.run_gh([entry(["pr", "view"], new)], "veto", "--pr", "23")["outcome"], "")
+            rs = enroll_responses()
+            rs[1] = entry(["pr", "view"], new)
+            self.assertFalse(any("vetoed" in r for r in self.enroll(rs)["reasons"]))
+
     def test_sweep_closes_merged_and_workflow_review(self):
         mk = lambda n, b, o="escalate": {"number": n, "body": f"<!-- upstream-sync: {b} {o} -->"}  # noqa: E731
         issues = [mk(1, "upstream-sync/m"), mk(2, "upstream-sync/open"), mk(3, "workflow-review", "workflow_review")]
