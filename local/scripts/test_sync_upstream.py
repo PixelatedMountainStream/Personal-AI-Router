@@ -246,10 +246,11 @@ class Sync(unittest.TestCase):
         for ck, extra in [(good, []), ({"ok": "false"}, []), ({"ok": True, "escalate": "no"}, []),
                           ({"ok": True, "surface_violations": ['{"kind": "made_up"}']}, []),
                           (good, ["--check-code", "2"])]:
+            extra = extra or ["--check-code", "0"]
             f = Path(self.tmp.name) / "ck.json"
             f.write_text(json.dumps(ck))
             r = self.sync("report", "--status", st, "--merge", str(mg), "--check", str(f), *extra)[1]
-            self.assertEqual(r["outcome"], "clean" if ck is good and not extra else "escalate", (ck, extra))
+            self.assertEqual(r["outcome"], "clean" if ck is good and extra == ["--check-code", "0"] else "escalate", (ck, extra))
 
     def test_null_list_in_check_escalates_and_renders(self):
         st = self._dump({"ok": True, "tags": [], "short": "abc", "commits": 1})
@@ -346,21 +347,41 @@ class Sync(unittest.TestCase):
                 ("workflow_review", self.results({**st, **held}, {"ok": True}, ck), ("workflow_review", [], False)),
                 ("held+failing", self.results({**st, **held}, {"ok": True}, bad), ("failing", [], False)),
                 ("stalled", [*self.results(st, {"ok": True}, ck), "--stalled"], ("clean", ["enroll_stalled"], True))]:
-            code, o = self.sync("outcome", *args)
+            code, o = self.sync("outcome", *args, "--check-code", "0")
             self.assertEqual((code, o["outcome"], o["extra"], o["enroll_eligible"]), (0, *want), name)
+
+    def test_missing_check_exit_is_failing_never_clean(self):
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        args = self.results(st, {"ok": True}, {"ok": True, "escalate": False})
+        self.assertEqual(self.sync("outcome", *args)[1]["outcome"], "failing")
+        self.assertEqual(self.sync("outcome", *args, "--check-code", "")[1]["outcome"], "failing")
+        self.assertEqual(self.sync("outcome", *args, "--check-code", "0")[1]["outcome"], "clean")
+
+    def test_issue_key_branch_order(self):
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        args = self.results(st, {"ok": True, "branch": "upstream-sync/bundle"}, {"ok": False, "escalate": False})
+        key = lambda *x: self.sync("report", *args, *x, "--check-code", "0")[1]["issue_key"]
+        self.assertEqual(key("--pr-branch", "upstream-sync/orig"), "upstream-sync/orig failing")
+        self.assertEqual(key(), "upstream-sync/bundle failing")
+        bad = self.results({"ok": False, "short": "?"}, None, None)   # status failed, no merge, no bundle
+        r = self.sync("report", *bad, "--pr-branch", "upstream-sync/orig")[1]
+        self.assertEqual(r["issue_key"], "upstream-sync/orig escalate")
+        nokey = self.results(st, None, {"ok": True, "escalate": False})
+        r = self.sync("report", *nokey, "--check-code", "1")[1]
+        self.assertRegex(r["issue_key"], r"^upstream-sync/\d{8}-abc failing$")
 
     def test_report_outcome_and_enrollment_lines(self):
         st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
         md = Path(self.tmp.name) / "r.md"
         args = self.results(st, {"ok": True, "branch": "upstream-sync/20261019-abc"}, {"ok": False, "escalate": False})
-        r = self.sync("report", *args, "--out", str(md))[1]
+        r = self.sync("report", *args, "--out", str(md), "--check-code", "0")[1]
         self.assertEqual((r["issue_key"], r["issue_title"]),
                          ("upstream-sync/20261019-abc failing", "Upstream sync needs attention: develop@abc [failing]"))
         self.assertIn("\nOutcome: failing\nEnrollment: pending\n", md.read_text())
-        r = self.sync("report", *args, "--out", str(md), "--demo")[1]
+        r = self.sync("report", *args, "--out", str(md), "--demo", "--check-code", "0")[1]
         self.assertEqual((r["labels"], r["title"]), (["sync-demo"], "Upstream sync demo: develop@abc (1 commits)"))
         held = {"ok": True, "held": {"files": [{"status": "A", "path": ".github/workflows/n.yml"}], "commits": []}}
-        r = self.sync("report", *self.results(st, held, {"ok": True, "escalate": False}))[1]
+        r = self.sync("report", *self.results(st, held, {"ok": True, "escalate": False}), "--check-code", "0")[1]
         self.assertEqual(r["issue_key"], "workflow-review workflow_review")
 
     def test_required_checks_match_local_ci(self):

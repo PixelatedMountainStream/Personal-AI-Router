@@ -68,6 +68,8 @@ def cmd_find_pr(a):
     label, prefix = ("sync-demo", "upstream-sync-demo/") if a.demo else ("upstream-sync", "upstream-sync/")
     prs = gh_json("pr", "list", "--base", "develop", "--label", label, "--state", "open", "--limit", "50", "--json", PR_FIELDS) or []
     prs = [p for p in prs if not p["isCrossRepository"] and p["headRefName"].startswith(prefix)]
+    if a.branch:   # a just-created PR: exact branch only, never "the newest"
+        prs = [p for p in prs if p["headRefName"] == a.branch]
     if not prs:
         return emit("find-pr", True, 0, number=None, branch=None, draft=None, base=None, labels=[],
                     auto_merge_enabled_at=None, head_sha=None)
@@ -235,6 +237,9 @@ def check_prereqs(a):
         reasons.append("PR is cross-repository")
     if pr["isDraft"]:
         reasons.append("PR is still a draft")
+    for veto in ("workflow-review", "sync-failing", "ci-failing"):
+        if veto in names(pr):
+            reasons.append(f"PR carries the {veto} label")
     return reasons
 
 
@@ -308,6 +313,7 @@ def main(argv=None):
 
     s = add("find-pr", cmd_find_pr)
     s.add_argument("--demo", action="store_true")
+    s.add_argument("--branch", help="exact head branch (a PR just created)")
     s = add("stalled", cmd_stalled)
     s.add_argument("--pr", type=int, required=True); s.add_argument("--run-url", required=True)
     s = add("disable-auto", cmd_disable_auto)

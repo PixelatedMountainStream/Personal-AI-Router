@@ -468,11 +468,11 @@ def derive_outcome(st, mg, guard, ck, check_code, stalled=False):
         return "escalate", extra
     if mg and not mg.get("ok", True):
         return "escalate", extra
-    if check_code not in (None, "", "0", "1") or not valid_check(ck) or ck.get("escalate"):
+    if check_code not in (None, "", "0", "1", 0, 1) or not valid_check(ck) or ck.get("escalate"):
         # tool-error exit, missing or malformed check result is never a pass
         return "escalate", extra
     dirty = any(ck.get(k) for k in ("build_errors", "test_failures", "surface_violations"))
-    if not ck["ok"] or check_code == "1" or dirty:   # clean needs exit 0 (absent only in tests), ok, empty failure fields
+    if not ck["ok"] or str(check_code) != "0" or dirty:   # clean needs an explicit exit 0, ok, empty failure fields
         return "failing", extra
     if held_of(st, mg).get("files"):
         return "workflow_review", extra
@@ -509,7 +509,11 @@ def cmd_report(a, root):
         title = f"Upstream release: {st['newest_tag']} (+develop@{short})"
     else:
         title = f"Upstream sync: develop@{short} ({st.get('commits', 0)} commits)"
-    branch = mg.get("branch") or a.branch
+    # Issue key branch, never the generic fallback while a PR exists: the carried original PR branch, else the
+    # bundle branch, else the deterministic candidate branch name.
+    prefix_b = "upstream-sync-demo" if a.demo else "upstream-sync"
+    branch = a.pr_branch or mg.get("branch") or a.branch \
+        or f"{prefix_b}/{datetime.now(timezone.utc):%Y%m%d}-{short}"
     cs = mg.get("conflicts", [])
     kinds = {k: sum(1 for c in cs if c["kind"] == k) for k in ("generated", "hook", "local", "other")}
     L = [f"## {title}", "", f"Result: {'PASS' if outcome == 'clean' else 'FAIL'} ({outcome})",
@@ -582,6 +586,7 @@ def main(argv=None):
     o.add_argument("--stalled", action="store_true", help="the open sync PR's auto-merge is stalled > 24h")
     r.add_argument("--run-url"); r.add_argument("--out")
     r.add_argument("--branch", help="sync branch for issue_key when there is no merge result")
+    r.add_argument("--pr-branch", help="branch of the original open sync PR (carried from the merge job); wins for issue_key")
     r.add_argument("--demo", action="store_true", help="demo labels/title: sync-demo only")
     a = ap.parse_args(argv)
     try:

@@ -125,6 +125,24 @@ class T(unittest.TestCase):
         self.run_gh([entry(["pr", "view"], ghstub.pr())], "disable-auto", "--pr", "23")
         self.assertEqual(self.gh.calls("pr", "merge"), [])   # idempotent: nothing to disable
 
+    def test_enroll_refuses_and_disarms_on_veto_labels(self):
+        for lab in ("workflow-review", "sync-failing", "ci-failing"):
+            rs = enroll_responses()
+            rs[1] = entry(["pr", "view"], ghstub.pr(labels=("upstream-sync", lab), enabled_at=hours_ago(1)))
+            o = self.enroll(rs)
+            self.assertEqual(o["outcome"], "enroll_refused", lab)
+            self.assertIn(f"PR carries the {lab} label", o["reasons"])
+            self.assertEqual(self.gh.calls("pr", "merge", "23", "--auto"), [])
+            self.assertTrue(self.gh.calls("pr", "merge", "23", "--disable-auto"), lab)
+
+    def test_find_pr_by_exact_branch(self):
+        prs = [json.loads(json.dumps(ghstub.pr(number=n, branch=b))) for n, b in
+               ((5, "upstream-sync/a"), (9, "upstream-sync/b"))]
+        o = self.run_gh([entry(["pr", "list"], prs)], "find-pr", "--branch", "upstream-sync/a")
+        self.assertEqual(o["number"], 5)
+        o = self.run_gh([entry(["pr", "list"], prs)], "find-pr", "--branch", "upstream-sync/zzz")
+        self.assertIsNone(o["number"])
+
     def test_enroll_refuses_other_base_or_cross_repo(self):
         for kw in ({"base": "main"}, {"cross": True}):
             rs = enroll_responses()
