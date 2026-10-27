@@ -248,14 +248,20 @@ def cmd_workflow_guard(a, root):
 # ---- merge ------------------------------------------------------------------
 def policy(root):
     cfg = tomllib.loads((Path(root) / "local/fork-surface.toml").read_text())
+    try:
+        recs = cfs.parse_records(root)
+    except cfs.ToolError:   # no records file: nothing is legacy
+        recs = []
+    by = lambda kinds: {f for r in recs if r["kind"] in kinds for f in r["files"]}
     return {"ignore": cfg.get("ignore", []), "generated": cfg.get("generated", []),
-            "allow": cfg.get("allow", [])}
+            "allow": cfg.get("allow", []), "legacy_only": by(("legacy",)) - by(("hook", "data"))}
 
 
 def classify(path, pol):
     for name, kind in (("ignore", "local"), ("generated", "generated"), ("allow", "hook")):
         if cfs.matches(path, pol[name]):
-            return kind
+            # An allowed path covered only by `legacy` records has no recipe: a manual re-merge.
+            return "legacy-hook" if kind == "hook" and path in pol["legacy_only"] else kind
     return "other"
 
 
@@ -272,6 +278,9 @@ def conflict_result(step, root, **kw):
         return emit(step, False, 2, "ESCALATE: conflict outside the allowlist or in a fork-owned path",
                     conflicts=cs, **kw)
     if cs:
+        if all(c["kind"] == "legacy-hook" for c in cs):
+            return emit(step, False, 1, "legacy-hook -> re-merge the fork diff by hand; then run check",
+                        conflicts=cs, **kw)
         return emit(step, False, 1, "hook -> re-apply the FORK_SURFACE.md recipe on upstream's version; then run check",
                     conflicts=cs, **kw)
     return emit(step, True, 0, "run: sync_upstream.py check", **kw)
@@ -355,20 +364,20 @@ def hook_tests(root):
 
 
 def conflict_marker_files(root, base):
-    """Text files changed in HEAD vs `base` that hold conflict markers (a lone `=======` is ignored: it is a
-    Markdown/RST underline unless paired with an opener/closer line). Binary files are skipped."""
+    """{path: marker line count} for text files changed in HEAD vs `base` (the pre-merge develop) holding lines
+    of the 4.3 grammar: `<{7} `, `={7}` alone, `>{7} `. Never the whole tree; binary files are skipped."""
     names = nul_list(git(root, "diff", "-z", "--name-only", "--diff-filter=ACMR", f"{base}...HEAD").stdout)
-    bad = []
+    bad = {}
     for n in names:
-        f = Path(root) / n
         try:
-            data = f.read_bytes()
+            data = (Path(root) / n).read_bytes()
         except OSError:
             continue
         if b"\0" in data[:8192]:
             continue
-        if re.search(rb"^<<<<<<< ", data, re.M) or re.search(rb"^>>>>>>> ", data, re.M):
-            bad.append(n)
+        k = len(re.findall(rb"^(?:<{7} |={7}$|>{7} )", data, re.M))
+        if k:
+            bad[n] = k
     return bad
 
 
@@ -376,7 +385,11 @@ def cmd_check(a, root):
     cfg = config(root)
     d = {"build_errors": [], "test_failures": [], "surface_violations": []}
     steps, skipped, escalate = [], [], []
-    have_go = bool(shutil.which("go")) and not a.no_go
+    # The marker scan runs first and always (hook conflicts reach check with markers committed); with markers
+    # present the go build/vet/test steps are hopeless and are skipped, but the count still reaches the report.
+    marked = conflict_marker_files(root, a.base) if a.base else {}
+    d["conflict_markers"] = sum(marked.values())
+    have_go = bool(shutil.which("go")) and not a.no_go and not marked
 
     def go(name, cwd, args, key, rx=r"FAIL|^#|\.go:\d+"):
         p = run(["go", *args], Path(root) / cwd)
@@ -396,7 +409,7 @@ def cmd_check(a, root):
             go(f"test {mod}", mod, t, "test_failures")
         for i, (mod, pkg, _, rx) in enumerate(h[:4] for h in hook_tests(root)):
             go(f"hook-test-{i}", mod, ["test", pkg, "-run", rx], "test_failures")
-    elif not a.no_go:
+    elif not a.no_go and not marked:
         skipped.append("go (not installed)")
     p = run([sys.executable, "-m", "unittest", "discover", "-s", "local/scripts", "-p", "test_*.py"], root)
     steps.append({"step": "python", "ok": p.returncode == 0})
@@ -430,10 +443,9 @@ def cmd_check(a, root):
         if old != new:
             v = v + added_ignored(root, old, new)
     if a.base:   # every candidate (rechecks included) must be free of committed conflict markers
-        marked = conflict_marker_files(root, a.base)
         if marked:
             escalate.append("unresolved conflict markers")
-            v = v + [{"kind": "conflict_markers", "path": n} for n in marked]
+            v = v + [{"kind": "conflict_markers", "path": n} for n in sorted(marked)]
     escalate += [x for x in v if isinstance(x, dict) and x.get("kind") in cfs.ESCALATE_KINDS]
     d["surface_violations"] += [x if isinstance(x, str) else json.dumps(x) for x in v]
     steps.append({"step": "fork-surface", "ok": p.returncode == 0})
@@ -538,6 +550,20 @@ def cmd_outcome(a, root):
     return 0
 
 
+KINDS = ("generated", "hook", "legacy-hook", "local", "other")
+KIND_LABEL = {"legacy-hook": "legacy-hook (manual re-merge)"}
+
+
+def prev_kinds(path):
+    """Conflict counts from the open PR body (untrusted: integers only), or None."""
+    try:
+        text = Path(path).read_text() if path else ""
+    except OSError:
+        return None
+    got = {k: re.search(rf"^- {re.escape(KIND_LABEL.get(k, k))}: (\d{{1,6}})$", text, re.M) for k in KINDS}
+    return {k: int(m.group(1)) for k, m in got.items() if m} if all(got.values()) else None
+
+
 def cmd_report(a, root):
     st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
     guard = load_json(a.guard) if a.guard and Path(a.guard).exists() else None
@@ -568,12 +594,21 @@ def cmd_report(a, root):
     branch = a.pr_branch or mg.get("branch") or a.branch \
         or f"{prefix_b}/{datetime.now(timezone.utc):%Y%m%d}-{short}"
     cs = mg.get("conflicts", [])
-    kinds = {k: sum(1 for c in cs if c["kind"] == k) for k in ("generated", "hook", "local", "other")}
+    kinds = {k: sum(1 for c in cs if c["kind"] == k) for k in KINDS}
+    nmark = ck.get("conflict_markers") if type(ck.get("conflict_markers")) is int else None
+    if not mg:   # recheck: no merge result. Keep the last known counts, never print 0 over committed markers
+        prev = prev_kinds(a.prev_body)
+        if prev:
+            kinds = prev
+        elif nmark:
+            kinds = {k: "unknown" for k in KINDS}
     L = [f"## {title}", "", f"Result: {'PASS' if outcome == 'clean' else 'FAIL'} ({outcome})",
          f"Outcome: {outcome}", "Enrollment: pending", ""]
     if tags:
         L += ["### Upstream tags included", *(f"- {t}" for t in tags), ""]
-    L += ["### Conflicts by kind", *(f"- {k}: {n}" for k, n in kinds.items()), ""]
+    L += ["### Conflicts by kind", *(f"- {KIND_LABEL.get(k, k)}: {n}" for k, n in kinds.items()), ""]
+    if nmark is not None:
+        L += ["### Conflict markers", f"- found: {nmark}", ""]
     for key, name in (("build_errors", "Build errors"), ("test_failures", "Test failures"),
                       ("surface_violations", "Surface violations")):
         items = ck.get(key) if isinstance(ck.get(key), list) else []   # untrusted: null/odd values render as none
@@ -641,6 +676,7 @@ def main(argv=None):
         x.add_argument("--veto-outcome", choices=("escalate", "failing"), help="head-pinned veto still on the PR head")
     o.add_argument("--stalled", action="store_true", help="the open sync PR's auto-merge is stalled > 24h")
     r.add_argument("--run-url"); r.add_argument("--out")
+    r.add_argument("--prev-body", help="the open sync PR's current body, for a recheck's last known counts")
     r.add_argument("--head-sha", help="PR head this report describes (40-hex); pins the veto marker")
     r.add_argument("--branch", help="sync branch for issue_key when there is no merge result")
     r.add_argument("--pr-branch", help="branch of the original open sync PR (carried from the merge job); wins for issue_key")

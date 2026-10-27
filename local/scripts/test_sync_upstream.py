@@ -443,14 +443,17 @@ class Sync(unittest.TestCase):
         self.assertEqual(self.sync("check", "--no-go", "--demo-ref", "test/upstream-sim-7")[0], 2)
 
     def test_check_escalates_committed_conflict_markers(self):
+        self.put(self.fork, "doc.md", "Title\n=======\n")   # banner in a file the merge does not change
+        git(self.fork, "add", "-A")
+        git(self.fork, "commit", "-qm", "banner")
         git(self.fork, "update-ref", "refs/remotes/origin/develop", "HEAD")
         self.put(self.fork, "f.txt", "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> up\n")
-        self.put(self.fork, "doc.md", "Title\n=======\n")
         git(self.fork, "add", "-A")
         git(self.fork, "commit", "-qm", "conflicted")
         code, ck = self.sync("check", "--no-go", "--base", "origin/develop")
         self.assertEqual(code, 2)
         self.assertTrue(ck["escalate"])
+        self.assertEqual(ck["conflict_markers"], 3)   # counted even though go is skipped (fix 2)
         self.assertEqual([x for x in ck["surface_violations"] if "conflict_markers" in x],
                          [json.dumps({"kind": "conflict_markers", "path": "f.txt"})])
         st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
@@ -458,6 +461,30 @@ class Sync(unittest.TestCase):
         args = self.results(st, {"ok": True}, ck)
         o = self.sync("outcome", *args, "--check-code", "2")[1]
         self.assertEqual((o["outcome"], o["enroll_eligible"]), ("escalate", False))
+
+    def test_check_job_runs_on_hook_conflict_exit(self):
+        wf = (HERE.parents[1] / ".github/workflows/upstream-sync.yml").read_text()
+        self.assertRegex(wf, r"needs\.merge\.outputs\.code == '1'.*mode == 'recheck'")
+
+    def test_recheck_keeps_last_known_conflict_counts(self):
+        body = Path(self.tmp.name) / "prev.md"
+        md = Path(self.tmp.name) / "r.md"
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        mg = {"ok": False, "conflicts": [{"path": "a", "kind": "hook"}, {"path": "b", "kind": "legacy-hook"}]}
+        self.sync("report", *self.results(st, mg, {"ok": True}), "--out", str(body), "--check-code", "0")
+        self.assertIn("- legacy-hook (manual re-merge): 1\n", body.read_text())   # not folded into hook
+        self.assertIn("- hook: 1\n", body.read_text())
+        ck = {"ok": True, "conflict_markers": 3}
+        self.sync("report", *self.results(st, {}, ck), "--out", str(md), "--check-code", "0", "--prev-body", str(body))
+        self.assertIn("- hook: 1\n", md.read_text())
+        self.sync("report", *self.results(st, {}, ck), "--out", str(md), "--check-code", "0")   # no prior body
+        self.assertNotIn("- hook: 0", md.read_text())
+
+    def test_legacy_only_record_conflict_is_legacy_hook(self):
+        self.put(self.fork, "local/fork-surface.toml", 'allow = ["a.txt", "b.txt"]\n')
+        self.put(self.fork, "local/FORK_SURFACE.md", "### L-a\nfiles: a.txt\nkind: legacy\nrecipe: by hand\n"
+                 "### S1\nfiles: b.txt\nkind: data\nrecipe: r\n")
+        self.assertEqual([su.classify(p, su.policy(self.fork)) for p in ("a.txt", "b.txt")], ["legacy-hook", "hook"])
 
     def test_demo_merge_keeps_version_and_demo_prefix(self):
         sim = self.make_sim()

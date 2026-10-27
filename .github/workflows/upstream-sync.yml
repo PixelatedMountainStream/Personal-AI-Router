@@ -224,7 +224,7 @@ jobs:
 
   check:
     needs: merge
-    if: needs.merge.outputs.candidate == 'true' && (needs.merge.outputs.code == '0' || needs.merge.outputs.mode == 'recheck')
+    if: needs.merge.outputs.candidate == 'true' && (needs.merge.outputs.code == '0' || needs.merge.outputs.code == '1' || needs.merge.outputs.mode == 'recheck')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     cache-mode: none   # no cache restore or save: nothing here may poison what privileged jobs read
@@ -366,6 +366,7 @@ jobs:
           MERGE_BRANCH: ${{ needs.merge.outputs.branch }}
           CAND_SHA: ${{ needs.merge.outputs.cand_sha }}
           ORIG_PR_BRANCH: ${{ needs.merge.outputs.pr_branch }}
+          PR_NUMBER: ${{ needs.merge.outputs.pr_number }}
         run: |
           in="$RUNNER_TEMP/in"
           # Anything but a successful check job is never a pass: an empty exit code derives as failing.
@@ -373,6 +374,9 @@ jobs:
           args=(--root "$GITHUB_WORKSPACE" report --status "$in/status.json" --merge "$in/merge.json" --guard "$in/guard.json"
             --check "$RUNNER_TEMP/chk/check.json" --check-code "$CHECK_CODE" --run-url "$RUN_URL" --out "$RUNNER_TEMP/report.md")
           [ -n "$VETO_OUTCOME" ] && args+=(--veto-outcome "$VETO_OUTCOME")
+          # A recheck has no merge result: the open PR's body supplies the last known conflict counts (parsed as integers only).
+          [ -n "$PR_NUMBER" ] && gh pr view "$PR_NUMBER" --json body -q .body > "$RUNNER_TEMP/prev.md" 2>/dev/null \
+            && args+=(--prev-body "$RUNNER_TEMP/prev.md")
           head="${CAND_SHA:-$PR_HEAD_SHA}"; [ -n "$head" ] && args+=(--head-sha "$head")
           [ -n "$MERGE_BRANCH" ] && args+=(--branch "$MERGE_BRANCH")
           [ -n "$ORIG_PR_BRANCH" ] && args+=(--pr-branch "$ORIG_PR_BRANCH")
