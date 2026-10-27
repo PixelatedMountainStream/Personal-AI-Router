@@ -481,6 +481,20 @@ class Sync(unittest.TestCase):
         self.sync("report", *self.results(st, {}, ck), "--out", str(md), "--check-code", "0")   # no prior body
         self.assertNotIn("- hook: 0", md.read_text())
 
+    def test_recheck_report_never_zero_over_markers_and_old_bodies(self):
+        st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
+        ck = {"ok": True, "conflict_markers": 3, "go_skipped": True}
+        body, md = Path(self.tmp.name) / "old.md", Path(self.tmp.name) / "r.md"
+        body.write_text("- generated: 1\n- hook: 6\n- local: 0\n- other: 0\n")   # pre-change body: no legacy-hook line
+        self.sync("report", *self.results(st, {}, ck), "--out", str(md), "--check-code", "0", "--prev-body", str(body))
+        t = md.read_text()
+        self.assertIn("- hook: 6\n", t)
+        self.assertIn("- legacy-hook (manual re-merge): unknown\n", t)
+        self.assertIn("### Build errors\n- skipped \u2014 unresolved conflict markers", t)
+        body.write_text("- generated: 0\n- hook: 0\n- legacy-hook (manual re-merge): 0\n- local: 0\n- other: 0\n")
+        self.sync("report", *self.results(st, {}, ck), "--out", str(md), "--check-code", "0", "--prev-body", str(body))
+        self.assertIn("- hook: unknown\n", md.read_text())
+
     def test_legacy_only_record_conflict_is_legacy_hook(self):
         self.put(self.fork, "local/fork-surface.toml", 'allow = ["a.txt", "b.txt"]\n')
         self.put(self.fork, "local/FORK_SURFACE.md", "### L-a\nfiles: a.txt\nkind: legacy\nrecipe: by hand\n"

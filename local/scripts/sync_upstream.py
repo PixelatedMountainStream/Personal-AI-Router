@@ -389,6 +389,7 @@ def cmd_check(a, root):
     marked = conflict_marker_files(root, a.base) if a.base else {}
     d["conflict_markers"] = sum(marked.values())
     have_go = bool(shutil.which("go")) and not a.no_go and not marked
+    d["go_skipped"] = bool(marked) and not a.no_go
 
     def go(name, cwd, args, key, rx=r"FAIL|^#|\.go:\d+"):
         p = run(["go", *args], Path(root) / cwd)
@@ -554,13 +555,13 @@ KIND_LABEL = {"legacy-hook": "legacy-hook (manual re-merge)"}
 
 
 def prev_kinds(path):
-    """Conflict counts from the open PR body (untrusted: integers only), or None."""
+    """Per-kind counts that parse from the open PR body (untrusted: integers only); absent kinds are omitted."""
     try:
         text = Path(path).read_text() if path else ""
     except OSError:
-        return None
+        return {}
     got = {k: re.search(rf"^- {re.escape(KIND_LABEL.get(k, k))}: (\d{{1,6}})$", text, re.M) for k in KINDS}
-    return {k: int(m.group(1)) for k, m in got.items() if m} if all(got.values()) else None
+    return {k: int(m.group(1)) for k, m in got.items() if m}
 
 
 def cmd_report(a, root):
@@ -597,10 +598,10 @@ def cmd_report(a, root):
     nmark = ck.get("conflict_markers") if type(ck.get("conflict_markers")) is int else None
     if not mg:   # recheck: no merge result. Keep the last known counts, never print 0 over committed markers
         prev = prev_kinds(a.prev_body)
-        if prev:
-            kinds = prev
-        elif nmark:
-            kinds = {k: "unknown" for k in KINDS}
+        if prev or nmark:
+            kinds = {k: prev.get(k, "unknown") for k in KINDS}   # older bodies lack some kinds
+            if nmark and not any(v for k, v in kinds.items() if k != "generated" and v != "unknown"):
+                kinds.update({k: "unknown" for k in KINDS if k != "generated"})   # never 0 over markers
     L = [f"## {title}", "", f"Result: {'PASS' if outcome == 'clean' else 'FAIL'} ({outcome})",
          f"Outcome: {outcome}", "Enrollment: pending", ""]
     if tags:
@@ -611,7 +612,9 @@ def cmd_report(a, root):
     for key, name in (("build_errors", "Build errors"), ("test_failures", "Test failures"),
                       ("surface_violations", "Surface violations")):
         items = ck.get(key) if isinstance(ck.get(key), list) else []   # untrusted: null/odd values render as none
-        L += [f"### {name}", *([f"- `{x}`" for x in items] or ["- none"]), ""]
+        none = "- skipped \u2014 unresolved conflict markers" if key != "surface_violations" and ck.get("go_skipped") is True \
+            else "- none"
+        L += [f"### {name}", *([f"- `{x}`" for x in items] or [none]), ""]
     if held_files:
         L += ["### Held workflow changes (kept identical to develop; port by hand)",
               *(f"- `{h['path']}` ({h['status']})" for h in held_files),
