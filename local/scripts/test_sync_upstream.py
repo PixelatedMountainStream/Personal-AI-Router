@@ -447,6 +447,7 @@ class Sync(unittest.TestCase):
         git(self.fork, "add", "-A")
         git(self.fork, "commit", "-qm", "banner")
         git(self.fork, "update-ref", "refs/remotes/origin/develop", "HEAD")
+        self.put(self.fork, "NOTICES.md", "Banner\n=======\n")   # merge-changed, lone banner: not reported
         self.put(self.fork, "f.txt", "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> up\n")
         git(self.fork, "add", "-A")
         git(self.fork, "commit", "-qm", "conflicted")

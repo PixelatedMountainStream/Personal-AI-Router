@@ -365,7 +365,7 @@ def hook_tests(root):
 
 def conflict_marker_files(root, base):
     """{path: marker line count} for text files changed in HEAD vs `base` (the pre-merge develop) holding lines
-    of the 4.3 grammar: `<{7} `, `={7}` alone, `>{7} `. Never the whole tree; binary files are skipped."""
+    with a `<{7} ` or `>{7} ` line (4.3 grammar; `={7}` is counted but never triggers alone). Never the whole tree; binary files are skipped."""
     names = nul_list(git(root, "diff", "-z", "--name-only", "--diff-filter=ACMR", f"{base}...HEAD").stdout)
     bad = {}
     for n in names:
@@ -375,9 +375,8 @@ def conflict_marker_files(root, base):
             continue
         if b"\0" in data[:8192]:
             continue
-        k = len(re.findall(rb"^(?:<{7} |={7}$|>{7} )", data, re.M))
-        if k:
-            bad[n] = k
+        if re.search(rb"^(?:<{7} |>{7} )", data, re.M):   # a lone `=======` is a banner, never a conflict
+            bad[n] = len(re.findall(rb"^(?:<{7} |={7}$|>{7} )", data, re.M))
     return bad
 
 
