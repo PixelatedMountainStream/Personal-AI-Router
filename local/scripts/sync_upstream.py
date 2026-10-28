@@ -4,7 +4,7 @@
 
 """Daily upstream sync for the PAIR fork (plan section 4). Stdlib only, no gh calls.
 
-Subcommands: status | merge | workflow-guard | conflicts | check | report.
+Subcommands: status | merge | workflow-guard | conflicts | check | report | outcome.
 Each prints ONE JSON object {ok, step, conflicts[], build_errors[], test_failures[],
 surface_violations[], next_action, ...}. Exit codes: 0 ok, 1 needs repair, 2 escalate,
 3 sha= regression (upstream is not a descendant of local/UPSTREAM_VERSION.txt sha=).
@@ -96,11 +96,13 @@ def read_version(root, ref=None):
     return parse_version((Path(root) / "local/UPSTREAM_VERSION.txt").read_text())
 
 
-def added_ignored(root, old, new):
-    """Upstream-range additions under fork-owned (ignore) globs: they would be silently uncounted."""
+def added_ignored(root, old, new, exempt=()):
+    """Upstream-range additions under fork-owned (ignore) globs: they would be silently uncounted.
+    `exempt` globs (demo mode only) are dropped."""
     ignore = tomllib.loads((Path(root) / "local/fork-surface.toml").read_text()).get("ignore", [])
     names = nul_list(git(root, "diff", "-z", "--name-only", "--diff-filter=A", f"{old}..{new}").stdout)
-    return [{"kind": "upstream_adds_ignored_path", "path": n} for n in names if cfs.matches(n, ignore)]
+    return [{"kind": "upstream_adds_ignored_path", "path": n} for n in names
+            if cfs.matches(n, ignore) and not cfs.matches(n, list(exempt))]
 
 
 def write_version(root, sha, tag):
@@ -124,6 +126,31 @@ def resolve_target(root, remote, cfg, ref):
     raise Escalate(f"upstream ref {ref!r} not found (fetch the {remote} remote)")
 
 
+# Demo mode (plan section 5, PR-B2 (f)): the target is a simulated upstream commit on origin, never `upstream`.
+DEMO_REF_RE = re.compile(r"test/upstream-sim-[0-9]+")
+DEMO_EXEMPT = ["local/sync-demo/**"]
+
+
+def demo_full_ref(demo_ref):
+    return f"refs/remotes/origin/{demo_ref}"
+
+
+def resolve_demo(root, demo_ref, base_sha):
+    """Commit of origin/<demo_ref>; its parent must be the current sha= or the demo is not a one-step sync."""
+    if not DEMO_REF_RE.fullmatch(demo_ref):
+        raise Escalate(f"demo ref {demo_ref!r} does not match test/upstream-sim-<n>")
+    full = demo_full_ref(demo_ref)   # fully qualified: a tag named origin/<ref> must never shadow the branch
+    if git(root, "show-ref", "--verify", "-q", full, check=False).returncode:
+        raise Escalate(f"demo ref origin/{demo_ref} not found (fetch origin)")
+    p = git(root, "rev-parse", "-q", "--verify", f"{full}^{{commit}}", check=False)
+    if p.returncode:
+        raise Escalate(f"demo ref origin/{demo_ref} not found (fetch origin)")
+    parent = git(root, "rev-parse", "-q", "--verify", f"{full}^", check=False).stdout.strip()
+    if parent != base_sha:
+        raise Escalate(f"demo ref origin/{demo_ref} parent {parent[:10] or '?'} is not sha={base_sha[:10]}")
+    return p.stdout.strip()
+
+
 def tag_key(tag):
     return tuple(int(x) for x in re.findall(r"\d+", tag))
 
@@ -145,11 +172,11 @@ def newer_tags(root, remote, cfg, last_tag, contained_in):
     return sorted(keep, key=tag_key)
 
 
-def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False):
+def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False, demo_ref=None):
     """Shared by status and merge. `base` is the ref whose UPSTREAM_VERSION the PR would build on (the
     open sync PR's branch when one exists); `tags_base` (develop) is where the reported tag list starts."""
     base_sha, last_tag = read_version(root, base)
-    target = resolve_target(root, remote, cfg, ref)
+    target = resolve_demo(root, demo_ref, base_sha) if demo_ref else resolve_target(root, remote, cfg, ref)
     if target != base_sha and not is_ancestor(root, base_sha, target):
         raise Regression(f"upstream {target[:10]} is not a descendant of sha={base_sha[:10]}")
     new = target != base_sha
@@ -157,11 +184,13 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False):
     hold_from = read_version(root, tags_base or base)[0]
     held = {"files": [{"status": st, "path": pth} for st, pth in workflow_changes(root, hold_from, target)],
             "commits": nul_list(git(root, "log", "-z", "--format=%h %s", f"{hold_from}..{target}", "--", WF).stdout)[:30]}
-    rtags = newer_tags(root, remote, cfg, last_tag, target)   # tags this branch has not recorded yet
-    tags = rtags
-    if tags_base:
-        tags = newer_tags(root, remote, cfg, read_version(root, tags_base)[1], target)
-    if new or force:
+    rtags = tags = []   # demo mode has no tag lookup
+    if not demo_ref:
+        rtags = newer_tags(root, remote, cfg, last_tag, target)   # tags this branch has not recorded yet
+        tags = rtags
+        if tags_base:
+            tags = newer_tags(root, remote, cfg, read_version(root, tags_base)[1], target)
+    if new or force or demo_ref:
         mode = "sync"
     elif rtags:
         mode = "bump"
@@ -172,13 +201,13 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False):
     commits = int(out(root, "rev-list", "--count", f"{base_sha}..{target}")) if new else 0
     return {"mode": mode, "new": new, "base_sha": base_sha, "target": target, "short": target[:10],
             "commits": commits, "tags": tags, "rtags": rtags, "held": held, "newest_tag": tags[-1] if tags else "",
-            "release": bool(tags), "last_release_tag": last_tag, "remote": remote}
+            "release": bool(tags), "last_release_tag": last_tag, "remote": remote, "demo": bool(demo_ref)}
 
 
 def cmd_status(a, root):
     cfg = config(root)
     remote = resolve_remote(root, cfg, a.upstream_remote)
-    p = plan(root, remote, cfg, a.ref, a.base or "HEAD", a.force, a.tags_base, a.pending)
+    p = plan(root, remote, cfg, a.ref, a.base or "HEAD", a.force, a.tags_base, a.pending, a.demo_ref)
     return emit("status", True, 0, p["mode"] if p["mode"] != "none" else "none", **p)
 
 
@@ -219,14 +248,20 @@ def cmd_workflow_guard(a, root):
 # ---- merge ------------------------------------------------------------------
 def policy(root):
     cfg = tomllib.loads((Path(root) / "local/fork-surface.toml").read_text())
+    try:
+        recs = cfs.parse_records(root)
+    except cfs.ToolError:   # no records file: nothing is legacy
+        recs = []
+    by = lambda kinds: {f for r in recs if r["kind"] in kinds for f in r["files"]}
     return {"ignore": cfg.get("ignore", []), "generated": cfg.get("generated", []),
-            "allow": cfg.get("allow", [])}
+            "allow": cfg.get("allow", []), "legacy_only": by(("legacy",)) - by(("hook", "data"))}
 
 
 def classify(path, pol):
     for name, kind in (("ignore", "local"), ("generated", "generated"), ("allow", "hook")):
         if cfs.matches(path, pol[name]):
-            return kind
+            # An allowed path covered only by `legacy` records has no recipe: a manual re-merge.
+            return "legacy-hook" if kind == "hook" and path in pol["legacy_only"] else kind
     return "other"
 
 
@@ -243,6 +278,9 @@ def conflict_result(step, root, **kw):
         return emit(step, False, 2, "ESCALATE: conflict outside the allowlist or in a fork-owned path",
                     conflicts=cs, **kw)
     if cs:
+        if all(c["kind"] == "legacy-hook" for c in cs):
+            return emit(step, False, 1, "legacy-hook -> re-merge the fork diff by hand; then run check",
+                        conflicts=cs, **kw)
         return emit(step, False, 1, "hook -> re-apply the FORK_SURFACE.md recipe on upstream's version; then run check",
                     conflicts=cs, **kw)
     return emit(step, True, 0, "run: sync_upstream.py check", **kw)
@@ -251,7 +289,7 @@ def conflict_result(step, root, **kw):
 def cmd_merge(a, root):
     cfg = config(root)
     remote = resolve_remote(root, cfg, a.upstream_remote)
-    p = plan(root, remote, cfg, a.ref, "HEAD", a.force, a.base_ref)
+    p = plan(root, remote, cfg, a.ref, "HEAD", a.force, a.base_ref, demo_ref=a.demo_ref)
     old, last_tag = p["base_sha"], p["last_release_tag"]
     target = p["target"]
     stamp = a.date or datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -265,7 +303,8 @@ def cmd_merge(a, root):
         git(root, "add", "local/UPSTREAM_VERSION.txt")
         git(root, "commit", "-s", "--no-verify", "-m", f"Record upstream release {p['rtags'][-1]}")
         return emit("merge", True, 0, "run: sync_upstream.py check", branch=branch, committed=True, **p)
-    branch = a.branch or f"upstream-sync/{stamp}-{target[:10]}"
+    prefix = "upstream-sync-demo" if a.demo_ref else "upstream-sync"
+    branch = a.branch or f"{prefix}/{stamp}-{target[:10]}"
     if not a.reuse:
         git(root, "checkout", "-b", branch)
     base_ref = a.base_ref or "HEAD"
@@ -283,7 +322,8 @@ def cmd_merge(a, root):
                 git(root, "rm", "-q", "--", c["path"])
     # Classify before committing: the commit clears the unmerged index entries.
     cs = unmerged(root)
-    write_version(root, target, p["rtags"][-1] if p["rtags"] else last_tag)
+    if not a.demo_ref:   # a demo must leave sha= alone: the simulated commit is not upstream history
+        write_version(root, target, p["rtags"][-1] if p["rtags"] else last_tag)
     # Stage only intended paths (the merge result is already in the index): conflicted files go in with
     # their markers so a human can repair on the draft PR branch.
     git(root, "add", "-A", "--", "local/UPSTREAM_VERSION.txt", *[c["path"] for c in cs])
@@ -323,11 +363,33 @@ def hook_tests(root):
     return res
 
 
+def conflict_marker_files(root, base):
+    """{path: marker line count} for text files changed in HEAD vs `base` (the pre-merge develop) holding lines
+    with a `<{7} ` or `>{7} ` line (4.3 grammar; `={7}` is counted but never triggers alone). Never the whole tree; binary files are skipped."""
+    names = nul_list(git(root, "diff", "-z", "--name-only", "--diff-filter=ACMR", f"{base}...HEAD").stdout)
+    bad = {}
+    for n in names:
+        try:
+            data = (Path(root) / n).read_bytes()
+        except OSError:
+            continue
+        if b"\0" in data[:8192]:
+            continue
+        if re.search(rb"^(?:<{7} |>{7} )", data, re.M):   # a lone `=======` is a banner, never a conflict
+            bad[n] = len(re.findall(rb"^(?:<{7} |={7}$|>{7} )", data, re.M))
+    return bad
+
+
 def cmd_check(a, root):
     cfg = config(root)
     d = {"build_errors": [], "test_failures": [], "surface_violations": []}
     steps, skipped, escalate = [], [], []
-    have_go = bool(shutil.which("go")) and not a.no_go
+    # The marker scan runs first and always (hook conflicts reach check with markers committed); with markers
+    # present the go build/vet/test steps are hopeless and are skipped, but the count still reaches the report.
+    marked = conflict_marker_files(root, a.base) if a.base else {}
+    d["conflict_markers"] = sum(marked.values())
+    have_go = bool(shutil.which("go")) and not a.no_go and not marked
+    d["go_skipped"] = bool(marked) and not a.no_go
 
     def go(name, cwd, args, key, rx=r"FAIL|^#|\.go:\d+"):
         p = run(["go", *args], Path(root) / cwd)
@@ -347,7 +409,7 @@ def cmd_check(a, root):
             go(f"test {mod}", mod, t, "test_failures")
         for i, (mod, pkg, _, rx) in enumerate(h[:4] for h in hook_tests(root)):
             go(f"hook-test-{i}", mod, ["test", pkg, "-run", rx], "test_failures")
-    elif not a.no_go:
+    elif not a.no_go and not marked:
         skipped.append("go (not installed)")
     p = run([sys.executable, "-m", "unittest", "discover", "-s", "local/scripts", "-p", "test_*.py"], root)
     steps.append({"step": "python", "ok": p.returncode == 0})
@@ -369,10 +431,21 @@ def cmd_check(a, root):
         escalate.append(f"checker exit {p.returncode}")
     if p.returncode and not v:
         v = [f"check_fork_surface.py exited {p.returncode}"]
-    if a.base:   # old sha from the base branch, before this branch advanced it
+    if a.demo_ref:   # sha= does not advance in a demo: scan sha=..origin/<ref> explicitly
+        if not DEMO_REF_RE.fullmatch(a.demo_ref):
+            raise Escalate(f"demo ref {a.demo_ref!r} does not match test/upstream-sim-<n>")
+        full = demo_full_ref(a.demo_ref)
+        if git(root, "show-ref", "--verify", "-q", full, check=False).returncode:
+            raise Escalate(f"demo ref origin/{a.demo_ref} not found (fetch origin)")
+        v = v + added_ignored(root, read_version(root)[0], full, DEMO_EXEMPT)
+    elif a.base:   # old sha from the base branch, before this branch advanced it
         old, new = read_version(root, a.base)[0], read_version(root)[0]
         if old != new:
             v = v + added_ignored(root, old, new)
+    if a.base:   # every candidate (rechecks included) must be free of committed conflict markers
+        if marked:
+            escalate.append("unresolved conflict markers")
+            v = v + [{"kind": "conflict_markers", "path": n} for n in sorted(marked)]
     escalate += [x for x in v if isinstance(x, dict) and x.get("kind") in cfs.ESCALATE_KINDS]
     d["surface_violations"] += [x if isinstance(x, str) else json.dumps(x) for x in v]
     steps.append({"step": "fork-surface", "ok": p.returncode == 0})
@@ -422,46 +495,126 @@ def load_json(path):
         return {}
 
 
+def guard_bad(guard):
+    return guard is not None and (not guard or guard.get("ok") is not True)
+
+
+def held_of(st, mg):
+    return next((h for h in (st.get("held"), mg.get("held")) if isinstance(h, dict) and h.get("files")), {})
+
+
+def derive_outcome(st, mg, guard, ck, check_code, stalled=False, veto=None):
+    """(outcome, extra): clean | failing | escalate | workflow_review. Held drift is never clean (and so
+    never enrolled); `extra` carries enroll_stalled, which does not change the outcome."""
+    extra = ["enroll_stalled"] if stalled else []
+    if not st or not st.get("ok", False):   # status failed (exit 2/3) or missing
+        return "escalate", extra
+    if guard_bad(guard):   # a failing guard is a tool/tamper error: nothing is pushed
+        return "escalate", extra
+    if mg and not mg.get("ok", True):
+        return "escalate", extra
+    if check_code not in (None, "", "0", "1", 0, 1) or not valid_check(ck) or ck.get("escalate"):
+        # tool-error exit, missing or malformed check result is never a pass
+        return "escalate", extra
+    dirty = any(ck.get(k) for k in ("build_errors", "test_failures", "surface_violations"))
+    if not ck["ok"] or str(check_code) != "0" or dirty:   # clean needs an explicit exit 0, ok, empty failure fields
+        return "failing", extra
+    if held_of(st, mg).get("files"):
+        return "workflow_review", extra
+    if veto in ("escalate", "failing"):   # head-pinned veto: an unchanged head never turns clean
+        return veto, extra
+    return "clean", extra
+
+
+def conflict_escalation(outcome, mg, ck):
+    """True when an escalate outcome stems from merge conflicts (merge-time or committed markers)."""
+    if outcome != "escalate":
+        return False
+    if mg.get("conflicts") or (isinstance(ck, dict) and ck.get("conflicts")):
+        return True
+    for x in (ck.get("surface_violations") if isinstance(ck, dict) else None) or []:
+        try:
+            d = json.loads(x) if isinstance(x, str) else x
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("kind") == "conflict_markers":
+            return True
+    return False
+
+
+def cmd_outcome(a, root):
+    st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
+    guard = load_json(a.guard) if a.guard and Path(a.guard).exists() else None
+    outcome, extra = derive_outcome(st, mg, guard, ck, a.check_code, a.stalled, a.veto_outcome)
+    print(json.dumps({"outcome": outcome, "extra": extra, "enroll_eligible": outcome == "clean"}, indent=2))
+    return 0
+
+
+KINDS = ("generated", "hook", "legacy-hook", "local", "other")
+KIND_LABEL = {"legacy-hook": "legacy-hook (manual re-merge)"}
+
+
+def prev_kinds(path):
+    """Per-kind counts that parse from the open PR body (untrusted: integers only); absent kinds are omitted."""
+    try:
+        text = Path(path).read_text() if path else ""
+    except OSError:
+        return {}
+    got = {k: re.search(rf"^- {re.escape(KIND_LABEL.get(k, k))}: (\d{{1,6}})$", text, re.M) for k in KINDS}
+    return {k: int(m.group(1)) for k, m in got.items() if m}
+
+
 def cmd_report(a, root):
     st, mg, ck = load_json(a.status), load_json(a.merge), load_json(a.check)
     guard = load_json(a.guard) if a.guard and Path(a.guard).exists() else None
-    no_push = False
+    outcome, _ = derive_outcome(st, mg, guard, ck, a.check_code, veto=a.veto_outcome)
+    no_push = guard_bad(guard)
     short, tags = st.get("short", "?"), st.get("tags", [])
-    if (st and not st.get("ok", False)) or not st:   # status failed (exit 2/3) or missing
-        outcome = "escalate"
-    elif guard is not None and (not guard or guard.get("ok") is not True):
-        outcome = "escalate"   # the guard failing is a tool/tamper error: nothing is pushed
-        no_push = True
-    elif mg and not mg.get("ok", True):
-        outcome = "escalate"
-    elif a.check_code not in (None, "", "0", "1") or not valid_check(ck) or ck.get("escalate"):
-        # tool-error exit, missing or malformed check result is never a pass
-        outcome = "escalate"
-    elif not ck["ok"]:
-        outcome = "failing"
-    else:
-        outcome = "clean"
-    held = next((h for h in (st.get("held"), mg.get("held")) if isinstance(h, dict) and h.get("files")), {})
+    held = held_of(st, mg)
     held_files = held.get("files") or []
-    labels = ["upstream-sync"] + (["upstream-release"] if st.get("release") else []) \
-        + (["workflow-review"] if held_files else []) \
-        + ([] if outcome == "clean" else ["sync-failing"])
+    if a.demo:   # the demo PR is found and swept by its own label only
+        labels = ["sync-demo"]
+    else:
+        labels = ["upstream-sync"] + (["upstream-release"] if st.get("release") else []) \
+            + (["workflow-review"] if held_files else []) \
+            + (["sync-failing"] if outcome in ("failing", "escalate") else [])
+    if conflict_escalation(outcome, mg, ck):   # sticky: only a human removes it, after repairing
+        labels.append("sync-conflict")
     if not st.get("ok", False):
         title = ""   # leave an open PR's title alone
+    elif a.demo:
+        title = f"Upstream sync demo: develop@{short} ({st.get('commits', 0)} commits)"
     elif st.get("release"):
         title = f"Upstream release: {st['newest_tag']} (+develop@{short})"
     else:
         title = f"Upstream sync: develop@{short} ({st.get('commits', 0)} commits)"
+    # Issue key branch, never the generic fallback while a PR exists: the carried original PR branch, else the
+    # bundle branch, else the deterministic candidate branch name.
+    prefix_b = "upstream-sync-demo" if a.demo else "upstream-sync"
+    branch = a.pr_branch or mg.get("branch") or a.branch \
+        or f"{prefix_b}/{datetime.now(timezone.utc):%Y%m%d}-{short}"
     cs = mg.get("conflicts", [])
-    kinds = {k: sum(1 for c in cs if c["kind"] == k) for k in ("generated", "hook", "local", "other")}
-    L = [f"## {title}", "", f"Result: {'PASS' if outcome == 'clean' else 'FAIL'} ({outcome})", ""]
+    kinds = {k: sum(1 for c in cs if c["kind"] == k) for k in KINDS}
+    nmark = ck.get("conflict_markers") if type(ck.get("conflict_markers")) is int else None
+    if not mg:   # recheck: no merge result. Keep the last known counts, never print 0 over committed markers
+        prev = prev_kinds(a.prev_body)
+        if prev or nmark:
+            kinds = {k: prev.get(k, "unknown") for k in KINDS}   # older bodies lack some kinds
+            if nmark and not any(v for k, v in kinds.items() if k != "generated" and v != "unknown"):
+                kinds.update({k: "unknown" for k in KINDS if k != "generated"})   # never 0 over markers
+    L = [f"## {title}", "", f"Result: {'PASS' if outcome == 'clean' else 'FAIL'} ({outcome})",
+         f"Outcome: {outcome}", "Enrollment: pending", ""]
     if tags:
         L += ["### Upstream tags included", *(f"- {t}" for t in tags), ""]
-    L += ["### Conflicts by kind", *(f"- {k}: {n}" for k, n in kinds.items()), ""]
+    L += ["### Conflicts by kind", *(f"- {KIND_LABEL.get(k, k)}: {n}" for k, n in kinds.items()), ""]
+    if nmark is not None:
+        L += ["### Conflict markers", f"- found: {nmark}", ""]
     for key, name in (("build_errors", "Build errors"), ("test_failures", "Test failures"),
                       ("surface_violations", "Surface violations")):
         items = ck.get(key) if isinstance(ck.get(key), list) else []   # untrusted: null/odd values render as none
-        L += [f"### {name}", *([f"- `{x}`" for x in items] or ["- none"]), ""]
+        none = "- skipped \u2014 unresolved conflict markers" if key != "surface_violations" and ck.get("go_skipped") is True \
+            else "- none"
+        L += [f"### {name}", *([f"- `{x}`" for x in items] or [none]), ""]
     if held_files:
         L += ["### Held workflow changes (kept identical to develop; port by hand)",
               *(f"- `{h['path']}` ({h['status']})" for h in held_files),
@@ -475,14 +628,18 @@ def cmd_report(a, root):
         L += [f"Merge: {mg.get('next_action', '')}", ""]
     if a.run_url:
         L += [f"Run: {a.run_url}", ""]
+    if outcome in ("escalate", "failing") and SHA_RE.fullmatch(a.head_sha or ""):
+        L += [f"<!-- upstream-sync-veto: {a.head_sha} {outcome} -->", ""]   # the body is rewritten each run: older markers go
     md = "\n".join(L)
     if a.out:
         Path(a.out).write_text(md)
+    prefix = "Upstream sync demo" if a.demo else "Upstream sync"
     return emit("report", True, 0, "publish", outcome=outcome, title=title, labels=labels,
-                draft=outcome == "escalate", issue=outcome == "escalate" or bool(held_files),
+                draft=outcome == "escalate", issue=outcome != "clean",
                 push=not no_push,
-                issue_title=(f"Upstream sync needs repair: develop@{short}" if outcome == "escalate"
-                             else f"Upstream workflow changes held for manual porting: develop@{short}"),
+                issue_key="workflow-review workflow_review" if outcome == "workflow_review"
+                else f"{branch or 'upstream-sync'} {outcome}",
+                issue_title=f"{prefix} needs attention: develop@{short} [{outcome}]",
                 reason=st.get("next_action", "") if not st.get("ok", False) else "")
 
 
@@ -496,12 +653,14 @@ def main(argv=None):
     s.add_argument("--base", help="ref whose UPSTREAM_VERSION the PR builds on (default HEAD)")
     s.add_argument("--pending", action="store_true", help="an open sync PR exists: report mode recheck, not none")
     s.add_argument("--tags-base", help="ref (develop) the reported tag list is measured from")
+    s.add_argument("--demo-ref", help="test/upstream-sim-<n> on origin: simulated upstream (demo mode)")
     m = sub.add_parser("merge"); m.set_defaults(fn=cmd_merge)
     m.add_argument("--ref"); m.add_argument("--force", action="store_true")
     m.add_argument("--bump-only", action="store_true"); m.add_argument("--reuse", action="store_true",
                    help="stay on the current branch (the open sync PR's)")
     m.add_argument("--base-ref", help="branch whose workflows are held (workflow passes origin/develop)")
     m.add_argument("--branch"); m.add_argument("--date", help="yyyymmdd (tests)")
+    m.add_argument("--demo-ref", help="test/upstream-sim-<n> on origin: demo branch, sha= left alone")
     g = sub.add_parser("workflow-guard"); g.set_defaults(fn=cmd_workflow_guard)
     g.add_argument("--base", required=True); g.add_argument("--cand", required=True)
     sub.add_parser("conflicts").set_defaults(fn=cmd_conflicts)
@@ -509,11 +668,21 @@ def main(argv=None):
     c.add_argument("--no-go", action="store_true")
     c.add_argument("--base", help="PR base ref (e.g. origin/develop): enables budget_raised and the old-sha range check")
     c.add_argument("--label", action="append", default=[], help="PR label (e.g. surface-budget-raise)")
+    c.add_argument("--demo-ref", help="demo mode: scan sha=..origin/<ref>, exempting local/sync-demo/**")
     r = sub.add_parser("report"); r.set_defaults(fn=cmd_report)
-    r.add_argument("--status"); r.add_argument("--merge"); r.add_argument("--check")
-    r.add_argument("--check-code", help="exit code the check job captured (workflow passes it through)")
-    r.add_argument("--guard", help="workflow-guard result from the privileged merge job")
+    o = sub.add_parser("outcome"); o.set_defaults(fn=cmd_outcome)
+    for x in (r, o):
+        x.add_argument("--status"); x.add_argument("--merge"); x.add_argument("--check")
+        x.add_argument("--check-code", help="exit code the check job captured (workflow passes it through)")
+        x.add_argument("--guard", help="workflow-guard result from the privileged merge job")
+        x.add_argument("--veto-outcome", choices=("escalate", "failing"), help="head-pinned veto still on the PR head")
+    o.add_argument("--stalled", action="store_true", help="the open sync PR's auto-merge is stalled > 24h")
     r.add_argument("--run-url"); r.add_argument("--out")
+    r.add_argument("--prev-body", help="the open sync PR's current body, for a recheck's last known counts")
+    r.add_argument("--head-sha", help="PR head this report describes (40-hex); pins the veto marker")
+    r.add_argument("--branch", help="sync branch for issue_key when there is no merge result")
+    r.add_argument("--pr-branch", help="branch of the original open sync PR (carried from the merge job); wins for issue_key")
+    r.add_argument("--demo", action="store_true", help="demo labels/title: sync-demo only")
     a = ap.parse_args(argv)
     try:
         return a.fn(a, Path(a.root))

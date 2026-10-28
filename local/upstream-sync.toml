@@ -15,6 +15,16 @@ go_modules = [
   "services/nvpair-node-settings", "services/tests",
 ]
 
+# The 10 Local CI check names (job `name:`s in .github/workflows/local-ci.yml; the Go matrix is expanded).
+# Branch protection on develop must require exactly this set before a sync PR is enrolled in auto-merge;
+# test_required_checks_match_local_ci keeps it in step with the workflow.
+required_checks = [
+  "Fork surface", "Python tests",
+  "Go test (nvpair-proxy)", "Go test (nvpair-engine-manager)", "Go test (shared)",
+  "Go test (nvpair-node-scanner)", "Go test (nvpair-ui-broker)", "Go test (nvpair-job-scheduler)",
+  "Go test (nvpair-node-settings)", "Go cross-process tests",
+]
+
 # Known failures skipped in the sync job only (local-ci.yml runs them unskipped).
 # Drop an entry once the first local-ci run shows it passing on ubuntu.
 [go_skip]
