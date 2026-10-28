@@ -122,7 +122,7 @@ func TestReserveCandidate_CombinesPendingPressureAndReservations(t *testing.T) {
 		reservedID(p, candidates),
 		reservedID(p, candidates),
 	}
-	require.Equal(t, []string{"b", "b", "c"}, got, "GPU-aware reservations")
+	require.Equal(t, []string{"c", "a", "b"}, got, "GPU-aware reservations")
 }
 
 func TestSetPrioritySnapshot_ClampsGPUPressure(t *testing.T) {

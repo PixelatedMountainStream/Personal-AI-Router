@@ -6,6 +6,9 @@ package main
 import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"nvpair-shared/schedulerwire"
@@ -36,4 +39,24 @@ func TestReserveCandidate_FullLocalYieldsToFreeRemote(t *testing.T) {
 	}
 	p.priorityMu.Unlock()
 	require.Equal(t, "a-remote", reservedID(p, localTieCandidates()), "want remote with free slot")
+}
+
+// Model lookups (/api/show) only need an owner with the model installed, not a
+// loaded slot; inference for the same model still requires residency.
+func TestHandleHTTP_ModelLookupIgnoresResidency(t *testing.T) {
+	tc := ollamaCase(t)
+	a, _ := newCountingServer(t, 200, "")
+	disc := NewDiscovery()
+	disc.AddManual(nodeForModel(t, "a", a, tc.advertisedModel))
+	p := testProxy(tc.profile, disc, tc.profile.FacadePort)
+	p.capacity = &fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty}}
+
+	rec := httptest.NewRecorder()
+	p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/show", strings.NewReader(`{"name":"qwen3"}`)))
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	rec = httptest.NewRecorder()
+	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	require.NotEmpty(t, rec.Body.String())
 }

@@ -1227,11 +1227,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// whether a matching Started was seen.
 	reqID := strconv.FormatUint(f.nextRequestID.Add(1), 10)
 
-<<<<<<< HEAD
-	// Parse the request's model before choosing a node. Model eligibility only
-	// applies to inference routes; control endpoints retain their existing
-	// routing behavior even when their JSON happens to contain a model field.
-	bodyBytes, model := bufferBodyAndModel(r)
+	// Parse the request's model before choosing a node. Model eligibility
+	// applies to inference routes and model lookups (/api/show); other control
+	// endpoints retain their existing routing behavior even when their JSON
+	// happens to contain a model field.
+	isInf := isInferenceRequest(f.profile, r.Method, r.URL.Path)
+	role, routed := f.profile.roleFor(r.Method, r.URL.Path)
+	lookup := routed && role == roleModelLookupPOST
+	bodyBytes, model := bufferBodyAndModel(r, lookup)
 	if r.URL.Path == "/v1/responses" && len(bodyBytes) > 0 {
 		if nb := normalizeResponsesInput(bodyBytes); len(nb) != len(bodyBytes) || !bytes.Equal(nb, bodyBytes) {
 			bodyBytes = nb
@@ -1239,21 +1242,13 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			r.Header.Set("Content-Length", strconv.Itoa(len(nb)))
 		}
 	}
-=======
-	// Parse the request's model before choosing a node. Model eligibility
-	// applies to inference routes and model lookups (/api/show); other control
-	// endpoints retain their existing routing behavior even when their JSON
-	// happens to contain a model field.
->>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
-	isInf := isInferenceRequest(f.profile, r.Method, r.URL.Path)
-	role, routed := f.profile.roleFor(r.Method, r.URL.Path)
-	lookup := routed && role == roleModelLookupPOST
-	bodyBytes, model := bufferBodyAndModel(r, lookup)
 	routingModel := ""
 	if isInf || lookup {
 		routingModel = model
 	}
-	candidates, notLoaded := f.resolveCandidatesN(routingModel)
+	// A lookup reads the model from disk and loads nothing, so it needs an
+	// owner (advertised inventory), not a loaded slot: skip the residency filter.
+	candidates, notLoaded := f.resolveCandidatesFor(routingModel, !lookup)
 	if cors.IsPreflight(r) {
 		targets := make([]cors.Target, 0, len(candidates))
 		for _, cand := range candidates {
@@ -1323,17 +1318,6 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if len(candidates) == 0 {
 		rejectionBody := `{"error":"no active node selected or available"}`
 		rejectionError := "no active node"
-<<<<<<< HEAD
-		status := http.StatusBadGateway
-		if isInf && model != "" {
-			rejectionBody = `{"error":"no available node advertises the requested model"}`
-			rejectionError = "no node advertises requested model"
-			if notLoaded > 0 {
-				msg, _ := json.Marshal("no live node has model " + model + " loaded")
-				rejectionBody = `{"error":` + string(msg) + `}`
-				rejectionError = "no live node has model loaded"
-				status = http.StatusServiceUnavailable
-=======
 		rejectionStatus := http.StatusBadGateway
 		if routingModel != "" {
 			rejectionBody = `{"error":"no available node advertises the requested model"}`
@@ -1342,26 +1326,22 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				// A model lookup for a model nobody has is a not-found, as
 				// Ollama itself answers it, not a gateway failure.
 				rejectionStatus = http.StatusNotFound
->>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
+			} else if notLoaded > 0 {
+				msg, _ := json.Marshal("no live node has model " + model + " loaded")
+				rejectionBody = `{"error":` + string(msg) + `}`
+				rejectionError = "no live node has model loaded"
+				rejectionStatus = http.StatusServiceUnavailable
 			}
 		}
 		slog.Warn("proxy request rejected",
 			"id", reqID, "method", r.Method, "path", r.URL.Path,
 			"remote", r.RemoteAddr, "reason", rejectionError)
-<<<<<<< HEAD
-		http.Error(w, rejectionBody, status)
-=======
 		http.Error(w, rejectionBody, rejectionStatus)
->>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 		_ = f.notify("proxy/request", RequestEvent{
 			ID:       reqID,
 			Method:   r.Method,
 			Path:     r.URL.Path,
-<<<<<<< HEAD
-			Status:   status,
-=======
 			Status:   rejectionStatus,
->>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 			Duration: time.Since(start).Milliseconds(),
 			Error:    rejectionError,
 		})
@@ -2129,6 +2109,12 @@ func (f *facade) resolveCandidates(model string) []candidate {
 // resolveCandidatesN is resolveCandidates that also returns how many owners of
 // the model were dropped because no live node has it loaded.
 func (f *facade) resolveCandidatesN(model string) ([]candidate, int) {
+	return f.resolveCandidatesFor(model, true)
+}
+
+// resolveCandidatesFor is resolveCandidatesN with the residency filter
+// optional: with requireEligible false, every advertised owner is a candidate.
+func (f *facade) resolveCandidatesFor(model string, requireEligible bool) ([]candidate, int) {
 	p := f.host
 	notLoaded := 0
 	id := f.SelectedID()
@@ -2151,7 +2137,7 @@ func (f *facade) resolveCandidatesN(model string) ([]candidate, int) {
 			if !nodeAdvertisesModel(f.profile, node, model) {
 				continue
 			}
-			if !p.eligible(node.ID, f.profile.Name, model) {
+			if requireEligible && !p.eligible(node.ID, f.profile.Name, model) {
 				notLoaded++
 				continue
 			}
