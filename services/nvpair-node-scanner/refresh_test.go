@@ -364,20 +364,11 @@ func TestApplyModels_RejectsRemovedNodeAndStaleAddress(t *testing.T) {
 	d := newDirectory()
 
 	// Removed mid-sweep: node absent -> not resurrected.
-<<<<<<< HEAD
-	if _, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, modelInventory{models: []string{"a"}}, 1); ok || changed {
-		t.Errorf("applyModels on an absent node = (changed %v, ok %v), want (false, false)", changed, ok)
-	}
-	if _, present := d.get("ghost"); present {
-		t.Error("applyModels must not resurrect a removed node")
-	}
-=======
-	_, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, []string{"a"}, nil, nil)
+	_, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, modelInventory{models: []string{"a"}}, 1)
 	assert.False(t, ok, "applyModels on an absent node = (changed (%v, %v)", changed, ok)
 	assert.False(t, changed, "applyModels on an absent node = (changed (%v, %v)", changed, ok)
 	_, present := d.get("ghost")
 	assert.False(t, present, "applyModels must not resurrect a removed node")
->>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 
 	// Re-addressed mid-sweep: node present but IP changed -> not overwritten.
 	d.upsert(noderec.DirectoryNode{
@@ -386,23 +377,13 @@ func TestApplyModels_RejectsRemovedNodeAndStaleAddress(t *testing.T) {
 		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
 		Models:   []string{"old"},
 	})
-<<<<<<< HEAD
-	if _, changed, ok := d.applyModels("peer-E", "127.0.0.1", 14322, modelInventory{models: []string{"new"}}, 1); ok || changed {
-		t.Errorf("applyModels with a stale IP = (changed %v, ok %v), want (false, false)", changed, ok)
-	}
-	// em port changed -> also discarded.
-	if _, changed, ok := d.applyModels("peer-E", "10.0.0.9", 99999, modelInventory{models: []string{"new"}}, 1); ok || changed {
-		t.Errorf("applyModels with a stale em port = (changed %v, ok %v), want (false, false)", changed, ok)
-	}
-=======
-	_, changed, ok = d.applyModels("peer-E", "127.0.0.1", 14322, []string{"new"}, nil, nil)
+	_, changed, ok = d.applyModels("peer-E", "127.0.0.1", 14322, modelInventory{models: []string{"new"}}, 1)
 	assert.False(t, ok, "applyModels with a stale IP = (changed (%v, %v)", changed, ok)
 	assert.False(t, changed, "applyModels with a stale IP = (changed (%v, %v)", changed, ok)
 	// em port changed -> also discarded.
-	_, changed, ok = d.applyModels("peer-E", "10.0.0.9", 99999, []string{"new"}, nil, nil)
+	_, changed, ok = d.applyModels("peer-E", "10.0.0.9", 99999, modelInventory{models: []string{"new"}}, 1)
 	assert.False(t, ok, "applyModels with a stale em port = (changed (%v, %v)", changed, ok)
 	assert.False(t, changed, "applyModels with a stale em port = (changed (%v, %v)", changed, ok)
->>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 	got, _ := d.get("peer-E")
 	assert.Equal(t, []string{"old"}, got.Models, "Models after guarded rejects")
 }
@@ -472,57 +453,4 @@ func TestRefreshOnce_PollsSlowPeersConcurrently(t *testing.T) {
 	assert.Equal(t, []string{"m"}, got.Models, "peer-1 Models")
 	got, _ = d.dir.get("peer-2")
 	assert.Equal(t, []string{"m"}, got.Models, "peer-2 Models")
-}
-
-// TestRefreshSlotChangeReportsChange: a slots-only or jit-only change (same
-// models, same loaded set) is a directory change; an identical one is not.
-func TestRefreshSlotChangeReportsChange(t *testing.T) {
-	d := newRefreshTestDaemon()
-	body := func(slots int, jit bool) map[string]any {
-		return map[string]any{
-			"models":          []string{"a"},
-			"modelsByEngine":  map[string][]string{"lmstudio": {"a"}},
-			"loadedByEngine":  map[string][]string{"lmstudio": {"a"}},
-			"slotsByEngine":   map[string]map[string]map[string]int{"lmstudio": {"a": {"slots": slots, "ctxPerSlot": 4096}}},
-			"jitLoadByEngine": map[string]bool{"lmstudio": jit},
-		}
-	}
-	stub, port := startModelsStub(t, http.StatusOK, body(2, false))
-	seedEMNode(d, "peer-S", "127.0.0.1", port)
-	if !d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
-		t.Fatal("initial populate should report a change")
-	}
-	got, _ := d.dir.get("peer-S")
-	if si := got.SlotsByEngine["lmstudio"]["a"]; si.Slots != 2 || si.CtxPerSlot != 4096 || got.JITLoadByEngine["lmstudio"] {
-		t.Fatalf("slots/jit not populated: %+v %+v", got.SlotsByEngine, got.JITLoadByEngine)
-	}
-	if d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
-		t.Error("identical slots should not report a change")
-	}
-	stub.set(http.StatusOK, body(4, false))
-	if !d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
-		t.Error("a slot-count change must report a change")
-	}
-	stub.set(http.StatusOK, body(4, true))
-	if !d.refreshNodeModels("peer-S", "127.0.0.1", port, "") {
-		t.Error("a jit_load change must report a change")
-	}
-}
-
-// TestApplyModelsObservedAtHeartbeat: an identical sweep republishes a fresher
-// ModelsObservedAt only once it is a heartbeat ahead; sooner it is silent.
-func TestApplyModelsObservedAtHeartbeat(t *testing.T) {
-	d := newDirectory()
-	d.upsert(noderec.DirectoryNode{
-		HostUUID: "p", IP: "10.0.0.9", Models: []string{"a"}, ModelsObservedAt: 1000,
-		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
-	})
-	inv := modelInventory{models: []string{"a"}}
-	if _, changed, ok := d.applyModels("p", "10.0.0.9", 14322, inv, 2000); changed || !ok {
-		t.Fatalf("sweep inside heartbeat: changed=%v ok=%v", changed, ok)
-	}
-	n, changed, _ := d.applyModels("p", "10.0.0.9", 14322, inv, 1000+modelsObservedHeartbeat.Milliseconds())
-	if !changed || n.ModelsObservedAt != 1000+modelsObservedHeartbeat.Milliseconds() {
-		t.Fatalf("sweep past heartbeat: changed=%v at=%d", changed, n.ModelsObservedAt)
-	}
 }

@@ -72,18 +72,11 @@ func TestModelsClient_ReusesPeerConnections(t *testing.T) {
 	// pinned mTLS path instead of the plaintext self-fetch.
 	const rounds = 5
 	for i := 0; i < rounds; i++ {
-<<<<<<< HEAD
 		inv, ok := d.fetchModels("localhost", port, "uuid-peer")
 		models := inv.models
-		if !ok || len(models) != 1 || models[0] != "m" {
-			t.Fatalf("round %d: ok=%v models=%v", i, ok, models)
-		}
-=======
-		models, _, _, ok := d.fetchModels("localhost", port, "uuid-peer")
 		require.True(t, ok, "round (%v, %v, %v)", i, ok, models)
 		require.Len(t, models, 1, "round (%v, %v, %v)", i, ok, models)
 		require.Equal(t, "m", models[0], "round (%v, %v, %v)", i, ok, models)
->>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 	}
 
 	mu.Lock()

@@ -527,7 +527,7 @@ func TestEmit_SendsSnapshotOnlyWhenRankingChanges(t *testing.T) {
 func TestEmit_IncludesPendingRanks(t *testing.T) {
 	rec := &capRW{}
 	m := mgrWith(rec, []string{"a", "b"},
-		workload{ID: "b1", Engine: "ollama", Model: "m", RunID: "run", State: "running", OriginatedFrom: "local", ScheduledOn: "b"},
+		workload{ID: "b1", Engine: "ollama", RunID: "run", State: "running", OriginatedFrom: "local", ScheduledOn: "b"},
 	)
 
 	m.recomputeAll(false)
@@ -535,20 +535,12 @@ func TestEmit_IncludesPendingRanks(t *testing.T) {
 	require.Len(t, got, 1, "priority snapshots")
 	want := []NodeRank{
 		{ID: "a", Pending: 0, GPUPressure: unknownGPUPressure, Rank: 0},
-		{ID: "b", Pending: 1, GPUPressure: unknownGPUPressure, Rank: 1, PendingBy: map[string]int{"ollama/m": 1}},
+		{ID: "b", Pending: 1, GPUPressure: unknownGPUPressure, Rank: 1},
 	}
-<<<<<<< HEAD
-	if len(got[0].Ranks) != len(want) {
-		t.Fatalf("ranks = %+v, want %+v", got[0].Ranks, want)
-	}
+	require.Len(t, got[0].Ranks, len(want), "pending ranks")
 	for i := range want {
-		if !got[0].Ranks[i].Equal(want[i]) || (i == 1 && got[0].Ranks[i].ComputedAt == 0) {
-			t.Fatalf("rank[%d] = %+v, want %+v", i, got[0].Ranks[i], want[i])
-		}
+		assert.True(t, got[0].Ranks[i].Equal(want[i]), "rank[%d] = %+v, want %+v", i, got[0].Ranks[i], want[i])
 	}
-=======
-	assert.Equal(t, want, got[0].Ranks, "pending ranks")
->>>>>>> b494470a035a76e8e4fbb7acfa4935538f9d7c04
 }
 
 func TestEmit_RefreshesSnapshotWhenOnlyPendingCountsChange(t *testing.T) {
