@@ -55,6 +55,7 @@ class Sync(unittest.TestCase):
         self.put(self.fork, "local/upstream-sync.toml", CONF)
         self.put(self.fork, "local/fork-surface.toml", "allow = []\n")
         self.put(self.fork, "local/neutralized.txt", "")
+        self.put(self.fork, "local/FORK_SURFACE.md", "")   # empty records: the legacy guard fails closed without a file
         self.set_version(self.c1, "v1.0.0")
         self.fetch()
 
@@ -500,6 +501,57 @@ class Sync(unittest.TestCase):
         self.put(self.fork, "local/FORK_SURFACE.md", "### L-a\nfiles: a.txt\nkind: legacy\nrecipe: by hand\n"
                  "### S1\nfiles: b.txt\nkind: data\nrecipe: r\n")
         self.assertEqual([su.classify(p, su.policy(self.fork)) for p in ("a.txt", "b.txt")], ["legacy-hook", "hook"])
+
+    def legacy_run(self, kind, upstream_file):
+        self.put(self.fork, "local/FORK_SURFACE.md", f"### {'L-a' if kind == 'legacy' else 'P1'}\nfiles: a.txt\n"
+                 f"kind: {kind}\nrecipe: r\n" + ("Tests: m p -run 'T'\n" if kind == "hook" else ""))
+        git(self.fork, "add", "-A")
+        git(self.fork, "commit", "-qm", "records")
+        self.up_commit(upstream_file, "2\n")
+        self.fetch()
+        code, st = self.sync("status")
+        self.assertEqual(code, 0, st)
+        _, r = self.sync("report", *self.results({"ok": True, "tags": [], "short": "abc", "commits": 1,
+                                                  "legacy_touched": st["legacy_touched"]}, {"ok": True},
+                                                 {"ok": True, "escalate": False}), "--check-code", "0")
+        return st, r
+
+    def test_legacy_touch_is_held_labelled_and_listed(self):
+        st, r = self.legacy_run("legacy", "a.txt")
+        self.assertEqual(st["legacy_touched"], ["a.txt"])
+        self.assertEqual((r["outcome"], "legacy-touch" in r["labels"]), ("legacy_touch", True))
+        self.assertEqual((r["issue"], r["push"]), (False, True))   # PR stays open and pushed; no issue filed
+
+    def test_guard_error_blocks_enrollment_without_label(self):
+        for bad in (None, "### X\nfiles: a.txt\nkind: bogus\nrecipe: r\n"):   # missing, then unparseable
+            fs = self.fork / "local/FORK_SURFACE.md"
+            fs.unlink() if bad is None else fs.write_text(bad)
+            self.up_commit("a.txt", f"{bad}\n")
+            self.fetch()
+            code, st = self.sync("status")
+            self.assertEqual((code, st["legacy_touched"]), (0, []))
+            _, r = self.sync("report", *self.results({"ok": True, "tags": [], "short": "abc", "commits": 1,
+                                                      "legacy_error": st["legacy_error"]}, {"ok": True},
+                                                     {"ok": True, "escalate": False}), "--check-code", "0", "--out", str(self.fork / "r.md"))
+            self.assertEqual((r["outcome"], r["issue"], "legacy-touch" in r["labels"]), ("enroll_refused", True, False))
+            self.assertIn("Enrollment: refused: legacy-touch guard error", (self.fork / "r.md").read_text())
+
+    def test_guard_error_shown_when_workflow_review_wins(self):
+        md = self.fork / "r.md"
+        held = {"files": [{"status": "M", "path": ".github/workflows/x.yml"}], "commits": []}
+        _, r = self.sync("report", *self.results({"ok": True, "tags": [], "short": "abc", "commits": 1, "held": held,
+                                                  "legacy_error": "legacy-touch guard error: boom"}, {"ok": True},
+                                                 {"ok": True, "escalate": False}), "--check-code", "0", "--out", str(md))
+        self.assertEqual(r["outcome"], "workflow_review")
+        self.assertIn("legacy-touch guard error: boom", md.read_text())
+
+    def test_non_legacy_upstream_change_stays_clean(self):
+        st, r = self.legacy_run("legacy", "other.txt")
+        self.assertEqual((st["legacy_touched"], r["outcome"], "legacy-touch" in r["labels"]), ([], "clean", False))
+
+    def test_hook_record_does_not_trigger_legacy_guard(self):
+        st, r = self.legacy_run("hook", "a.txt")
+        self.assertEqual((st["legacy_touched"], r["outcome"]), ([], "clean"))
 
     def test_demo_merge_keeps_version_and_demo_prefix(self):
         sim = self.make_sim()

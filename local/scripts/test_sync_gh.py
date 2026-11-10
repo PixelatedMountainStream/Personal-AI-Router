@@ -126,7 +126,7 @@ class T(unittest.TestCase):
         self.assertEqual(self.gh.calls("pr", "merge"), [])   # idempotent: nothing to disable
 
     def test_enroll_refuses_and_disarms_on_veto_labels(self):
-        for lab in ("workflow-review", "sync-failing", "ci-failing", "sync-conflict"):
+        for lab in ("workflow-review", "legacy-touch", "sync-failing", "ci-failing", "sync-conflict"):
             rs = enroll_responses()
             rs[1] = entry(["pr", "view"], ghstub.pr(labels=("upstream-sync", lab), enabled_at=hours_ago(1)))
             o = self.enroll(rs)
