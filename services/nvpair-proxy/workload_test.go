@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -64,8 +65,7 @@ func TestHandleHTTP_PublishesWorkloadBeforeFirstResponseByte(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, tc engineCase) {
 		received := make(chan struct{}, 1)
 		release := make(chan struct{})
-		var releaseOnce sync.Once
-		doRelease := func() { releaseOnce.Do(func() { close(release) }) }
+		doRelease := sync.OnceFunc(func() { close(release) })
 
 		slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			select {
@@ -74,7 +74,8 @@ func TestHandleHTTP_PublishesWorkloadBeforeFirstResponseByte(t *testing.T) {
 			}
 			<-release // no response byte until the test releases us
 			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, `{"done":true}`)
+			_, err := io.WriteString(w, `{"done":true}`)
+			assert.NoError(t, err)
 		}))
 		// Deferred order matters (LIFO): doRelease runs BEFORE slow.Close so
 		// the blocked upstream handler is unblocked before the server is torn

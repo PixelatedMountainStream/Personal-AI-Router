@@ -47,23 +47,22 @@ func TestFilterNodeRows_MatchesNameAndAddress(t *testing.T) {
 		{key: "c", name: "Server-01", address: "10.0.1.7"},
 	}
 
-	cases := map[string][]string{
-		"work":        {"a"},      // name substring
-		"10.0.0.":     {"a", "b"}, // shared address prefix
-		"192.168.1.9": {"a"},      // a secondary address
-		"SERVER":      {"c"},      // case-insensitive
-		"  laptop  ":  {"b"},      // surrounding whitespace ignored
-		"nothing":     {},
+	test := func(name, needle string, want ...string) {
+		t.Run(name, func(t *testing.T) {
+			got := filterNodeRows(rows, needle)
+			keys := make([]string, len(got))
+			for i, row := range got {
+				keys[i] = row.key
+			}
+			assert.Equal(t, append([]string{}, want...), keys)
+		})
 	}
-	for needle, want := range cases {
-		got := filterNodeRows(rows, needle)
-		if !assert.Len(t, got, len(want), "filter %q", needle) {
-			continue
-		}
-		for i, key := range want {
-			assert.Equal(t, key, got[i].key, "filter %q row %d", needle, i)
-		}
-	}
+	test("name substring", "work", "a")
+	test("shared address prefix", "10.0.0.", "a", "b")
+	test("secondary address", "192.168.1.9", "a")
+	test("case insensitive name", "SERVER", "c")
+	test("surrounding whitespace", "  laptop  ", "b")
+	test("no matches", "nothing")
 
 	// An empty filter is not a filter.
 	assert.Len(t, filterNodeRows(rows, "   "), len(rows), "blank filter must preserve rows")
@@ -153,7 +152,7 @@ func TestMerge_DeduplicatesAcrossFeeds(t *testing.T) {
 
 	require.Len(t, rows, 1, "one machine must produce one row")
 	row := rows[0]
-	assert.Equal(t, "m1", row.manualID, "manual handle must survive the merge")
+	assert.Equal(t, []string{"m1"}, row.manualIDs, "manual handle must survive the merge")
 	assert.Equal(t, nodeMembership(membershipMember), row.membership)
 	assert.Equal(t, 2, row.modelCount())
 }
@@ -192,7 +191,7 @@ func TestMerge_UsesEveryFactTheManualWorkerReports(t *testing.T) {
 		manual:     []manualNode{{ID: "m1", Address: "gpu-box.lan", HostUUID: "u1", NodeInfoUp: true}},
 	})
 	require.Len(t, rows, 1, "the manual entry must be joined by its UUID")
-	assert.Equal(t, "m1", rows[0].manualID, "the joined row must retain its manual handle")
+	assert.Equal(t, []string{"m1"}, rows[0].manualIDs, "the joined row must retain its manual handle")
 
 	// A hand-added node reached on a non-default node-info port, over TLS.
 	rows = mergeNodes(nodeFeeds{
@@ -210,6 +209,21 @@ func TestMerge_UsesEveryFactTheManualWorkerReports(t *testing.T) {
 	}
 }
 
+// TestMerge_KeepsEveryManualEntryForOneMachine checks a machine added twice, by
+// hostname and by IP, keeps both entries. Removing it must forget both, or the
+// one left behind brings it back when the broker next starts.
+func TestMerge_KeepsEveryManualEntryForOneMachine(t *testing.T) {
+	rows := mergeNodes(nodeFeeds{
+		discovered: []availableNode{{HostUUID: "u1", Name: "gpu-box", IPAddress: "10.0.0.5", Port: 14318}},
+		manual: []manualNode{
+			{ID: "m1", Address: "gpu-box.lan", HostUUID: "u1", NodeInfoUp: true},
+			{ID: "m2", Address: "10.0.0.5", HostUUID: "u1", NodeInfoUp: true},
+		},
+	})
+	require.Len(t, rows, 1, "both entries must join the one machine")
+	assert.Equal(t, []string{"m1", "m2"}, rows[0].manualIDs)
+}
+
 // TestAReusedAddressDoesNotMergeTwoMachines checks an address is not taken for
 // an identity. A manual entry whose probe read one UUID must not fold into a
 // discovered row with a different UUID at the same address — that is another
@@ -223,14 +237,14 @@ func TestAReusedAddress_DoesNotMergeTwoMachines(t *testing.T) {
 		manual:     []manualNode{{ID: "m1", Name: "a", Address: "10.0.0.5", HostUUID: "machine-a", NodeInfoUp: true}},
 	})
 	require.Len(t, rows, 2, "two machines at one address must remain distinct")
-	assert.Empty(t, findRow(t, rows, "b").manualID, "machine b must not take the manual entry for machine a")
+	assert.Empty(t, findRow(t, rows, "b").manualIDs, "machine b must not take the manual entry for machine a")
 
 	rows = mergeNodes(nodeFeeds{
 		discovered: discovered,
 		manual:     []manualNode{{ID: "m1", Address: "10.0.0.5"}},
 	})
 	require.Len(t, rows, 1, "an unidentified entry must join the machine at its address")
-	assert.Equal(t, "m1", rows[0].manualID)
+	assert.Equal(t, []string{"m1"}, rows[0].manualIDs)
 }
 
 // TestTLSNodeInfoIsNotPolledInPlainText checks the detail screen shows the
@@ -251,15 +265,15 @@ func TestTLSNodeInfo_IsNotPolledInPlainText(t *testing.T) {
 // TestMembershipGovernsInvitability is the guard for re-inviting a node that
 // already has a relationship. Only a standalone node may be invited.
 func TestNodeInvitation_RequiresEligibleClusterMembership(t *testing.T) {
-	cases := map[nodeMembership]bool{
-		membershipNone:    true,
-		membershipMember:  false,
-		membershipForeign: false,
-		membershipPending: false,
+	test := func(name string, membership nodeMembership, want bool) {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, want, membership.invitable())
+		})
 	}
-	for membership, want := range cases {
-		assert.Equal(t, want, membership.invitable(), "%v", membership)
-	}
+	test("standalone node can be invited", membershipNone, true)
+	test("cluster member cannot be invited", membershipMember, false)
+	test("foreign member cannot be invited", membershipForeign, false)
+	test("pairing node cannot be invited", membershipPending, false)
 }
 
 // TestMergeMarksSelf checks this machine is identified and always reads online.

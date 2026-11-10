@@ -23,7 +23,7 @@ func TestOllama_IsPreparedFirst(t *testing.T) {
 }
 
 func TestEngineNames_ReturnsCanonicalOrder(t *testing.T) {
-	assert.Equal(t, []string{"ollama", "lmstudio", "llamacpp"}, Names())
+	assert.Equal(t, []string{"ollama", "lmstudio", "llamacpp", "vllm"}, Names())
 }
 
 // There are two proxy identities: ComponentName per facade, ProxyComponent per
@@ -112,7 +112,7 @@ func TestEngineLookup_ResolvesDeclaredNamesAndKeys(t *testing.T) {
 		assert.Equal(t, e.ComponentName(), byName.ComponentName())
 	}
 
-	_, ok := ByName("vllm")
+	_, ok := ByName("nosuchengine")
 	assert.False(t, ok, "ByName should report ok=false for an unknown engine")
 }
 
@@ -131,22 +131,23 @@ func TestAddressedMethod_RoundTripsEngineAndMethod(t *testing.T) {
 // count as an address. Treating "errors:report" as engine "errors" would strip
 // a real method down to "report" and route it nowhere.
 func TestUnaddressedMethods_AreNotMistakenForAddressed(t *testing.T) {
-	for _, method := range []string{
-		"ready",
-		"errors:report",
-		"errors:clear",
-		"discovery:subscribe",
-		"discovery:nodes",
-		"discovery:node-activity",
-		"workload:started",
-		"proxy/request",
-		"node/selection-changed",
-		"log/set-level",
-	} {
-		engine, bare := SplitAddressedMethod(method)
-		assert.Equal(t, "", engine)
-		assert.Equal(t, method, bare)
+	test := func(method string) {
+		t.Run(method, func(t *testing.T) {
+			engine, bare := SplitAddressedMethod(method)
+			assert.Empty(t, engine)
+			assert.Equal(t, method, bare)
+		})
 	}
+	test("ready")
+	test("errors:report")
+	test("errors:clear")
+	test("discovery:subscribe")
+	test("discovery:nodes")
+	test("discovery:node-activity")
+	test("workload:started")
+	test("proxy/request")
+	test("node/selection-changed")
+	test("log/set-level")
 }
 
 // An engine id that is a prefix of another would make addresses ambiguous:

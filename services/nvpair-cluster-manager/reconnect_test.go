@@ -4,7 +4,6 @@
 package main
 
 import (
-	"context"
 	"net"
 	"strconv"
 	"testing"
@@ -39,13 +38,12 @@ func TestSetMemberAddr_ReportsHostAndPortChanges(t *testing.T) {
 // client's real source IP from the authenticated connection while preserving
 // the client's known listening port.
 func TestHandleRoster_LearnsSourceAddr(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	mA := newTestManagerPort(t, 15021)
 	mB := newTestManagerPort(t, 15022)
-	go func() { _ = mA.runHTTP(ctx) }()
-	go func() { _ = mB.runHTTP(ctx) }()
+	startTestHTTP(t, mA, ctx)
+	startTestHTTP(t, mB, ctx)
 	time.Sleep(400 * time.Millisecond)
 
 	pinTrusted(t, mA, mB.identity.NodeUUID, string(mB.identity.CertPEM), mB.identity.CertFingerprint)

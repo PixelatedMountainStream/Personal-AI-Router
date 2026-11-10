@@ -116,7 +116,7 @@ reserved for inference clients.
 | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
 | `app:ready`                                          | Complete broker startup and refresh snapshots                                                                                   | `state:request-refresh`                                   |
 | `discovery:nodes-changed`                            | Replace discovery snapshot and diff nodes                                                                                       | `discovery:nodes-changed`, `nodes:upsert`, `nodes:remove` |
-| `ollama-proxy:ready` / `lmstudio-proxy:ready` / `llamacpp-proxy:ready` | Record engine proxy port                                                                                          | `engines:state-changed`                                   |
+| `ollama-proxy:ready` / `lmstudio-proxy:ready` / `llamacpp-proxy:ready` / `vllm-proxy:ready` | Record engine proxy port                                                                                          | `engines:state-changed`                                   |
 | proxy `node/*`                                       | Update per-engine node presence; the advertised port is the peer's promoted proxy port (not the engine's private loopback port) | node and engine pushes                                    |
 | `engine:ready` / `engine:state-changed`              | Update engine facts and models                                                                                                  | `engines:state-changed`                                   |
 | `engine:settings-changed`                            | Validate and republish the owning node's settings snapshot                                                                      | `engines:settings-changed`                                |
@@ -194,10 +194,13 @@ stopping uses immediate `taskkill /T /F`.
 
 Shutdown ordering belongs to the broker. Personal AI Router sends the broker `shutdown` and
 does not stop the engines itself. The broker stops the proxy first, so no new
-inference arrives, then calls `engine:prepare-shutdown`, which stops local
-engine processes without clearing their persisted desired state, then waits for
-each worker to exit without force-killing it, so engines are not orphaned. The
-broker restores enabled engines on the next startup.
+inference arrives, then calls `engine:prepare-shutdown` before tearing down its
+workers, which stops local engine processes without clearing their persisted
+desired state, so engines are not orphaned. The broker then joins its workers
+concurrently within one shared teardown budget. A worker that misses its grace
+is terminated and then killed, except engine-manager on Windows, whose join is
+abandoned rather than killed mid-stop. The broker restores enabled engines on
+the next startup.
 
 ## Discovery and models
 

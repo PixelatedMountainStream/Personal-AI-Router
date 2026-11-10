@@ -48,7 +48,7 @@ func startNodeSettings(t *testing.T, settingsPath string) (io.WriteCloser, <-cha
 	require.NoError(t, cmd.Start(), "start node-settings")
 	t.Logf("node-settings started: pid=%d settings=%s", cmd.Process.Pid, settingsPath)
 
-	ch := startMsgReader(stdoutPipe)
+	ch := startMsgReader(t, stdoutPipe)
 
 	cleanup := func() {
 		stdinPipe.Close()
@@ -67,9 +67,9 @@ func startNodeSettings(t *testing.T, settingsPath string) (io.WriteCloser, <-cha
 // nextID hands out a monotonically increasing JSON-RPC ID per process
 // run. Tests in the same package may run in parallel via t.Run, so
 // atomic is required even though most callers are single-goroutine.
-var rpcIDCounter int64
+var rpcIDCounter atomic.Int64
 
-func newRPCID() int64 { return atomic.AddInt64(&rpcIDCounter, 1) }
+func newRPCID() int64 { return rpcIDCounter.Add(1) }
 
 // callRPC sends a JSON-RPC request and blocks until the response for
 // that ID arrives or the timeout fires. It deliberately re-implements
@@ -99,8 +99,11 @@ func callRPC(t *testing.T, in io.Writer, msgs <-chan jsonrpc.Message, method str
 				continue
 			}
 			var gotID int64
-			if msg.ID != nil && json.Unmarshal(*msg.ID, &gotID) == nil && gotID == id {
-				return msg
+			if msg.ID != nil {
+				require.NoError(t, json.Unmarshal(*msg.ID, &gotID))
+				if gotID == id {
+					return msg
+				}
 			}
 		case <-timer.C:
 			require.FailNowf(t, "timed out waiting for response", "method %s (id=%d) after %s", method, id, timeout)
@@ -239,21 +242,21 @@ func TestNodeSettings_PersistsAcrossProcessRestart(t *testing.T) {
 	var sync struct {
 		Value bool `json:"value"`
 	}
-	_ = json.Unmarshal(resp.Result, &sync)
+	require.NoError(t, json.Unmarshal(resp.Result, &sync))
 	assert.True(t, sync.Value, "cluster-auto-sync did not survive restart")
 
 	resp = callRPC(t, in2, msgs2, "settings/get-cluster-id", nil, 3*time.Second)
 	var id struct {
 		Value string `json:"value"`
 	}
-	_ = json.Unmarshal(resp.Result, &id)
+	require.NoError(t, json.Unmarshal(resp.Result, &id))
 	assert.Equal(t, "cluster-abc-123", id.Value, "cluster-id did not survive restart")
 
 	resp = callRPC(t, in2, msgs2, "settings/get-cluster-friendly-name", nil, 3*time.Second)
 	var name struct {
 		Value string `json:"value"`
 	}
-	_ = json.Unmarshal(resp.Result, &name)
+	require.NoError(t, json.Unmarshal(resp.Result, &name))
 	assert.Equal(t, "Lab 3 desks", name.Value, "cluster-friendly-name did not survive restart")
 }
 

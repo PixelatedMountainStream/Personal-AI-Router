@@ -4,9 +4,14 @@
 package main
 
 import (
+	"cmp"
 	"log/slog"
+<<<<<<< HEAD
 	"reflect"
 	"sort"
+=======
+	"slices"
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 	"sync"
 	"time"
 
@@ -159,7 +164,9 @@ func (d *directory) supersedeCandidates(n noderec.DirectoryNode, selfUUID string
 		}
 		candidates = append(candidates, other)
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].HostUUID < candidates[j].HostUUID })
+	slices.SortFunc(candidates, func(a, b noderec.DirectoryNode) int {
+		return cmp.Compare(a.HostUUID, b.HostUUID)
+	})
 	return candidates
 }
 
@@ -186,7 +193,9 @@ func (d *directory) upsertEvicting(n noderec.DirectoryNode, proven []noderec.Dir
 		delete(d.nodes, old.HostUUID)
 		evicted = append(evicted, current)
 	}
-	sort.Slice(evicted, func(i, j int) bool { return evicted[i].HostUUID < evicted[j].HostUUID })
+	slices.SortFunc(evicted, func(a, b noderec.DirectoryNode) int {
+		return cmp.Compare(a.HostUUID, b.HostUUID)
+	})
 	d.nodes[n.HostUUID] = n
 	return evicted
 }
@@ -221,7 +230,9 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 		out = append(out, n)
 	}
 	d.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].HostUUID < out[j].HostUUID })
+	slices.SortFunc(out, func(a, b noderec.DirectoryNode) int {
+		return cmp.Compare(a.HostUUID, b.HostUUID)
+	})
 	return out
 }
 
@@ -238,7 +249,7 @@ const modelsObservedHeartbeat = 30 * time.Second
 // It confirms the node still exists AND still advertises the same em endpoint
 // (ip + port) the fetch targeted, so an in-flight result can never resurrect a
 // removed node or overwrite one that has since been re-addressed. It then
-// compares the fetched flat, per-engine, and loaded inventories
+// compares the fetched flat, per-engine, loaded, and downloaded inventories
 // order-insensitively with the stored entry and, only when any changed, updates
 // just the model fields in place — preserving every other field (identity,
 // services, node-info, trust) the browse path owns.
@@ -246,7 +257,11 @@ const modelsObservedHeartbeat = 30 * time.Second
 // Returns the (possibly updated) node, whether the inventory changed, and
 // whether the guarded apply was valid. ok == false means the result is stale
 // (node gone or re-addressed) and the caller must not cache or emit it.
+<<<<<<< HEAD
 func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory, observedAt int64) (node noderec.DirectoryNode, changed, ok bool) {
+=======
+func (d *directory) applyModels(hostUUID, ip string, emPort int, inventory modelInventory) (node noderec.DirectoryNode, changed, ok bool) {
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n, present := d.nodes[hostUUID]
@@ -257,6 +272,7 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInvent
 	if !has || n.IP != ip || em.Port != emPort {
 		return n, false, false
 	}
+<<<<<<< HEAD
 	if sameStringSet(n.Models, inv.models) && sameByEngine(n.ModelsByEngine, inv.byEngine) && sameByEngine(n.LoadedByEngine, inv.loadedByEngine) &&
 		reflect.DeepEqual(n.SlotsByEngine, inv.slotsByEngine) && reflect.DeepEqual(n.JITLoadByEngine, inv.jitByEngine) {
 		// Identical inventory: still a fresh successful observation. Publish the
@@ -275,8 +291,46 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInvent
 	n.SlotsByEngine = inv.slotsByEngine
 	n.JITLoadByEngine = inv.jitByEngine
 	n.ModelsObservedAt = observedAt
+=======
+	if sameStringSet(n.Models, inventory.models) &&
+		sameByEngine(n.ModelsByEngine, inventory.byEngine) &&
+		sameByEngine(n.LoadedByEngine, inventory.loadedByEngine) &&
+		sameByEngine(n.DownloadedByEngine, inventory.downloadedByEngine) {
+		return n, false, true
+	}
+	inventory.applyTo(&n)
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 	d.nodes[hostUUID] = n
 	return n, true, true
+}
+
+// applyInfo writes a node's node-info enrichment — GPUs, CPU and memory — in
+// place. Unlike applyModels it does not compare before writing: the three facets
+// are a handful of scalars, so a field-by-field compare costs about what the
+// write does, and a caller that republishes figures which happen to be unchanged
+// does no harm downstream.
+//
+// The guard is the node-info service and the endpoint the caller read the figures
+// from. A node whose address or port moved between the fetch and this call is left
+// alone, because the figures in hand came from the old endpoint; the next refresh
+// re-reads it where it lives now. ok == false means the result is stale (node gone
+// or re-addressed) and the caller must not cache or emit it.
+func (d *directory) applyInfo(hostUUID, ip string, niPort int, gpus []noderec.GPUInfo, cpu *noderec.CPUInfo, memory *noderec.MemoryInfo) (node noderec.DirectoryNode, ok bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n, present := d.nodes[hostUUID]
+	if !present {
+		return noderec.DirectoryNode{}, false
+	}
+	ni, has := n.Services[noderec.ServiceNodeInfo]
+	if !has || n.IP != ip || ni.Port != niPort {
+		return n, false
+	}
+	n.GPUs = gpus
+	n.CPU = cpu
+	n.Memory = memory
+	d.nodes[hostUUID] = n
+	return n, true
 }
 
 // applyClusterIdentity sets one node's cluster principal and the trust annotation

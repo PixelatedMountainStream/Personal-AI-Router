@@ -81,6 +81,7 @@ func startBrokerWithDirsAndEnv(t *testing.T, configDir, clusterDir string, extra
 		"XDG_CONFIG_HOME="+configDir,
 		"APPDATA="+configDir,
 		"LOCALAPPDATA="+configDir,
+		"USERPROFILE="+configDir,
 	)
 	cmd.Env = append(cmd.Env, extraEnv...)
 
@@ -93,7 +94,7 @@ func startBrokerWithDirsAndEnv(t *testing.T, configDir, clusterDir string, extra
 	require.NoError(t, cmd.Start(), "start broker")
 	t.Logf("broker started: pid=%d", cmd.Process.Pid)
 
-	ch := startMsgReader(stdoutPipe)
+	ch := startMsgReader(t, stdoutPipe)
 	lines := startLineReader(stderrPipe)
 
 	return stdinPipe, ch, lines, func() {
@@ -346,7 +347,7 @@ func TestBroker_ShutsDownOnSignal(t *testing.T) {
 	stdoutPipe, err := cmd.StdoutPipe()
 	require.NoError(t, err, "broker stdout pipe")
 	require.NoError(t, cmd.Start(), "start broker")
-	msgs := startMsgReader(stdoutPipe)
+	msgs := startMsgReader(t, stdoutPipe)
 	waitForMethod(t, msgs, "app:ready", 10*time.Second)
 
 	// SIGINT to the broker only (children are in their own process groups).
@@ -424,6 +425,19 @@ func TestBroker_RelaysEngineRequests(t *testing.T) {
 	t.Logf("engine:get-installed returned %d engine(s)", len(result.Engines))
 }
 
+func TestBroker_PreservesCatalogSourceParameter(t *testing.T) {
+	stdin, msgs, _, cleanup := startBrokerWith(t, "--engine-manager-path", engineMgrBin)
+	t.Cleanup(cleanup)
+	waitForMethod(t, msgs, "app:ready", 10*time.Second)
+	// Rejecting the explicit source proves the relay preserved it, without
+	// fetching a live provider or silently selecting this node's default.
+	_, err := io.WriteString(stdin, `{"jsonrpc":"2.0","id":701,"method":"engine:catalog","params":{"engine":"llamacpp","modelSource":"unsupported"}}`+"\n")
+	require.NoError(t, err)
+	reply := waitForResponse(t, msgs, 5*time.Second)
+	require.NotNil(t, reply.Error)
+	require.Equal(t, "unsupported model download source", reply.Error.Message)
+}
+
 // proxyStatus queries ollama-proxy:get-status through the broker and returns the
 // proxy's readiness + bound port (the broker's captured view of the proxy's
 // last "ready").
@@ -481,7 +495,7 @@ func TestBrokerProxySetPort_Rebinds(t *testing.T) {
 			<-done
 		}
 	})
-	msgs := startMsgReader(stdoutPipe)
+	msgs := startMsgReader(t, stdoutPipe)
 
 	waitForMethod(t, msgs, "app:ready", 10*time.Second)
 
@@ -553,7 +567,8 @@ func TestBroker_MergesManualNodesIntoDiscovery(t *testing.T) {
 			require.True(t, ok, "broker stream closed before the manual node appeared")
 			if msg.Method == "" && msg.ID != nil {
 				var res availableNodesResult
-				if json.Unmarshal(msg.Result, &res) == nil && containsNode(res.Nodes, nodeName) {
+				require.NoError(t, json.Unmarshal(msg.Result, &res))
+				if containsNode(res.Nodes, nodeName) {
 					t.Logf("manual node %q present in discovery snapshot", nodeName)
 					return
 				}

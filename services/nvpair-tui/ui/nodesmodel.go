@@ -113,9 +113,10 @@ type nodeRow struct {
 	membership nodeMembership
 	self       bool
 
-	// manualID is the handle node/remove needs. Empty unless the entry was
-	// added by hand.
-	manualID string
+	// manualIDs are the handles node/remove needs, one per manual entry that
+	// merged into this row: the same machine can be added twice, once by
+	// hostname and once by IP. Empty unless the node was added by hand.
+	manualIDs []string
 	// nodeInfoTLS is a hand-added node that serves node-info over TLS. That
 	// endpoint needs the backend's cluster trust, which this client does not
 	// hold, so it is never polled from here: probedTelemetry, the manual-node
@@ -124,9 +125,10 @@ type nodeRow struct {
 	nodeInfoTLS     bool
 	probedTelemetry *nodeTelemetry
 
-	models         []string
-	modelsByEngine map[string][]string
-	loadedByEngine map[string][]string
+	models             []string
+	modelsByEngine     map[string][]string
+	loadedByEngine     map[string][]string
+	downloadedByEngine map[string][]string
 }
 
 // modelCount is the number of distinct models the node advertises.
@@ -174,6 +176,7 @@ func mergeNodes(in nodeFeeds) []nodeRow {
 		row.models = d.Models
 		row.modelsByEngine = d.ModelsByEngine
 		row.loadedByEngine = d.LoadedByEngine
+		row.downloadedByEngine = d.DownloadedByEngine
 		row.presence = discoveredPresence(d)
 		switch {
 		case d.Trusted:
@@ -213,7 +216,7 @@ func mergeNodes(in nodeFeeds) []nodeRow {
 			row.name = m.Name
 			row.address = m.Address
 		}
-		row.manualID = m.ID
+		row.manualIDs = append(row.manualIDs, m.ID)
 		if row.name == "" {
 			row.name = m.Address
 		}

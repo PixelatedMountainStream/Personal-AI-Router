@@ -29,12 +29,13 @@ func TestHealthChecks_ReuseConnections(t *testing.T) {
 						}
 						w.WriteHeader(status)
 						if chunked {
-							_ = http.NewResponseController(w).Flush()
+							assert.NoError(t, http.NewResponseController(w).Flush())
 						}
-						_, _ = io.WriteString(w, `{"models":[],"status":"responding"}`)
+						_, writeErr := io.WriteString(w, `{"models":[],"status":"responding"}`)
+						assert.NoError(t, writeErr)
 					}))
 					const rounds = 32
-					for i := 0; i < rounds; i++ {
+					for i := range rounds {
 						require.Equal(t, i%2 == 0, checkEngineHealth(profile, client, 1), "poll %d", i)
 					}
 					require.Equal(t, int32(1), connections.Count(), "HTTP/1 connections for %d polls", rounds)

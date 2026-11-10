@@ -57,7 +57,7 @@ func TestProgressHub_DropsWhenFull(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		for i := 0; i < 10_000; i++ {
+		for i := range 10_000 {
 			h.publish(ProgressEvent{Engine: "ollama", Op: "install", Percent: i})
 		}
 		close(done)
@@ -132,7 +132,7 @@ func TestInstallFlow_ReportsOnlyMeasurablePercents(t *testing.T) {
 	payload := []byte("engine payload")
 	sum := sha256.Sum256(payload)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write(payload)
+		writeTestResponse(t, w, payload)
 	}))
 	defer srv.Close()
 	bin := filepath.Join(t.TempDir(), "engine"+exeExt())

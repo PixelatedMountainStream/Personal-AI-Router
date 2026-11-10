@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -29,32 +30,38 @@ func pipePeers(t *testing.T) (a, b *Peer) {
 
 func TestPeerCall_ReturnsResult(t *testing.T) {
 	a, b := pipePeers(t)
+	writeErr := make(chan error, 1)
 	go b.Serve(func(req *Message) {
-		go b.Respond(req.ID, map[string]string{"echo": req.Method})
+		go func() { writeErr <- b.Respond(req.ID, map[string]string{"echo": req.Method}) }()
 	}, nil)
 	go a.Serve(nil, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	res, rpcErr, err := a.Call(ctx, "ping", json.RawMessage(`{"x":1}`))
 	require.NoError(t, err, "Call err")
+	require.NoError(t, <-writeErr, "respond to call")
 	require.Nil(t, rpcErr, "Call err")
 	var out map[string]string
-	json.Unmarshal(res, &out)
+	require.NoError(t, json.Unmarshal(res, &out), "decode call result")
 	assert.Equal(t, "ping", out["echo"], "unexpected result")
 }
 
 func TestPeerCall_ReturnsRPCError(t *testing.T) {
 	a, b := pipePeers(t)
+	writeErr := make(chan error, 1)
 	go b.Serve(func(req *Message) {
-		go b.RespondError(req.ID, -32601, "method not found")
+		go func() {
+			writeErr <- b.RespondError(req.ID, -32601, "method not found")
+		}()
 	}, nil)
 	go a.Serve(nil, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	_, rpcErr, err := a.Call(ctx, "nope", nil)
 	require.NoError(t, err, "transport err")
+	require.NoError(t, <-writeErr, "respond with RPC error")
 	require.NotNil(t, rpcErr, "want rpc error -32601")
 	assert.Equal(t, -32601, rpcErr.Code)
 }
@@ -63,13 +70,18 @@ func TestPeer_HandlesInboundRequestsWhileCallIsPending(t *testing.T) {
 	// Both peers Call each other while both are serving inbound requests. The
 	// read pump is separate from Call, so neither side deadlocks.
 	a, b := pipePeers(t)
+	writeErrs := make(chan error, 2)
 	handler := func(self *Peer) func(*Message) {
-		return func(req *Message) { go self.Respond(req.ID, map[string]string{"from": req.Method}) }
+		return func(req *Message) {
+			go func() {
+				writeErrs <- self.Respond(req.ID, map[string]string{"from": req.Method})
+			}()
+		}
 	}
 	go a.Serve(handler(a), nil)
 	go b.Serve(handler(b), nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 
 	type res struct {
@@ -85,6 +97,7 @@ func TestPeer_HandlesInboundRequestsWhileCallIsPending(t *testing.T) {
 		select {
 		case r := <-ch:
 			require.NoError(t, r.err, "simultaneous call failed")
+			require.NoError(t, <-writeErrs, "respond to simultaneous call")
 		case <-time.After(3 * time.Second):
 			require.FailNow(t, "simultaneous calls deadlocked")
 		}
@@ -98,10 +111,10 @@ func TestPeer_DeliversNotificationsInOrder(t *testing.T) {
 	go a.Serve(nil, nil)
 
 	const n = 8
-	for i := 0; i < n; i++ {
+	for i := range n {
 		require.NoError(t, a.Notify(fmt.Sprintf("n%d", i), nil), "Notify")
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		select {
 		case m := <-got:
 			assert.Equal(t, fmt.Sprintf("n%d", i), m, "out of order")
@@ -112,48 +125,53 @@ func TestPeer_DeliversNotificationsInOrder(t *testing.T) {
 }
 
 func TestPeerCall_ReturnsWhenContextIsCancelled(t *testing.T) {
-	a, b := pipePeers(t)
-	go b.Serve(func(*Message) {}, nil) // never responds
-	go a.Serve(nil, nil)
+	synctest.Test(t, func(t *testing.T) {
+		a, b := pipePeers(t)
+		go b.Serve(func(*Message) {}, nil) // never responds
+		go a.Serve(nil, nil)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
-	_, _, err := a.Call(ctx, "hang", nil)
-	assert.ErrorIs(t, err, context.Canceled, "want context.Canceled")
+		ctx, cancel := context.WithCancel(t.Context())
+		go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+		_, _, err := a.Call(ctx, "hang", nil)
+		assert.ErrorIs(t, err, context.Canceled, "want context.Canceled")
+	})
 }
 
 func TestPeerClose_UnblocksPendingCalls(t *testing.T) {
-	c1, c2 := net.Pipe()
-	a := NewPeer(NewCodec(c1))
-	b := NewPeer(NewCodec(c2))
-	go b.Serve(func(*Message) {}, nil) // never responds
-	go a.Serve(nil, nil)
+	synctest.Test(t, func(t *testing.T) {
+		c1, c2 := net.Pipe()
+		a := NewPeer(NewCodec(c1))
+		b := NewPeer(NewCodec(c2))
+		go b.Serve(func(*Message) {}, nil) // never responds
+		go a.Serve(nil, nil)
 
-	errc := make(chan error, 1)
-	go func() { _, _, e := a.Call(context.Background(), "hang", nil); errc <- e }()
-	time.Sleep(50 * time.Millisecond)
-	_ = c1.Close() // a's read pump errors -> a.Close() -> pending Call wakes
-	_ = c2.Close()
+		errc := make(chan error, 1)
+		go func() { _, _, e := a.Call(t.Context(), "hang", nil); errc <- e }()
+		time.Sleep(50 * time.Millisecond)
+		_ = c1.Close() // a's read pump errors -> a.Close() -> pending Call wakes
+		_ = c2.Close()
 
-	select {
-	case e := <-errc:
-		assert.Equal(t, ErrPeerClosed, e)
-	case <-time.After(2 * time.Second):
-		require.FailNow(t, "pending Call was not woken on close")
-	}
+		select {
+		case e := <-errc:
+			assert.Equal(t, ErrPeerClosed, e)
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, "pending Call was not woken on close")
+		}
+	})
 }
 
 func TestPeerCallAfterClose_FailsFast(t *testing.T) {
 	a, _ := pipePeers(t)
 	a.Close()
-	_, _, err := a.Call(context.Background(), "m", nil)
+	_, _, err := a.Call(t.Context(), "m", nil)
 	assert.ErrorIs(t, err, ErrPeerClosed, "want ErrPeerClosed after Close")
 }
 
 func TestPeer_RelaysRequestAndResponse(t *testing.T) {
 	a, b := pipePeers(t)
+	writeErr := make(chan error, 1)
 	go b.Serve(func(req *Message) {
-		go b.Respond(req.ID, map[string]int{"ok": 1})
+		go func() { writeErr <- b.Respond(req.ID, map[string]int{"ok": 1}) }()
 	}, nil)
 	go a.Serve(nil, nil)
 
@@ -168,8 +186,9 @@ func TestPeer_RelaysRequestAndResponse(t *testing.T) {
 	select {
 	case r := <-done:
 		require.NoError(t, r.err, "relay err")
+		require.NoError(t, <-writeErr, "respond to relay")
 		var out map[string]int
-		json.Unmarshal(r.res, &out)
+		require.NoError(t, json.Unmarshal(r.res, &out), "decode relay result")
 		assert.Equal(t, 1, out["ok"], "unexpected relay result")
 	case <-time.After(2 * time.Second):
 		require.FailNow(t, "relay respond not invoked")

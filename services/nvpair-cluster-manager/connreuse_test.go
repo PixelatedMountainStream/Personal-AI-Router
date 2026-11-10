@@ -42,7 +42,7 @@ func TestReconcile_ReusesPeerConnections(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc(rosterPath, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"clusterId":"cluster-1"}`))
+		writeTestResponse(t, w, []byte(`{"clusterId":"cluster-1"}`))
 	})
 	ts := httptest.NewUnstartedServer(mux)
 	ts.Config.ConnState = func(_ net.Conn, state http.ConnState) {
@@ -58,7 +58,7 @@ func TestReconcile_ReusesPeerConnections(t *testing.T) {
 
 	addr := ts.Listener.Addr().String()
 	const rounds = 5
-	for i := 0; i < rounds; i++ {
+	for i := range rounds {
 		outcome, _ := m.reconcileWith([]string{addr}, peerUUID)
 		require.Equal(t, reconcileAccepted, outcome, "round (%v)", i)
 	}

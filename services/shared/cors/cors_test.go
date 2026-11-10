@@ -5,6 +5,7 @@ package cors
 import (
 	"context"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -113,8 +114,10 @@ func TestEndToEndHeaders_StripsHopHeadersAndPreservesRequestHeaders(t *testing.T
 	assert.Equal(t, h.Get("Cookie"), got.Get("Cookie"), "lost end-to-end headers")
 	assert.NotEqual(t, "", h.Get("X-Hop"), "mutated caller")
 }
-func target(s *httptest.Server) Target {
-	u, _ := url.Parse(s.URL)
+func target(t *testing.T, s *httptest.Server) Target {
+	t.Helper()
+	u, err := url.Parse(s.URL)
+	require.NoError(t, err, "parse test server URL")
 	return Target{URL: u, Transport: s.Client().Transport}
 }
 func TestFanout_StripsCredentials(t *testing.T) {
@@ -126,14 +129,12 @@ func TestFanout_StripsCredentials(t *testing.T) {
 		assert.Empty(t, r.Header.Get("Cookie"), "fan-out shared caller credentials")
 		assert.Equal(t, "http://app.test", r.Header.Get("Origin"), "fan-out lost CORS inputs")
 		assert.Equal(t, "Content-Type, Authorization", r.Header.Get("Access-Control-Request-Headers"), "fan-out lost CORS inputs")
-		for key, values := range policy() {
-			w.Header()[key] = values
-		}
+		maps.Copy(w.Header(), policy())
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
 	rec := httptest.NewRecorder()
-	ServePreflight(rec, request, []Target{target(server), target(server)})
+	ServePreflight(rec, request, []Target{target(t, server), target(t, server)})
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 	assert.Equal(t, "Bearer private", request.Header.Get("Authorization"), "mutated original request")
 	assert.Equal(t, "session=private", request.Header.Get("Cookie"), "mutated original request")
@@ -148,9 +149,7 @@ func TestPreflight_CombinesTargetResponses(t *testing.T) {
 				assert.Equal(t, "test=1", r.URL.RawQuery, "request changed")
 				assert.Equal(t, "PUT", r.Header.Get("Access-Control-Request-Method"), "request changed")
 				if withPolicy {
-					for k, v := range policy() {
-						w.Header()[k] = v
-					}
+					maps.Copy(w.Header(), policy())
 				}
 				w.Header().Set("Location", "/redirect-target")
 				w.WriteHeader(status)
@@ -161,7 +160,7 @@ func TestPreflight_CombinesTargetResponses(t *testing.T) {
 			}))
 			defer server.Close()
 			rec := httptest.NewRecorder()
-			ServePreflight(rec, preflight(), []Target{target(server)})
+			ServePreflight(rec, preflight(), []Target{target(t, server)})
 			assert.Equal(t, status, rec.Code, "single status")
 			assert.Equal(t, withPolicy, rec.Header().Get("Access-Control-Allow-Origin") != "", "single policy changed")
 			if status != http.StatusNoContent {
@@ -169,7 +168,7 @@ func TestPreflight_CombinesTargetResponses(t *testing.T) {
 			}
 			assert.Equal(t, int32(1), calls.Load(), "followed redirect")
 			rec = httptest.NewRecorder()
-			ServePreflight(rec, preflight(), []Target{target(server), target(server)})
+			ServePreflight(rec, preflight(), []Target{target(t, server), target(t, server)})
 			assert.Equal(t, combinedStatus, rec.Code, "combined status")
 			if combinedStatus != http.StatusNoContent {
 				assert.Empty(t, rec.Header().Get("Access-Control-Allow-Origin"), "permission on failure")
@@ -193,6 +192,9 @@ func TestPreflight_RejectsRequestWithoutTargets(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// All target probes block until cancellation, exposing the shared request limit.
+// A single browser preflight must not create unbounded work across cluster engines.
 func TestCORSFanout_BoundsConcurrentRequestsAndHonorsCancellation(t *testing.T) {
 	var active, max atomic.Int32
 	started := make(chan struct{}, 20)
@@ -208,7 +210,8 @@ func TestCORSFanout_BoundsConcurrentRequestsAndHonorsCancellation(t *testing.T) 
 		<-r.Context().Done()
 		return nil, r.Context().Err()
 	})
-	u, _ := url.Parse("http://engine.test")
+	u, err := url.Parse("http://engine.test")
+	require.NoError(t, err, "parse engine URL")
 	targets := make([]Target, 20)
 	for i := range targets {
 		targets[i] = Target{URL: u, Transport: transport}
@@ -218,7 +221,7 @@ func TestCORSFanout_BoundsConcurrentRequestsAndHonorsCancellation(t *testing.T) 
 	rec := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() { ServePreflight(rec, preflight().WithContext(ctx), targets); close(done) }()
-	for i := 0; i < 8; i++ {
+	for range 8 {
 		select {
 		case <-started:
 		case <-time.After(time.Second):

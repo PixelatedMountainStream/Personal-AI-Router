@@ -12,6 +12,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 )
@@ -56,11 +57,16 @@ func (s *controlServer) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "port must be between 0 and 65535", http.StatusBadRequest)
 		return
 	}
+<<<<<<< HEAD
 	if err := s.exec.StartWith(r.Context(), req.Engine, startOpts{Port: req.Port, Bind: "127.0.0.1"}); err != nil {
 		if pinnedStatus(err) != http.StatusInternalServerError {
 			writePinnedError(w, err)
 			return
 		}
+=======
+	// A start the peer's own Stop cut short answers with the status, stopped.
+	if err := s.exec.StartWith(r.Context(), req.Engine, startOpts{Port: req.Port, Bind: "127.0.0.1"}); err != nil && !errors.Is(err, errStartStopped) {
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

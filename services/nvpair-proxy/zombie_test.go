@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -78,7 +77,8 @@ func TestHandleHTTP_MarksWorkloadCancelledAfterClientWriteFailure(t *testing.T) 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, `{"model":"llama","response":"partial tokens before the client vanished","done":false}`)
+		_, err := io.WriteString(w, `{"model":"llama","response":"partial tokens before the client vanished","done":false}`)
+		assert.NoError(t, err)
 	}))
 	defer upstream.Close()
 
@@ -116,14 +116,13 @@ func TestHandleHTTP_MarksWorkloadCancelledAfterClientWriteFailure(t *testing.T) 
 func TestHandleHTTP_EmitsOneTerminalEventAfterClientDisconnect(t *testing.T) {
 	received := make(chan struct{}, 1)
 	release := make(chan struct{})
-	var releaseOnce sync.Once
-	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		if f, ok := w.(http.Flusher); ok {
-			io.WriteString(w, `{"response":"first chunk","done":false}`+"\n")
+			_, err := io.WriteString(w, `{"response":"first chunk","done":false}`+"\n")
+			assert.NoError(t, err)
 			f.Flush()
 		}
 		select {
@@ -134,7 +133,7 @@ func TestHandleHTTP_EmitsOneTerminalEventAfterClientDisconnect(t *testing.T) {
 	}))
 	// LIFO: unblock the upstream handler before tearing the server down.
 	defer upstream.Close()
-	defer doRelease()
+	defer close(release)
 
 	tc := anyCase(t)
 	rec := &recRW{}
@@ -342,7 +341,7 @@ func TestHandleHTTP_BoundsRealSocketWrites(t *testing.T) {
 	// Read the status line only — enough to confirm the response committed and
 	// started streaming — then STOP reading so the proxy's send buffer backs
 	// up. A read deadline guards against a hang if the proxy never responds.
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	statusLine, err := bufio.NewReader(conn).ReadString('\n')
 	require.NoError(t, err, "read status line")
 	require.Contains(t, statusLine, "200", "unexpected status line")
@@ -411,7 +410,15 @@ func TestHandleHTTP_BoundsRealSocketFlushes(t *testing.T) {
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err, "listen")
-	srv := &http.Server{Handler: http.HandlerFunc(p.soleFacade().handleHTTP)}
+	// Limit the sender as well: default TCP buffers can absorb the entire
+	// five-second paced stream without ever blocking a flush.
+	srv := &http.Server{
+		Handler: http.HandlerFunc(p.soleFacade().handleHTTP),
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			assert.NoError(t, c.(*net.TCPConn).SetWriteBuffer(4096), "set proxy write buffer")
+			return ctx
+		},
+	}
 	go func() { _ = srv.Serve(ln) }()
 	defer srv.Close()
 
@@ -428,9 +435,12 @@ func TestHandleHTTP_BoundsRealSocketFlushes(t *testing.T) {
 	_, err = conn.Write([]byte(reqText))
 	require.NoError(t, err, "write request")
 
+	// Bound the receive buffer so a paced stream reaches backpressure within
+	// the test budget rather than fitting in host-dependent TCP buffers.
+	require.NoError(t, conn.(*net.TCPConn).SetReadBuffer(1024), "set client read buffer")
 	// Read the status line only, then stop reading so the proxy's send buffer
 	// backs up and a Flush blocks.
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	statusLine, err := bufio.NewReader(conn).ReadString('\n')
 	require.NoError(t, err, "read status line")
 	require.Contains(t, statusLine, "200", "unexpected status line")
@@ -495,8 +505,10 @@ func TestHandleHTTP_EmitsTerminalEventWhenUpstreamDiesMidStream(t *testing.T) {
 					}
 				}
 				chunk := `{"response":"partial tokens","done":false}`
-				io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n")
-				fmt.Fprintf(c, "%x\r\n%s\r\n", len(chunk), chunk)
+				_, err := io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n")
+				assert.NoError(t, err)
+				_, err = fmt.Fprintf(c, "%x\r\n%s\r\n", len(chunk), chunk)
+				assert.NoError(t, err)
 				c.Close()
 			}(conn)
 		}

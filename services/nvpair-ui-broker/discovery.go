@@ -4,13 +4,14 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"os/exec"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -71,10 +72,18 @@ type EnrichedNode struct {
 	// peer's engine-manager /v1/models loadedByEngine field. Carried through to
 	// AvailableNode so a remote node's cards can reflect loaded state.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+<<<<<<< HEAD
 	// SlotsByEngine and JITLoadByEngine carry per-engine slot capacity and
 	// jit_load flags from the directory to AvailableNode.
 	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine,omitempty"`
 	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine,omitempty"`
+=======
+	// DownloadedByEngine is the downloaded inventory of an engine that advertises
+	// only the model it is serving (vLLM), enriched by the daemon from the peer's
+	// engine-manager /v1/models downloadedByEngine field. Carried through to
+	// AvailableNode so a remote node's model manager keeps its rows.
+	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 }
 
 // directoryToEnriched projects the promoted daemon's DirectoryNode onto the
@@ -99,6 +108,7 @@ func directoryToEnriched(n noderec.DirectoryNode) EnrichedNode {
 		port = ni.Port
 	}
 	return EnrichedNode{
+<<<<<<< HEAD
 		ID:              n.Name,
 		HostUUID:        n.HostUUID,
 		Host:            n.Name,
@@ -115,6 +125,23 @@ func directoryToEnriched(n noderec.DirectoryNode) EnrichedNode {
 		LoadedByEngine:  n.LoadedByEngine,
 		SlotsByEngine:   n.SlotsByEngine,
 		JITLoadByEngine: n.JITLoadByEngine,
+=======
+		ID:                 n.Name,
+		HostUUID:           n.HostUUID,
+		Host:               n.Name,
+		Port:               port,
+		Addresses:          addrs,
+		TXT:                txt,
+		GPUs:               n.GPUs,
+		CPU:                n.CPU,
+		Memory:             n.Memory,
+		Trusted:            n.Trusted,
+		Clustered:          n.Clustered(),
+		Models:             n.Models,
+		ModelsByEngine:     n.ModelsByEngine,
+		LoadedByEngine:     n.LoadedByEngine,
+		DownloadedByEngine: n.DownloadedByEngine,
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 	}
 }
 
@@ -291,7 +318,9 @@ func (s *discoveryStore) Snapshot() []AvailableNode {
 		out = append(out, sn.toAvailable())
 	}
 	s.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	slices.SortFunc(out, func(a, b AvailableNode) int {
+		return cmp.Compare(a.ID, b.ID)
+	})
 	return out
 }
 
@@ -317,6 +346,7 @@ func (sn storedNode) toAvailable() AvailableNode {
 		candidates = nil
 	}
 	return AvailableNode{
+<<<<<<< HEAD
 		ID:              n.ID,
 		Name:            n.ID,
 		HostUUID:        n.HostUUID,
@@ -331,6 +361,21 @@ func (sn storedNode) toAvailable() AvailableNode {
 		LoadedByEngine:  n.LoadedByEngine,
 		SlotsByEngine:   n.SlotsByEngine,
 		JITLoadByEngine: n.JITLoadByEngine,
+=======
+		ID:                 n.ID,
+		Name:               n.ID,
+		HostUUID:           n.HostUUID,
+		IPAddress:          primary,
+		IPAddresses:        candidates,
+		Port:               n.Port,
+		LastSeen:           sn.lastSeen.Unix(),
+		Trusted:            n.Trusted,
+		Clustered:          n.Clustered,
+		Models:             n.Models,
+		ModelsByEngine:     n.ModelsByEngine,
+		LoadedByEngine:     n.LoadedByEngine,
+		DownloadedByEngine: n.DownloadedByEngine,
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 	}
 }
 

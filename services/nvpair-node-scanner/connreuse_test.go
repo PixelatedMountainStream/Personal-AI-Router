@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"nvpair-shared/clustertrust"
@@ -49,7 +50,7 @@ func TestModelsClient_ReusesPeerConnections(t *testing.T) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"models": []string{"m"}})
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"models": []string{"m"}}))
 	})
 	ts := httptest.NewUnstartedServer(mux)
 	ts.Config.ConnState = func(_ net.Conn, state http.ConnState) {
@@ -71,9 +72,15 @@ func TestModelsClient_ReusesPeerConnections(t *testing.T) {
 	// "localhost" is not a loopback IP literal, so modelsClient takes the
 	// pinned mTLS path instead of the plaintext self-fetch.
 	const rounds = 5
+<<<<<<< HEAD
 	for i := 0; i < rounds; i++ {
 		inv, ok := d.fetchModels("localhost", port, "uuid-peer")
 		models := inv.models
+=======
+	for i := range rounds {
+		inventory, ok := d.fetchModels("localhost", port, "uuid-peer")
+		models := inventory.models
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 		require.True(t, ok, "round (%v, %v, %v)", i, ok, models)
 		require.Len(t, models, 1, "round (%v, %v, %v)", i, ok, models)
 		require.Equal(t, "m", models[0], "round (%v, %v, %v)", i, ok, models)

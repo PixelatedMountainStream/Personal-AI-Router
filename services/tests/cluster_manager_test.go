@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"nvpair-shared/jsonrpc"
@@ -48,7 +49,7 @@ func startCMEnv(t *testing.T, configDir string, port int, extraEnv []string) *cm
 	require.NoError(t, err, "stdout pipe")
 	cmd.Stderr = os.Stderr
 	require.NoError(t, cmd.Start(), "start cluster-manager")
-	return &cmProc{t: t, cmd: cmd, stdin: stdin, msgs: startMsgReader(stdout), nextID: 1}
+	return &cmProc{t: t, cmd: cmd, stdin: stdin, msgs: startMsgReader(t, stdout), nextID: 1}
 }
 
 func (p *cmProc) stop() {
@@ -86,12 +87,13 @@ func (p *cmProc) pump(want func(jsonrpc.Message) bool, timeout time.Duration) js
 	}
 }
 
-func idEquals(raw *json.RawMessage, id int) bool {
+func idEquals(t *testing.T, raw *json.RawMessage, id int) bool {
+	t.Helper()
 	if raw == nil {
 		return false
 	}
 	var got int
-	return json.Unmarshal(*raw, &got) == nil && got == id
+	return assert.NoError(t, json.Unmarshal(*raw, &got)) && got == id
 }
 
 func (p *cmProc) call(method string, params any) jsonrpc.Message {
@@ -102,11 +104,12 @@ func (p *cmProc) call(method string, params any) jsonrpc.Message {
 	if params != nil {
 		req["params"] = params
 	}
-	b, _ := json.Marshal(req)
+	b, err := json.Marshal(req)
+	require.NoError(p.t, err, "encode %s", method)
 	b = append(b, '\n')
-	_, err := p.stdin.Write(b)
+	_, err = p.stdin.Write(b)
 	require.NoError(p.t, err, "write %s", method)
-	resp := p.pump(func(m jsonrpc.Message) bool { return m.Method == "" && idEquals(m.ID, id) }, 15*time.Second)
+	resp := p.pump(func(m jsonrpc.Message) bool { return m.Method == "" && idEquals(p.t, m.ID, id) }, 15*time.Second)
 	require.Nil(p.t, resp.Error, "%s returned a JSON-RPC error", method)
 	return resp
 }
@@ -121,11 +124,12 @@ func (p *cmProc) callExpectError(method string, params any) jsonrpc.Message {
 	if params != nil {
 		req["params"] = params
 	}
-	b, _ := json.Marshal(req)
+	b, err := json.Marshal(req)
+	assert.NoError(p.t, err, "encode %s", method)
 	b = append(b, '\n')
-	_, err := p.stdin.Write(b)
+	_, err = p.stdin.Write(b)
 	require.NoError(p.t, err, "write %s", method)
-	return p.pump(func(m jsonrpc.Message) bool { return m.Method == "" && idEquals(m.ID, id) }, 15*time.Second)
+	return p.pump(func(m jsonrpc.Message) bool { return m.Method == "" && idEquals(p.t, m.ID, id) }, 15*time.Second)
 }
 
 func (p *cmProc) waitNotify(method string) jsonrpc.Message {
@@ -568,7 +572,7 @@ func TestClusterCancelInvite_PreservesConsistentOutcomeDuringConcurrentAccept(t 
 	}
 
 	const iterations = 6
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		port := 14880 + i
 		b := startCM(t, t.TempDir(), port)
 		time.Sleep(600 * time.Millisecond) // let B's inter-node listener bind
@@ -589,20 +593,17 @@ func TestClusterCancelInvite_PreservesConsistentOutcomeDuringConcurrentAccept(t 
 		// don't clash.
 		var wg sync.WaitGroup
 		var cancelMsg, respMsg jsonrpc.Message
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			respMsg = b.callExpectError("cluster:respond-to-invite", map[string]any{
 				"inviteId": inv.InviteID, "accept": true, "pin": inv.Pin,
 			})
-		}()
-		go func() {
-			defer wg.Done()
+		})
+		wg.Go(func() {
 			// Land inside the inviter's commit pause (after Completion has entered
 			// it, well before it ends).
 			time.Sleep(commitDelayMS / 3 * time.Millisecond)
 			cancelMsg = a.callExpectError("cluster:cancel-invite", map[string]any{"inviteId": inv.InviteID})
-		}()
+		})
 		wg.Wait()
 
 		cancelSucceeded := cancelMsg.Error == nil && decodeResult[inviteState](t, cancelMsg).State == "canceled"
@@ -869,8 +870,9 @@ func TestClusterDecline_KeepsSiblingPendingInvite(t *testing.T) {
 // incorrect-pin), and — because its cluster was invite-created — it leaves so
 // both sides end standalone. Neither side pins the other.
 func TestClusterWrongPin_FailsBothSides(t *testing.T) {
-	portB := freePort(t)
-	a := startCM(t, t.TempDir(), freePort(t))
+	ports := freePorts(t, 2)
+	portB := ports[1]
+	a := startCM(t, t.TempDir(), ports[0])
 	defer a.stop()
 	b := startCM(t, t.TempDir(), portB)
 	defer b.stop()
@@ -927,8 +929,9 @@ func TestClusterWrongPin_FailsBothSides(t *testing.T) {
 // cluster of one is not dissolved when a pairing fails on a wrong PIN,
 // mirroring the decline variant.
 func TestClusterWrongPin_PreservesIntentionalSolo(t *testing.T) {
-	portB := freePort(t)
-	a := startCM(t, t.TempDir(), freePort(t))
+	ports := freePorts(t, 2)
+	portB := ports[1]
+	a := startCM(t, t.TempDir(), ports[0])
 	defer a.stop()
 	b := startCM(t, t.TempDir(), portB)
 	defer b.stop()
@@ -1041,8 +1044,9 @@ func waitUnclusteredWithin(t *testing.T, p *cmProc, timeout time.Duration) {
 // must detect that unanimous 403 and self-remove.
 func TestCluster_RemovesLocalMembershipAfterVerifiedOfflineRemoval(t *testing.T) {
 	baseA, baseB := t.TempDir(), t.TempDir()
-	portB := freePort(t)
-	a := startCM(t, baseA, freePort(t))
+	ports := freePorts(t, 2)
+	portB := ports[1]
+	a := startCM(t, baseA, ports[0])
 	defer a.stop()
 	b := startCM(t, baseB, portB)
 
@@ -1092,7 +1096,8 @@ func TestCluster_RemovesLocalMembershipAfterVerifiedOfflineRemoval(t *testing.T)
 // no authenticated proof — and a bare 403 must not tear the survivor down.
 func TestCluster_KeepsMembershipWhenPeerLeaves(t *testing.T) {
 	baseA, baseB := t.TempDir(), t.TempDir()
-	portA, portB := freePort(t), freePort(t)
+	ports := freePorts(t, 2)
+	portA, portB := ports[0], ports[1]
 	a := startCM(t, baseA, portA)
 	// B stays up (unclustered) for the whole test so A's reconcile reaches it
 	// and gets a live 403 rather than an "unreachable" that would block teardown
@@ -1154,8 +1159,9 @@ func assertStillClustered(t *testing.T, p *cmProc, wait time.Duration) {
 // cluster could self-evict.
 func TestCluster_KeepsMembershipWhenPeerAcceptsReconciliation(t *testing.T) {
 	baseA, baseB := t.TempDir(), t.TempDir()
-	portB := freePort(t)
-	a := startCM(t, baseA, freePort(t))
+	ports := freePorts(t, 2)
+	portB := ports[1]
+	a := startCM(t, baseA, ports[0])
 	defer a.stop()
 	b := startCM(t, baseB, portB)
 
@@ -1191,8 +1197,9 @@ func TestCluster_KeepsMembershipWhenPeerAcceptsReconciliation(t *testing.T) {
 // removed) must never make the surviving node self-evict.
 func TestCluster_KeepsMembershipWhenPeerIsUnreachable(t *testing.T) {
 	baseA, baseB := t.TempDir(), t.TempDir()
-	portB := freePort(t)
-	a := startCM(t, baseA, freePort(t))
+	ports := freePorts(t, 2)
+	portB := ports[1]
+	a := startCM(t, baseA, ports[0])
 	defer a.stop()
 	b := startCM(t, baseB, portB)
 

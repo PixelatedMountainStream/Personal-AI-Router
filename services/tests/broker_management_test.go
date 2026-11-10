@@ -1,15 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Cross-process tests for the two broker-management hotfix legs:
+// Cross-process tests for broker management:
 //
 //	A. the broker bridges a reachable supervised manual node into
 //	   ollama-proxy (node/add-manual), so inference can route to a node
-//	   that never appears over mDNS; and
+//	   that never appears over mDNS;
 //	B. the broker accepts a client-originated errors:report and forwards it
-//	   into nvpair-errors, reflected in the next errors:update.
+//	   into nvpair-errors, reflected in the next errors:update; and
+//	C. the broker starts the vLLM facade by default.
 //
-// Both reuse the supervision harness (startBrokerWith) and binaries built by
+// These reuse the supervision harness (startBrokerWith) and binaries built by
 // TestMain.
 package tests
 
@@ -24,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"nvpair-shared/appdir"
@@ -45,7 +47,8 @@ func fakeOllama(t *testing.T) func() {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("/api/tags", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"models":[{"name":"llama3.2:latest"}]}`)
+		_, writeErr := io.WriteString(w, `{"models":[{"name":"llama3.2:latest"}]}`)
+		assert.NoError(t, writeErr)
 	})
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
@@ -65,7 +68,8 @@ func fakeLMStudio(t *testing.T) func() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"qwen2.5-7b-instruct","object":"model"}]}`)
+		_, writeErr := io.WriteString(w, `{"object":"list","data":[{"id":"qwen2.5-7b-instruct","object":"model"}]}`)
+		assert.NoError(t, writeErr)
 	})
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
@@ -99,7 +103,8 @@ func fakeNodeInfo(t *testing.T, hostUUID string) func() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/node-info", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, fmt.Sprintf(`{"GPUs":[],"hostUuid":%q}`, hostUUID))
+		_, writeErr := io.WriteString(w, fmt.Sprintf(`{"GPUs":[],"hostUuid":%q}`, hostUUID))
+		assert.NoError(t, writeErr)
 	})
 	srv := &http.Server{Handler: mux}
 	go func() { _ = srv.Serve(ln) }()
@@ -122,9 +127,7 @@ type proxyNodesResult struct {
 func proxyNodesHas(t *testing.T, raw json.RawMessage, id string) bool {
 	t.Helper()
 	var res proxyNodesResult
-	if err := json.Unmarshal(raw, &res); err != nil {
-		return false
-	}
+	require.NoError(t, json.Unmarshal(raw, &res))
 	for _, n := range res.Nodes {
 		if n.ID == id {
 			return true
@@ -350,4 +353,16 @@ func TestBroker_AcceptsClientErrorsReportRequest(t *testing.T) {
 			require.FailNow(t, fmt.Sprintf("timed out (ack=%v update=%v) for errors:report request %q", gotAck, gotUpdate, id))
 		}
 	}
+}
+
+func TestBrokerDefaults_StartTheVLLMProxy(t *testing.T) {
+	stdin, msgs, stderr, cleanup := startBrokerWith(t, "--proxy-path", proxyBin)
+	t.Cleanup(cleanup)
+	go func() {
+		for range stderr {
+		}
+	}()
+
+	waitForMethod(t, msgs, "app:ready", 10*time.Second)
+	assert.Positive(t, waitEngineProxyReady(t, "vllm-proxy", stdin, msgs, 15*time.Second), "the default vLLM proxy must be a listening facade")
 }

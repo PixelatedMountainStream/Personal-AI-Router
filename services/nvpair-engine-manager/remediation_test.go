@@ -7,12 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 
 	"sync"
@@ -41,12 +43,7 @@ func (c *captured) emit(method string, _ any) {
 func (c *captured) has(method string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, m := range c.emits {
-		if m == method {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.emits, method)
 }
 
 func capturingExecutor(t *testing.T, m *Manifest) (*Executor, *captured) {
@@ -64,25 +61,26 @@ func capturingExecutor(t *testing.T, m *Manifest) (*Executor, *captured) {
 func TestDownload_AllowsManifestWithoutChecksum(t *testing.T) {
 	payload := []byte("unpinned engine bytes")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(payload)
+		writeTestResponse(t, w, payload)
 	}))
 	defer srv.Close()
 	ex := newTestExecutor(t, testEngineManifest(fakeEngineBin))
 	p, err := ex.download(context.Background(), "fake", &Fetch{URL: srv.URL}) // no SHA256
 	require.NoError(t, err, "unpinned download should succeed")
 	defer os.Remove(p)
-	got, _ := os.ReadFile(p)
+	got, err := os.ReadFile(p)
+	require.NoError(t, err)
 	require.Equal(t, string(payload), string(got), "downloaded content mismatch")
 }
 
 // TestValidateDownloadURL pins the HTTPS-only policy (loopback http is the
 // only plaintext exception — used by the live tests and a LAN mirror).
 func TestValidateDownloadURL_RejectsUnsafeDownloadSchemes(t *testing.T) {
-	assert.NoError(t, validateDownloadURL("https://ollama.com/x.zip"))
-	assert.NoError(t, validateDownloadURL("https://example.com/y"))
-	assert.NoError(t, validateDownloadURL("http://127.0.0.1:8080/x"))
-	assert.NoError(t, validateDownloadURL("http://localhost/x"))
-	assert.NoError(t, validateDownloadURL("http://[::1]:9/x"))
+	require.NoError(t, validateDownloadURL("https://ollama.com/x.zip"))
+	require.NoError(t, validateDownloadURL("https://example.com/y"))
+	require.NoError(t, validateDownloadURL("http://127.0.0.1:8080/x"))
+	require.NoError(t, validateDownloadURL("http://localhost/x"))
+	require.NoError(t, validateDownloadURL("http://[::1]:9/x"))
 	assert.Error(t, validateDownloadURL("http://example.com/x"))
 	assert.Error(t, validateDownloadURL("http://10.0.0.5/x"))
 	assert.Error(t, validateDownloadURL("ftp://h/y"))
@@ -115,7 +113,8 @@ func TestUninstall_RetriesFailedCommandWithinBudget(t *testing.T) {
 	// the retry behavior under test.
 	require.NoError(t, writeInstallMarker(filepath.Join(ex.baseDir, "fake"), "fake"))
 	require.ErrorContains(t, ex.Uninstall(context.Background(), "fake"), "after 3 attempts", "expected uninstall failure after 3 attempts")
-	data, _ := os.ReadFile(marker)
+	data, err := os.ReadFile(marker)
+	require.NoError(t, err)
 	require.Len(t, data, 3, "expected 3 uninstall attempts, marker has")
 }
 
@@ -132,7 +131,8 @@ func portOf(t *testing.T, rawURL string) int {
 	t.Helper()
 	u, err := url.Parse(rawURL)
 	require.NoError(t, err)
-	p, _ := strconv.Atoi(u.Port())
+	p, err := strconv.Atoi(u.Port())
+	require.NoError(t, err)
 	return p
 }
 
@@ -193,7 +193,9 @@ func TestReadinessTimeout_DoesNotReportSpuriousProcessExit(t *testing.T) {
 	// Give the watcher a chance to (wrongly) fire before asserting silence.
 	time.Sleep(400 * time.Millisecond)
 	require.False(t, hasErr(ex.Errors(), exitedID("slow")), "must NOT report 'exited unexpectedly' for a readiness timeout")
-	state, _ := ex.state("slow")
+	state, err := ex.state("slow")
+	require.NoError(t, err)
+	require.NotNil(t, state)
 	state.mu.Lock()
 	proc, running := state.proc, state.running
 	state.mu.Unlock()
@@ -236,18 +238,20 @@ func TestConcurrentStart_IsSerialized(t *testing.T) {
 	ex, _ := capturingExecutor(t, testEngineManifest(fakeEngineBin))
 	t.Cleanup(func() { _ = ex.Stop("fake") })
 	var wg sync.WaitGroup
-	for i := 0; i < 8; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); _ = ex.Start(context.Background(), "fake") }()
+	for range 8 {
+		wg.Go(func() {
+			assert.NoError(t, ex.Start(context.Background(), "fake"))
+		})
 	}
 	wg.Wait()
-	st, _ := ex.Status("fake")
+	st, err := ex.Status("fake")
+	require.NoError(t, err)
 	require.True(t, st.Running, "expected running after concurrent starts (%v)", st)
 }
 
 func TestInstall_ReportsChecksumMismatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte("payload"))
+		writeTestResponse(t, w, []byte("payload"))
 	}))
 	defer srv.Close()
 	m := &Manifest{
@@ -304,10 +308,15 @@ func TestHealthFlip_ReportsAndClears(t *testing.T) {
 func TestEngineLifecycle_ReportsUnexpectedExit(t *testing.T) {
 	ex, _ := capturingExecutor(t, testEngineManifest(fakeEngineBin))
 	require.NoError(t, ex.Start(context.Background(), "fake"), "start")
-	st, _ := ex.Status("fake")
+	st, err := ex.Status("fake")
+	require.NoError(t, err)
 	// The /exit route makes the fake engine os.Exit(1) — a crash.
 	_, _ = http.Get(fmt.Sprintf("http://127.0.0.1:%d/exit", st.Port))
-	waitFor(t, 6*time.Second, func() bool { s, _ := ex.Status("fake"); return !s.Running })
+	waitFor(t, 6*time.Second, func() bool {
+		s, err := ex.Status("fake")
+		require.NoError(t, err)
+		return !s.Running
+	})
 	require.True(t, hasErr(ex.Errors(), exitedID("fake")), "expected an 'exited' error after a crash")
 }
 
@@ -324,7 +333,8 @@ func TestRestart_StopsAndStartsManagedProcess(t *testing.T) {
 	t.Cleanup(func() { _ = ex.Stop("fake") })
 	require.NoError(t, ex.Start(context.Background(), "fake"), "start")
 	require.NoError(t, ex.Restart(context.Background(), "fake"), "restart")
-	st, _ := ex.Status("fake")
+	st, err := ex.Status("fake")
+	require.NoError(t, err)
 	require.True(t, st.Running, "expected running+healthy after restart (%v)", st)
 	require.True(t, st.Healthy, "expected running+healthy after restart (%v)", st)
 }
@@ -343,25 +353,21 @@ func TestAction_ReportsUnknownActionAndHTTPFailure(t *testing.T) {
 
 func TestExpandPath_ResolvesHomeAndEnvironmentVariables(t *testing.T) {
 	t.Setenv("NVPAIR_TEST_VAR", "xyz")
-	for _, tc := range []struct {
-		name, goos, input, want string
-	}{
-		{"windows percent", "windows", "a/%NVPAIR_TEST_VAR%/b", "a/xyz/b"},
-		{"windows dollar", "windows", "a/$NVPAIR_TEST_VAR/b", "a/$NVPAIR_TEST_VAR/b"},
-		{"windows braced dollar", "windows", "a/${NVPAIR_TEST_VAR}/b", "a/${NVPAIR_TEST_VAR}/b"},
-		{"unix dollar", "linux", "a/$NVPAIR_TEST_VAR/b", "a/xyz/b"},
-		{"unix braced dollar", "linux", "a/${NVPAIR_TEST_VAR}/b", "a/xyz/b"},
-		{"unix percent", "linux", "a/%NVPAIR_TEST_VAR%/b", "a/%NVPAIR_TEST_VAR%/b"},
-		{"unix shell parameters", "linux", `tar -xzf "$1" -C "$3"`, `tar -xzf "$1" -C "$3"`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, expandPathForOS(tc.input, tc.goos), "expandPathForOS")
+	test := func(name, goos, input, want string) {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, want, expandPathForOS(input, goos))
 		})
 	}
+	test("windows percent", "windows", "a/%NVPAIR_TEST_VAR%/b", "a/xyz/b")
+	test("windows dollar", "windows", "a/$NVPAIR_TEST_VAR/b", "a/$NVPAIR_TEST_VAR/b")
+	test("windows braced dollar", "windows", "a/${NVPAIR_TEST_VAR}/b", "a/${NVPAIR_TEST_VAR}/b")
+	test("unix dollar", "linux", "a/$NVPAIR_TEST_VAR/b", "a/xyz/b")
+	test("unix braced dollar", "linux", "a/${NVPAIR_TEST_VAR}/b", "a/xyz/b")
+	test("unix percent", "linux", "a/%NVPAIR_TEST_VAR%/b", "a/%NVPAIR_TEST_VAR%/b")
+	test("unix shell parameters", "linux", `tar -xzf "$1" -C "$3"`, `tar -xzf "$1" -C "$3"`)
 	if home, err := os.UserHomeDir(); err == nil {
-		for _, goos := range []string{"windows", "linux"} {
-			assert.Equal(t, filepath.Join(home, "sub"), expandPathForOS("~/sub", goos), " (%v)", goos)
-		}
+		test("windows home", "windows", "~/sub", filepath.Join(home, "sub"))
+		test("unix home", "linux", "~/sub", filepath.Join(home, "sub"))
 	}
 }
 
@@ -401,7 +407,7 @@ func TestDownload_RejectsResponseExceedingSizeLimit(t *testing.T) {
 	t.Cleanup(func() { maxDownloadBytes = old })
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write(make([]byte, 256)) // larger than the cap
+		writeTestResponse(t, w, make([]byte, 256)) // larger than the cap
 	}))
 	defer srv.Close()
 
@@ -463,4 +469,34 @@ func TestStop_ClearsUnhealthy(t *testing.T) {
 		require.FailNow(t, "stop command did not close the test endpoint")
 	}
 	require.False(t, hasErr(ex.Errors(), unhealthyID("d")), "stop must clear the lingering unhealthy error")
+}
+
+// A start refused before the engine is launched changes no state, so a client
+// that sends Start without waiting for the reply, as the desktop does, learns of
+// the refusal only from the start-failed error.
+func TestStart_ReportsARefusalAsAFailedStart(t *testing.T) {
+	test := func(name string, executor func(t *testing.T) *Executor, wantErr string) {
+		t.Run(name, func(t *testing.T) {
+			e := executor(t)
+			require.ErrorContains(t, e.Start(t.Context(), "fake"), wantErr)
+			assert.True(t, hasErr(e.Errors(), startFailedID("fake")), "the refusal is reported as a failed start")
+		})
+	}
+	test("an engine whose model is a launch argument, with no model selected", func(t *testing.T) *Executor {
+		e := settingsExecutor(t, false)
+		m, _ := e.reg.Get("fake")
+		m.Actions["load_model"] = Action{LaunchModel: &ActionLaunchModel{Flag: "--model"}}
+		require.NoError(t, m.Validate())
+		return e
+	}, "no model selected")
+	test("a port taken by a service that is not the engine", func(t *testing.T) *Executor {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = l.Close() })
+		e := settingsExecutor(t, false)
+		st, err := e.state("fake")
+		require.NoError(t, err)
+		st.port = l.Addr().(*net.TCPAddr).Port
+		return e
+	}, "occupied")
 }

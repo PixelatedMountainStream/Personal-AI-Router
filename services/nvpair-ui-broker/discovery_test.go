@@ -102,6 +102,28 @@ func TestDiscoveryStoreScannerProjection_Wins(t *testing.T) {
 	require.Equal(t, "manual-host", snap[0].ID, "manual projection should surface after scanner removal (%v)", snap)
 }
 
+// A peer's model lists reach the desktop's AvailableNode unchanged, including
+// the downloaded inventory of a stopped vLLM, so a remote model manager keeps
+// its rows after an Eject.
+func TestDiscoveryStore_CarriesEveryModelListFromTheScanner(t *testing.T) {
+	s := newDiscoveryStore()
+	s.Upsert(directoryToEnriched(noderec.DirectoryNode{
+		HostUUID:           "peer-uuid",
+		Name:               "peer",
+		Models:             []string{"qwen-api"},
+		ModelsByEngine:     map[string][]string{"vllm": {"qwen-api"}},
+		LoadedByEngine:     map[string][]string{"vllm": {"Qwen/Qwen3.5-4B"}},
+		DownloadedByEngine: map[string][]string{"vllm": {"Qwen/Qwen3.5-4B", "mistralai/Ministral-3-3B-Instruct-2512"}},
+	}), sourceScanner)
+
+	snap := s.Snapshot()
+	require.Len(t, snap, 1)
+	assert.Equal(t, []string{"qwen-api"}, snap[0].Models)
+	assert.Equal(t, map[string][]string{"vllm": {"qwen-api"}}, snap[0].ModelsByEngine)
+	assert.Equal(t, map[string][]string{"vllm": {"Qwen/Qwen3.5-4B"}}, snap[0].LoadedByEngine)
+	assert.Equal(t, map[string][]string{"vllm": {"Qwen/Qwen3.5-4B", "mistralai/Ministral-3-3B-Instruct-2512"}}, snap[0].DownloadedByEngine)
+}
+
 func newManualTestBroker() *Broker {
 	return &Broker{
 		manualNodeKeys:     make(map[string]string),
@@ -122,33 +144,27 @@ func manualStatus(id, addr, uuid string) manualNodeStatus {
 // alias's address doesn't linger — and only the last removal releases the key.
 func TestManualAliases_KeepSharedKeyUntilLastAliasIsRemoved(t *testing.T) {
 	const uuid = "shared-uuid"
-	for _, tc := range []struct {
-		name         string
-		removeFirst  string
-		survivorID   string
-		survivorAddr string
-	}{
-		{"remove-A-first", "alias-a", "alias-b", "10.0.0.2"},
-		{"remove-B-first", "alias-b", "alias-a", "10.0.0.1"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	test := func(name, removeFirst, survivorID, survivorAddr string) {
+		t.Run(name, func(t *testing.T) {
 			b := newManualTestBroker()
 			b.upsertManualNode(manualStatus("alias-a", "10.0.0.1", uuid))
 			b.upsertManualNode(manualStatus("alias-b", "10.0.0.2", uuid))
 			require.Len(t, b.store.Snapshot(), 1, "two aliases for one machine should be one record")
 
-			b.removeManualNode(tc.removeFirst)
+			b.removeManualNode(removeFirst)
 			snap := b.store.Snapshot()
 			require.Len(t, snap, 1, "removing one of two aliases evicted the shared node")
 			// The surviving alias must be reprojected: its id and address, not
 			// the removed alias's stale payload.
-			require.Equal(t, tc.survivorID, snap[0].ID, "survivor not reprojected")
-			require.Equal(t, tc.survivorAddr, snap[0].IPAddress, "survivor not reprojected")
+			require.Equal(t, survivorID, snap[0].ID, "survivor not reprojected")
+			require.Equal(t, survivorAddr, snap[0].IPAddress, "survivor not reprojected")
 
-			b.removeManualNode(tc.survivorID)
+			b.removeManualNode(survivorID)
 			require.Empty(t, b.store.Snapshot(), "record should be gone once the last alias left")
 		})
 	}
+	test("remove A first", "alias-a", "alias-b", "10.0.0.2")
+	test("remove B first", "alias-b", "alias-a", "10.0.0.1")
 }
 
 // TestManualRekeyReprojectsSharedOldKey: when one of two aliases sharing a key

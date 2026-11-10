@@ -29,13 +29,12 @@ const unreachableAddr = "192.0.2.1:14321"
 // could not reach, so every reconcile burned the full request timeout against it
 // while the address that worked sat unused in the same candidate list.
 func TestReconcileWith_FailsOverToAnAnsweringAddress(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	mA := newTestManagerPort(t, 15031)
 	mB := newTestManagerPort(t, 15032)
-	go func() { _ = mA.runHTTP(ctx) }()
-	go func() { _ = mB.runHTTP(ctx) }()
+	startTestHTTP(t, mA, ctx)
+	startTestHTTP(t, mB, ctx)
 	time.Sleep(400 * time.Millisecond)
 
 	pinTrusted(t, mA, mB.identity.NodeUUID, string(mB.identity.CertPEM), mB.identity.CertFingerprint)
@@ -148,7 +147,8 @@ func TestReachableEndpointFirst_LeadsWithTheAddressThatAnswers(t *testing.T) {
 			_ = c.Close()
 		}
 	}()
-	_, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	_, portStr, err := net.SplitHostPort(ln.Addr().String())
+	require.NoError(t, err)
 	answering := net.JoinHostPort("127.0.0.1", portStr)
 
 	require.Equal(t, []string{answering, unreachableAddr}, reachableEndpointFirst([]string{unreachableAddr, answering}), "reachableEndpointFirst")
@@ -174,7 +174,7 @@ func pairingProbeServer(t *testing.T, status int, body string) (addr string, req
 		requests.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
-		_, _ = w.Write([]byte(body))
+		writeTestResponse(t, w, []byte(body))
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

@@ -41,8 +41,7 @@ func newStalledEngine(t *testing.T) stalledEngine {
 	t.Helper()
 	var n atomic.Int32
 	releaseCh := make(chan struct{})
-	var once sync.Once
-	release := func() { once.Do(func() { close(releaseCh) }) }
+	release := sync.OnceFunc(func() { close(releaseCh) })
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		n.Add(1)
@@ -81,10 +80,12 @@ func TestHandleHTTP_FailsOverWhenHeadersArriveWithoutBody(t *testing.T) {
 
 		var servedBody string
 		good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			b, _ := io.ReadAll(r.Body)
+			b, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
 			servedBody = string(b)
 			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, `{"done":true}`)
+			_, err = io.WriteString(w, `{"done":true}`)
+			assert.NoError(t, err)
 		}))
 		defer good.Close()
 
@@ -153,7 +154,8 @@ func TestHandleHTTP_PreservesFirstBodyByteWhenCommittingResponse(t *testing.T) {
 		const payload = `{"response":"whole body intact","done":true}`
 		good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, payload)
+			_, err := io.WriteString(w, payload)
+			assert.NoError(t, err)
 		}))
 		defer good.Close()
 

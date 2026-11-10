@@ -137,11 +137,21 @@ func startNodeInfo(t *testing.T, instanceName string, extraArgs ...string) (clea
 // avoids stomping on whatever the developer has running locally.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err, "listen")
-	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
-	return port
+	return freePorts(t, 1)[0]
+}
+
+// freePorts holds every listener until all ports are allocated, so the OS
+// cannot return the same port twice within a multi-listener fixture.
+func freePorts(t *testing.T, count int) []int {
+	t.Helper()
+	ports := make([]int, count)
+	for i := range ports {
+		ln, err := net.Listen("tcp", ":0")
+		require.NoError(t, err, "allocate fixture port")
+		defer func() { assert.NoError(t, ln.Close(), "release fixture port") }()
+		ports[i] = ln.Addr().(*net.TCPAddr).Port
+	}
+	return ports
 }
 
 // httpsClientWithCert builds an *http.Client that trusts the test
@@ -220,8 +230,8 @@ func TestNodeInfoHTTPS_RequiresClientCertificateWhenConfigured(t *testing.T) {
 	scPath := writePEM(t, dir, "server.crt", scPEM)
 	skPath := writePEM(t, dir, "server.key", skPEM)
 
-	httpPort := freePort(t)
-	tlsPort := freePort(t)
+	ports := freePorts(t, 2)
+	httpPort, tlsPort := ports[0], ports[1]
 	instance := fmt.Sprintf("tls-mtls-%d", tlsPort)
 
 	cleanup := startNodeInfo(t,
@@ -244,7 +254,8 @@ func TestNodeInfoHTTPS_RequiresClientCertificateWhenConfigured(t *testing.T) {
 	url := fmt.Sprintf("https://localhost:%d/v1/node-info", tlsPort)
 	resp, err := client.Get(url)
 	require.NoError(t, err, "authenticated mTLS GET (%v)", url)
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(resp.Body)
+	require.NoError(t, readErr)
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode, "authenticated mTLS GET status (%v)", body)
 	assert.Contains(t, string(body), "GPUs", "response body missing GPUs key")
@@ -268,8 +279,8 @@ func TestNodeInfoHTTPS_AcceptsPlainHTTPOnSharedListener(t *testing.T) {
 	scPath := writePEM(t, dir, "server.crt", scPEM)
 	skPath := writePEM(t, dir, "server.key", skPEM)
 
-	httpPort := freePort(t)
-	tlsPort := freePort(t)
+	ports := freePorts(t, 2)
+	httpPort, tlsPort := ports[0], ports[1]
 	instance := fmt.Sprintf("tls-dual-%d", tlsPort)
 
 	cleanup := startNodeInfo(t,

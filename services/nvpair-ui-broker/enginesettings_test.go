@@ -41,6 +41,19 @@ type settingsHarness struct {
 	launchMu sync.Mutex
 }
 
+// reserveSettingsPort holds a wildcard listener until release is called.
+// Registering the same release for cleanup also covers failed fixture setup.
+func reserveSettingsPort(t *testing.T) (int, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", ":0")
+	require.NoError(t, err, "allocate fixture port")
+	release := sync.OnceFunc(func() {
+		require.NoError(t, ln.Close(), "release fixture port")
+	})
+	t.Cleanup(release)
+	return ln.Addr().(*net.TCPAddr).Port, release
+}
+
 func newSettingsHarness(t *testing.T) *settingsHarness {
 	t.Helper()
 	return newSettingsHarnessForEngine(t, "ollama")
@@ -48,16 +61,13 @@ func newSettingsHarness(t *testing.T) *settingsHarness {
 
 func newSettingsHarnessForEngine(t *testing.T, engine string) *settingsHarness {
 	t.Helper()
-	ports := make([]int, 4)
-	listeners := []net.Listener{}
+	ports := make([]int, 5)
+	releases := make([]func(), len(ports))
 	for i := range ports {
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		listeners = append(listeners, ln)
-		ports[i] = ln.Addr().(*net.TCPAddr).Port
+		ports[i], releases[i] = reserveSettingsPort(t)
 	}
-	for _, ln := range listeners {
-		_ = ln.Close()
+	for _, release := range releases {
+		release()
 	}
 	h := &settingsHarness{b: &Broker{codec: NewCodec(&bytes.Buffer{}), nodeID: "target", clusterDir: filepath.Join(t.TempDir(), "cluster")}}
 	worker, codec := newTestRPCWorkerPipe(t)
@@ -67,6 +77,7 @@ func newSettingsHarnessForEngine(t *testing.T, engine string) *settingsHarness {
 		"ollama":   {ready: true, port: ports[1]},
 		"lmstudio": {ready: true, port: ports[2]},
 		"llamacpp": {ready: true, port: ports[3]},
+		"vllm":     {ready: true, port: ports[4]},
 	}}
 	for _, profile := range engineProxyProfiles {
 		h.b.setEngineProxyHandle(profile, proxy)
@@ -74,7 +85,7 @@ func newSettingsHarnessForEngine(t *testing.T, engine string) *settingsHarness {
 	go func() {
 		for {
 			msg, err := proxyCodec.Read()
-			if err != nil {
+			if !assertRPCRead(t, err) {
 				return
 			}
 			if !msg.IsRequest() {
@@ -82,7 +93,7 @@ func newSettingsHarnessForEngine(t *testing.T, engine string) *settingsHarness {
 			}
 			engine, method := engines.SplitAddressedMethod(msg.Method)
 			if engine == "" || method != "set-port" {
-				_ = proxyCodec.Respond(msg.ID, map[string]bool{"ok": true})
+				assert.NoError(t, proxyCodec.Respond(msg.ID, map[string]bool{"ok": true}))
 				continue
 			}
 			var p struct {
@@ -95,14 +106,17 @@ func newSettingsHarnessForEngine(t *testing.T, engine string) *settingsHarness {
 			proxy.readyMu.Lock()
 			proxy.facadeState[engine] = proxyFacadeState{ready: true, port: p.Port}
 			proxy.readyMu.Unlock()
-			_ = proxyCodec.Respond(msg.ID, map[string]int{"port": p.Port})
+			assert.NoError(t, proxyCodec.Respond(msg.ID, map[string]int{"port": p.Port}))
 		}
 	}()
 	launch := settings.LaunchState{Engine: engine, ServerPort: ports[0], EffectivePort: ports[0], LaunchText: "--fixture-option", Running: true, Editable: true, Format: "pair-arguments-v1"}
+	if engine == "llamacpp" {
+		launch.ModelSource = "huggingface"
+	}
 	go func() {
 		for {
 			msg, err := codec.Read()
-			if err != nil {
+			if !assertRPCRead(t, err) {
 				return
 			}
 			if !msg.IsRequest() {
@@ -113,20 +127,20 @@ func newSettingsHarnessForEngine(t *testing.T, engine string) *settingsHarness {
 				h.launchMu.Lock()
 				current := launch
 				h.launchMu.Unlock()
-				_ = codec.Respond(msg.ID, current)
+				assert.NoError(t, codec.Respond(msg.ID, current))
 			case "engine:configured-ports":
-				_ = codec.Respond(msg.ID, map[string]any{"engines": []any{map[string]any{"engine": "lmstudio", "port": h.otherEnginePort.Load()}}})
+				assert.NoError(t, codec.Respond(msg.ID, map[string]any{"engines": []any{map[string]any{"engine": "lmstudio", "port": h.otherEnginePort.Load()}}}))
 			case "engine:preview-launch":
 				var p settings.Request
-				_ = json.Unmarshal(msg.Params, &p)
+				assert.NoError(t, json.Unmarshal(msg.Params, &p))
 				h.previewPreserveCORS.Store(p.PreserveCORS)
 				if p.Format == "pair-launch-v1" {
 					p.Settings.LaunchText = strings.TrimPrefix(p.Settings.LaunchText, "managed serve ")
 				}
 				h.launchMu.Lock()
-				restart := launch.Running && (p.Settings.ServerPort != launch.ServerPort || p.Settings.LaunchText != launch.LaunchText)
+				restart := launch.Running && (p.Settings.ServerPort != launch.ServerPort || p.Settings.LaunchText != launch.LaunchText || p.Settings.ModelSource != launch.ModelSource)
 				h.launchMu.Unlock()
-				_ = codec.Respond(msg.ID, settings.Preview{Settings: p.Settings, Restart: restart})
+				assert.NoError(t, codec.Respond(msg.ID, settings.Preview{Settings: p.Settings, Restart: restart}))
 			case "engine:configure-launch":
 				// Serve this off the reader loop: a suspended apply must not
 				// stop the fixture from answering an unrelated read, which is
@@ -145,22 +159,23 @@ func newSettingsHarnessForEngine(t *testing.T, engine string) *settingsHarness {
 							proxy.facadeState[engine] = state
 							proxy.readyMu.Unlock()
 						}
-						_ = codec.RespondError(msg.ID, -32000, "stop failure")
+						assert.NoError(t, codec.RespondError(msg.ID, -32000, "stop failure"))
 						return
 					}
 					var p settings.Configure
-					_ = json.Unmarshal(msg.Params, &p)
+					assert.NoError(t, json.Unmarshal(msg.Params, &p))
 					h.launchMu.Lock()
 					launch.ServerPort = p.Settings.ServerPort
 					launch.LaunchText = p.Settings.LaunchText
+					launch.ModelSource = p.Settings.ModelSource
 					launch.Running = false
 					h.launchMu.Unlock()
 					if err := h.b.rebindSettingsProxy(p.Engine, p.Settings.ProxyPort); err != nil {
-						_ = codec.RespondError(msg.ID, -32000, err.Error())
+						assert.NoError(t, codec.RespondError(msg.ID, -32000, err.Error()))
 						return
 					}
 					if h.fail.Load() {
-						_ = codec.RespondError(msg.ID, -32000, "startup failure")
+						assert.NoError(t, codec.RespondError(msg.ID, -32000, "startup failure"))
 						return
 					}
 					h.launchMu.Lock()
@@ -169,14 +184,15 @@ func newSettingsHarnessForEngine(t *testing.T, engine string) *settingsHarness {
 					current := launch
 					h.launchMu.Unlock()
 					if h.failResultSave.Load() {
-						journal, _ := h.b.engineSettingsPath()
+						journal, pathErr := h.b.engineSettingsPath()
+						assert.NoError(t, pathErr)
 						assert.NoError(t, os.Remove(journal))
 						assert.NoError(t, os.Mkdir(journal, 0700))
 					}
-					_ = codec.Respond(msg.ID, current)
+					assert.NoError(t, codec.Respond(msg.ID, current))
 				}(msg)
 			default:
-				_ = codec.RespondError(msg.ID, -32601, "unsupported fixture method")
+				assert.NoError(t, codec.RespondError(msg.ID, -32601, "unsupported fixture method"))
 			}
 		}
 	}()
@@ -188,6 +204,32 @@ func (h *settingsHarness) request(t *testing.T) settings.Request {
 	s, err := h.b.getEngineSettings(context.Background(), settings.Request{Engine: "ollama"}, "")
 	require.NoError(t, err)
 	return settings.Request{Engine: "ollama", ExpectedRevision: s.Revision, RequestID: settingsID(), Settings: s.Settings}
+}
+
+func TestSettingsCoordinator_PreservesModelSourceAcrossWorkerAndJournal(t *testing.T) {
+	h := newSettingsHarnessForEngine(t, "llamacpp")
+	target := settings.Request{Engine: "llamacpp"}
+	before, err := h.b.getEngineSettings(context.Background(), target, "")
+	require.NoError(t, err)
+	require.Equal(t, "huggingface", before.Settings.ModelSource)
+	request := settings.Request{Engine: target.Engine, ExpectedRevision: before.Revision, RequestID: settingsID(), Settings: before.Settings}
+	request.Settings.ModelSource = "modelscope"
+	preview, err := h.b.previewEngineSettings(context.Background(), request, "")
+	require.NoError(t, err)
+	assert.True(t, preview.Restart)
+	receipt, err := h.b.applyEngineSettings(context.Background(), request, "")
+	require.NoError(t, err)
+	require.Equal(t, "succeeded", receipt.Phase)
+	after, err := h.b.getEngineSettings(context.Background(), target, "")
+	require.NoError(t, err)
+	assert.Equal(t, "modelscope", after.Settings.ModelSource)
+	journal, err := h.b.engineSettingsPath()
+	require.NoError(t, err)
+	data, err := os.ReadFile(journal)
+	require.NoError(t, err)
+	var saved map[string]engineSettingsRecord
+	require.NoError(t, json.Unmarshal(data, &saved))
+	assert.Equal(t, "modelscope", saved["llamacpp"].Snapshot.Settings.ModelSource)
 }
 
 func TestSettingsCoordinator_TracksRevisionsDeduplicatesAndReportsFailures(t *testing.T) {
@@ -235,31 +277,22 @@ func TestSettingsCoordinator_TracksRevisionsDeduplicatesAndReportsFailures(t *te
 }
 
 func TestSettingsFailedApply_RestoresOnlyRunningReadyService(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		stopFails  bool
-		proxyReady bool
-		advertised bool
-	}{
-		{"stop failed with engine still running", true, true, true},
-		{"engine stopped before startup failed", false, true, false},
-		{"proxy unavailable", true, false, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	test := func(name string, stopFails, proxyReady, advertised bool) {
+		t.Run(name, func(t *testing.T) {
 			h := newSettingsHarness(t)
 			p := h.request(t)
 			oldPort := p.Settings.ProxyPort
 			h.b.regCache = relay.NewRegistrationCache()
 			h.b.registerService(noderec.RegisterParams{Service: noderec.ServiceOllama, Port: oldPort})
-			h.failBeforeStop.Store(tc.stopFails)
+			h.failBeforeStop.Store(stopFails)
 			h.fail.Store(true)
-			h.loseProxyOnStop.Store(!tc.proxyReady)
+			h.loseProxyOnStop.Store(!proxyReady)
 			p.Settings.LaunchText += " --new-option"
 			receipt, err := h.b.applyEngineSettings(context.Background(), p, "")
 			require.NoError(t, err, "expected failed receipt (%v)", receipt)
 			require.Equal(t, "failed", receipt.Phase, "expected failed receipt (%v)", receipt)
 			registered := h.b.regCache.Snapshot()
-			if tc.advertised {
+			if advertised {
 				require.Len(t, registered, 1, "running engine lost registration")
 				require.Equal(t, noderec.ServiceOllama, registered[0].Service, "running engine lost registration (%v)", registered)
 				require.Equal(t, oldPort, registered[0].Port, "running engine lost registration (%v)", registered)
@@ -268,6 +301,9 @@ func TestSettingsFailedApply_RestoresOnlyRunningReadyService(t *testing.T) {
 			}
 		})
 	}
+	test("stop failed with engine still running", true, true, true)
+	test("engine stopped before startup failed", false, true, false)
+	test("proxy unavailable", true, false, false)
 }
 
 func TestSettingsCoordinator_SerializesAndCancelsQueuedRequests(t *testing.T) {
@@ -335,7 +371,8 @@ func TestSettingsJournal_ReportsPersistenceFailureAndRecoversInterruptedApply(t 
 	h := newSettingsHarness(t)
 	p := h.request(t)
 	p.Settings.LaunchText += " --new"
-	path, _ := h.b.engineSettingsPath()
+	path, pathErr := h.b.engineSettingsPath()
+	require.NoError(t, pathErr)
 	require.NoError(t, os.Remove(path))
 	require.NoError(t, os.Mkdir(path, 0700))
 	_, err := h.b.applyEngineSettings(context.Background(), p, "")
@@ -389,7 +426,8 @@ func TestSettingsPortValidation_IncludesStoppedEnginesAndAliases(t *testing.T) {
 
 func TestSettings_MigratesLegacyProxyChoiceBeforeManagedDefaults(t *testing.T) {
 	h := newSettingsHarness(t)
-	path, _ := h.b.engineSettingsPath()
+	path, pathErr := h.b.engineSettingsPath()
+	require.NoError(t, pathErr)
 	require.NoError(t, os.WriteFile(filepath.Join(filepath.Dir(path), "proxy-port.json"), []byte(`{"port":26080}`), 0600))
 	h.b.migrateLegacyEngineSettings()
 	config, ok := h.b.explicitEngineSettings("ollama")

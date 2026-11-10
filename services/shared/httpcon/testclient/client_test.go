@@ -16,11 +16,12 @@ import (
 
 func TestConnectionCounter_CountsDistinctConnections(t *testing.T) {
 	client, connections := New(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "ok")
+		_, err := io.WriteString(w, "ok")
+		assert.NoError(t, err, "write response")
 	}))
 
 	const requests = 2
-	for i := 0; i < requests; i++ {
+	for range requests {
 		req, err := http.NewRequest(http.MethodGet, "http://example.test/", nil)
 		require.NoError(t, err)
 		// Request.Close makes the transport reject connection reuse before it

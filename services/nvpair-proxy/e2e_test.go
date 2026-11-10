@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -33,32 +34,28 @@ import (
 // tests in this package, and moving the whole file behind a build tag —  the
 // obvious alternative — would take the only end-to-end test of the shipped
 // artifact out of the CI gate entirely, in the change that replaces that
-// artifact. A sync.Once pays the cost once, only when an e2e case runs.
-var (
-	proxyBinOnce sync.Once
-	proxyBinPath string
-	proxyBinErr  error
-)
+// artifact. OnceValues pays the cost once, only when an e2e case runs.
+var buildProxyBinary = sync.OnceValues(func() (string, error) {
+	tmp, err := os.MkdirTemp("", "nvpair-proxy-e2e-*")
+	if err != nil {
+		return "", err
+	}
+	suffix := ""
+	if runtime.GOOS == "windows" {
+		suffix = ".exe"
+	}
+	path := filepath.Join(tmp, "nvpair-proxy"+suffix)
+	if out, err := exec.Command("go", "build", "-o", path, ".").CombinedOutput(); err != nil {
+		return path, fmt.Errorf("build nvpair-proxy: %w\n%s", err, out)
+	}
+	return path, nil
+})
 
 func proxyBinary(t *testing.T) string {
 	t.Helper()
-	proxyBinOnce.Do(func() {
-		tmp, err := os.MkdirTemp("", "nvpair-proxy-e2e-*")
-		if err != nil {
-			proxyBinErr = err
-			return
-		}
-		suffix := ""
-		if runtime.GOOS == "windows" {
-			suffix = ".exe"
-		}
-		proxyBinPath = filepath.Join(tmp, "nvpair-proxy"+suffix)
-		if out, err := exec.Command("go", "build", "-o", proxyBinPath, ".").CombinedOutput(); err != nil {
-			proxyBinErr = fmt.Errorf("build nvpair-proxy: %w\n%s", err, out)
-		}
-	})
-	require.NoError(t, proxyBinErr)
-	return proxyBinPath
+	path, err := buildProxyBinary()
+	require.NoError(t, err)
+	return path
 }
 
 type e2eFrame struct {
@@ -69,16 +66,20 @@ type e2eFrame struct {
 	Error  json.RawMessage `json:"error"`
 }
 
-func e2eReadFrames(r io.Reader, out chan<- e2eFrame) {
+func e2eReadFrames(t *testing.T, r io.Reader, out chan<- e2eFrame) {
+	t.Helper()
 	defer close(out)
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		var f e2eFrame
-		if err := json.Unmarshal(sc.Bytes(), &f); err != nil {
+		if !assert.NoError(t, json.Unmarshal(sc.Bytes(), &f)) {
 			continue
 		}
 		out <- f
+	}
+	if err := sc.Err(); !errors.Is(err, os.ErrClosed) {
+		assert.NoError(t, err)
 	}
 }
 
@@ -88,8 +89,9 @@ func e2eSend(t *testing.T, w io.Writer, id int, method string, params any) {
 	if params != nil {
 		msg["params"] = params
 	}
-	data, _ := json.Marshal(msg)
-	_, err := w.Write(append(data, '\n'))
+	data, err := json.Marshal(msg)
+	require.NoError(t, err)
+	_, err = w.Write(append(data, '\n'))
 	require.NoError(t, err, "send (%v, %v)", method, err)
 }
 
@@ -134,7 +136,7 @@ func e2eWaitResult(t *testing.T, frames *e2eInbox, id string, timeout time.Durat
 // reports a lost bind race, and returns the port it actually bound.
 func e2eEnableWithRetry(t *testing.T, stdin io.Writer, frames *e2eInbox, engine string, port int) int {
 	t.Helper()
-	for attempt := 0; attempt < 8; attempt++ {
+	for attempt := range 8 {
 		id := 100 + attempt
 		e2eSend(t, stdin, id, "facade/enable", map[string]any{
 			"engine":              engine,
@@ -163,7 +165,8 @@ func e2eEnabledPort(t *testing.T, frames *e2eInbox, id string, timeout time.Dura
 		var rpcErr struct {
 			Code int `json:"code"`
 		}
-		if json.Unmarshal(f.Error, &rpcErr) == nil && rpcErr.Code == codeFacadeBindFailed {
+		require.NoError(t, json.Unmarshal(f.Error, &rpcErr))
+		if rpcErr.Code == codeFacadeBindFailed {
 			return 0, true
 		}
 		require.FailNow(t, fmt.Sprintf("facade/enable returned error: %s", f.Error))
@@ -267,10 +270,12 @@ func TestProxy_FailsOverAcrossNodesOverStdio(t *testing.T) {
 		}))
 		defer busy.Close()
 		good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			b, _ := io.ReadAll(r.Body)
+			b, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
 			gotBody = string(b)
 			w.WriteHeader(http.StatusOK)
-			io.WriteString(w, `{"ok":true}`)
+			_, err = io.WriteString(w, `{"ok":true}`)
+			assert.NoError(t, err)
 		}))
 		defer good.Close()
 
@@ -291,7 +296,7 @@ func TestProxy_FailsOverAcrossNodesOverStdio(t *testing.T) {
 		}()
 
 		source := make(chan e2eFrame, 256)
-		go e2eReadFrames(stdout, source)
+		go e2eReadFrames(t, stdout, source)
 		frames := &e2eInbox{frames: source}
 
 		// Retried on a bind race: e2eFreePort can only probe-then-close, and a
@@ -327,7 +332,7 @@ func TestProxy_FailsOverAcrossNodesOverStdio(t *testing.T) {
 			fmt.Sprintf("http://127.0.0.1:%d%s", port, tc.inferencePath),
 			"application/json", strings.NewReader(body))
 		require.NoError(t, err, "inference POST")
-		defer resp.Body.Close()
+		defer func() { require.NoError(t, resp.Body.Close()) }()
 		require.Equal(t, http.StatusOK, resp.StatusCode, "status")
 		assert.Equal(t, "", resp.Header.Get("Access-Control-Allow-Origin"), "Access-Control-Allow-Origin")
 		assert.Equal(t, body, gotBody, "healthy upstream got body (%v, %v)", gotBody, body)
