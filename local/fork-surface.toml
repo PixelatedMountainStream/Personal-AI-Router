@@ -30,6 +30,7 @@ allow = [
   "services/nvpair-engine-manager/manifests/ollama.json",
   "services/nvpair-engine-manager/modelops.go",
   "services/nvpair-engine-manager/models.go",
+  "services/nvpair-engine-manager/install_artifacts_test.go",
   "services/nvpair-engine-manager/models_test.go",
   "services/nvpair-engine-manager/registry.go",
   "services/nvpair-engine-manager/remote.go",
