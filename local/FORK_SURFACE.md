@@ -101,6 +101,11 @@ files: services/nvpair-engine-manager/models.go
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
 
+### L-services-nvpair-engine-manager-install-artifacts-test-go
+files: services/nvpair-engine-manager/install_artifacts_test.go
+kind: legacy
+recipe: Fallback edit: `defer cancel()` after the context.WithCancel in the cancel test, because go vet lostcancel misses require.FailNow after upstream #160. Drop when upstream fixes it.
+
 ### L-services-nvpair-engine-manager-models-test-go
 files: services/nvpair-engine-manager/models_test.go
 kind: legacy

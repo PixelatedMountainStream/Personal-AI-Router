@@ -134,6 +134,7 @@ func TestInstallCancellation_RemovesDownloadedArtifacts(t *testing.T) {
 	progress := &installProgressRecorder{}
 	executor.emit = progress.emit
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() {
 		done <- executor.Install(ctx, manifest.Engine)
