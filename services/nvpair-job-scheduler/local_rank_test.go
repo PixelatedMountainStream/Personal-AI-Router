@@ -20,7 +20,7 @@ func TestEmit_IncludesPendingRanksLocalExt(t *testing.T) {
 	)
 
 	m.recomputeAll(false)
-	got := rec.priorities("ollama")
+	got := rec.priorities(t, "ollama")
 	require.Len(t, got, 1, "priority snapshots")
 	want := []NodeRank{
 		{ID: "a", Pending: 0, GPUPressure: unknownGPUPressure, Rank: 0},
