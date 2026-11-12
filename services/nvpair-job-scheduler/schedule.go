@@ -84,7 +84,6 @@ func (m *Manager) rank() ([]string, []NodeRank) {
 func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 	m.mu.Lock()
 	pending := make(map[string]int, len(m.nodes))
-	pendingBy := make(map[string]map[string]int)
 	for id := range m.nodes {
 		pending[id] = 0
 	}
@@ -97,12 +96,6 @@ func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 		}
 		if _, ok := m.nodes[w.ScheduledOn]; ok {
 			pending[w.ScheduledOn]++
-			if w.Model != "" {
-				if pendingBy[w.ScheduledOn] == nil {
-					pendingBy[w.ScheduledOn] = make(map[string]int)
-				}
-				pendingBy[w.ScheduledOn][schedulerwire.PendingKey(w.Engine, w.Model)]++
-			}
 		}
 	}
 	ranks := make([]NodeRank, 0, len(m.nodes))
@@ -112,8 +105,6 @@ func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 			ID:          id,
 			Pending:     pending[id],
 			GPUPressure: effectiveGPUPressure(state, ok, now),
-			PendingBy:   pendingBy[id],
-			ComputedAt:  now.UnixMilli(),
 		})
 	}
 	m.mu.Unlock()
@@ -180,18 +171,3 @@ type statusResult struct {
 	IntervalMs int64                     `json:"interval_ms"`
 	Engines    map[string]EngineSchedule `json:"engines"`
 }
-<<<<<<< HEAD
-
-func equalRanks(a, b []NodeRank) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if !a[i].Equal(b[i]) {
-			return false
-		}
-	}
-	return true
-}
-=======
->>>>>>> 4a8b67d38a845ac10739c883a8f367992e5c6c57
