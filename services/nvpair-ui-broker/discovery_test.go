@@ -276,7 +276,7 @@ func TestScannerProcess_RoutesAndRemovesTelemetry(t *testing.T) {
 func TestDirectoryRelaysSlotCapacity(t *testing.T) {
 	slots := map[string]map[string]noderec.SlotInfo{"ollama": {"q": {Slots: 4, CtxPerSlot: 8192}}}
 	jit := map[string]bool{"ollama": true}
-	e := directoryToEnriched(noderec.DirectoryNode{HostUUID: "h", Name: "n", SlotsByEngine: slots, JITLoadByEngine: jit})
+	e := directoryToEnriched(noderec.DirectoryNode{HostUUID: "h", Name: "n", LocalNodeExt: noderec.LocalNodeExt{SlotsByEngine: slots, JITLoadByEngine: jit}})
 	if e.SlotsByEngine["ollama"]["q"].Slots != 4 || !e.JITLoadByEngine["ollama"] {
 		t.Fatalf("enriched lost capacity: %+v", e)
 	}

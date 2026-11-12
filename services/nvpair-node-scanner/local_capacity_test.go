@@ -46,7 +46,7 @@ func TestRefreshSlotChangeReportsChange(t *testing.T) {
 func TestApplyModelsObservedAtHeartbeat(t *testing.T) {
 	d := newDirectory()
 	d.upsert(noderec.DirectoryNode{
-		HostUUID: "p", IP: "10.0.0.9", Models: []string{"a"}, ModelsObservedAt: 1000,
+		HostUUID: "p", IP: "10.0.0.9", Models: []string{"a"}, LocalNodeExt: noderec.LocalNodeExt{ModelsObservedAt: 1000},
 		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
 	})
 	inv := modelInventory{models: []string{"a"}}
@@ -63,7 +63,9 @@ func TestApplyModelsObservedAtHeartbeat(t *testing.T) {
 
 // newLocalTestDaemon is newRefreshTestDaemon plus the fork's enrichment state.
 func newLocalTestDaemon() *daemon {
-	return newRefreshTestDaemon()
+	d := newRefreshTestDaemon()
+	d.local = newLocalScanState()
+	return d
 }
 
 func slotBody(slots int, jit bool) map[string]any {

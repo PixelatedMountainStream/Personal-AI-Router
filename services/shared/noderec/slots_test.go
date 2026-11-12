@@ -11,7 +11,7 @@ import (
 )
 
 func TestDirectoryNodeSlotsRoundTrip(t *testing.T) {
-	orig := DirectoryNode{HostUUID: "h", SlotsByEngine: map[string]map[string]SlotInfo{"ollama": {"q": {Slots: 4, CtxPerSlot: 8192}}}, JITLoadByEngine: map[string]bool{"lmstudio": false}}
+	orig := DirectoryNode{HostUUID: "h", LocalNodeExt: LocalNodeExt{SlotsByEngine: map[string]map[string]SlotInfo{"ollama": {"q": {Slots: 4, CtxPerSlot: 8192}}}, JITLoadByEngine: map[string]bool{"lmstudio": false}}}
 	b, _ := json.Marshal(orig)
 	var got DirectoryNode
 	if err := json.Unmarshal(b, &got); err != nil || !reflect.DeepEqual(got, orig) {
