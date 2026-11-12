@@ -251,6 +251,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory, observedAt int64) (node noderec.DirectoryNode, changed, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	defer d.localMergeCapacity(hostUUID, inv, observedAt, &node, &changed, &ok) // fork:S5
 	n, present := d.nodes[hostUUID]
 	if !present {
 		return noderec.DirectoryNode{}, false, false

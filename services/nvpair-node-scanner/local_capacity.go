@@ -4,6 +4,7 @@
 package main
 
 import (
+	"reflect"
 	"time"
 
 	"nvpair-shared/noderec"
@@ -60,4 +61,31 @@ func (s *localScanState) forget(hostUUID string) {
 		return
 	}
 	delete(s.ext, hostUUID)
+}
+
+// modelsObservedHeartbeat bounds how often an unchanged inventory republishes a
+// fresher ModelsObservedAt.
+const modelsObservedHeartbeat = 30 * time.Second
+
+// localMergeCapacity is applyModels' capacity merge (seam S5), deferred under
+// the directory lock so it sees applyModels' named results. On a valid apply it
+// stores the fetch's slots/jit_load and observedAt when upstream's inventory
+// changed, when the capacity changed, or when an identical inventory is a
+// heartbeat newer than the stored observation; the last two report a change.
+// With a zero extension and observedAt 0 (a nil localScanState) it stores the
+// zero extension, leaving upstream's result unchanged.
+func (d *directory) localMergeCapacity(hostUUID string, inv modelInventory, observedAt int64, node *noderec.DirectoryNode, changed, ok *bool) {
+	if !*ok {
+		return
+	}
+	n := d.nodes[hostUUID]
+	if !*changed && reflect.DeepEqual(n.SlotsByEngine, inv.slotsByEngine) &&
+		reflect.DeepEqual(n.JITLoadByEngine, inv.jitByEngine) &&
+		observedAt-n.ModelsObservedAt < modelsObservedHeartbeat.Milliseconds() {
+		return
+	}
+	n.LocalNodeExt = noderec.LocalNodeExt{SlotsByEngine: inv.slotsByEngine, JITLoadByEngine: inv.jitByEngine,
+		ModelsObservedAt: observedAt}
+	d.nodes[hostUUID] = n
+	*node, *changed = n, true
 }
