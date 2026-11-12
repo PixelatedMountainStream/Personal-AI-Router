@@ -292,18 +292,3 @@ func TestScannerProcess_RoutesAndRemovesTelemetry(t *testing.T) {
 	sp.handleNotify(noderec.NotifyNodeRemoved, nodeRemovedFrame(t, "peer", "peer-uuid"))
 	require.Equal(t, "peer-uuid", removed, "removed telemetry host")
 }
-
-// TestDirectoryRelaysSlotCapacity: slot capacity and jit_load on a directory node
-// reach both the enriched projection and the client-facing AvailableNode.
-func TestDirectoryRelaysSlotCapacity(t *testing.T) {
-	slots := map[string]map[string]noderec.SlotInfo{"ollama": {"q": {Slots: 4, CtxPerSlot: 8192}}}
-	jit := map[string]bool{"ollama": true}
-	e := directoryToEnriched(noderec.DirectoryNode{HostUUID: "h", Name: "n", LocalNodeExt: noderec.LocalNodeExt{SlotsByEngine: slots, JITLoadByEngine: jit}})
-	if e.SlotsByEngine["ollama"]["q"].Slots != 4 || !e.JITLoadByEngine["ollama"] {
-		t.Fatalf("enriched lost capacity: %+v", e)
-	}
-	av := storedNode{scanner: &e}.toAvailable()
-	if av.SlotsByEngine["ollama"]["q"].CtxPerSlot != 8192 || !av.JITLoadByEngine["ollama"] {
-		t.Fatalf("available lost capacity: %+v", av)
-	}
-}

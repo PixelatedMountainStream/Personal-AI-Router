@@ -122,6 +122,8 @@ type AvailableNode struct {
 	// inventory was read and is empty; a missing key means it was not read.
 	// Omitted when no engine reports one.
 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
+	// fork:S6
+	LocalBrokerExt
 }
 
 // GetNodesResult is the response to "discovery:get-nodes". Wrapped in an

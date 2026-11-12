@@ -77,6 +77,8 @@ type EnrichedNode struct {
 	// engine-manager /v1/models downloadedByEngine field. Carried through to
 	// AvailableNode so a remote node's model manager keeps its rows.
 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
+	// fork:S6
+	LocalBrokerExt
 }
 
 // directoryToEnriched projects the promoted daemon's DirectoryNode onto the
@@ -116,6 +118,7 @@ func directoryToEnriched(n noderec.DirectoryNode) EnrichedNode {
 		ModelsByEngine:     n.ModelsByEngine,
 		LoadedByEngine:     n.LoadedByEngine,
 		DownloadedByEngine: n.DownloadedByEngine,
+		LocalBrokerExt:     localBrokerExt(n), // fork:S6
 	}
 }
 
@@ -333,6 +336,7 @@ func (sn storedNode) toAvailable() AvailableNode {
 		ModelsByEngine:     n.ModelsByEngine,
 		LoadedByEngine:     n.LoadedByEngine,
 		DownloadedByEngine: n.DownloadedByEngine,
+		LocalBrokerExt:     n.LocalBrokerExt, // fork:S6
 	}
 }
 
