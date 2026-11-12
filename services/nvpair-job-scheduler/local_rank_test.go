@@ -5,6 +5,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,4 +34,22 @@ func TestEmit_IncludesPendingRanksLocalExt(t *testing.T) {
 			assert.NotZero(t, got[0].Ranks[i].ComputedAt, "rank[1] ComputedAt")
 		}
 	}
+}
+
+// TestLocalRankUnchangedIgnoresComputedAt (step-3 characterization): a
+// recompute that only moves ComputedAt is not a new ranking, while a PendingBy
+// change is.
+func TestLocalRankUnchangedIgnoresComputedAt(t *testing.T) {
+	rec := &capRW{}
+	m := mgrWith(rec, []string{"a"},
+		workload{ID: "w", Engine: "ollama", Model: "m", RunID: "run", State: "running", OriginatedFrom: "local", ScheduledOn: "a"},
+	)
+	order, ranks := m.rankAt(time.UnixMilli(1000))
+	m.emitIfChanged("ollama", order, ranks, false)
+	order, ranks = m.rankAt(time.UnixMilli(2000))
+	m.emitIfChanged("ollama", order, ranks, false)
+	require.Len(t, rec.priorities(t, "ollama"), 1, "ComputedAt-only change must not re-emit")
+	ranks[0].PendingBy = map[string]int{"ollama/m": 2}
+	m.emitIfChanged("ollama", order, ranks, false)
+	require.Len(t, rec.priorities(t, "ollama"), 2, "PendingBy change must re-emit")
 }

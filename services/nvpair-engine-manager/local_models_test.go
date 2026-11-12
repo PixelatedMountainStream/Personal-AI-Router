@@ -113,3 +113,21 @@ func TestApplySettingsOverrides(t *testing.T) {
 	assert.False(t, r.JITLoadByEngine["lmstudio"], "jit defaults = %v", r.JITLoadByEngine)
 	assert.True(t, r.JITLoadByEngine["ollama"], "jit defaults = %v", r.JITLoadByEngine)
 }
+
+// TestLocalModelsResultJSONKeys (step-3 characterization, E11): the fork's
+// capacity fields keep their wire keys and drop out when empty.
+func TestLocalModelsResultJSONKeys(t *testing.T) {
+	r := ModelsResult{Models: []string{"a"}}
+	b, err := json.Marshal(r)
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "slotsByEngine", "empty slots must be omitted")
+	assert.NotContains(t, string(b), "jitLoadByEngine", "empty jit must be omitted")
+	r.SlotsByEngine = map[string]map[string]SlotInfo{"lmstudio": {"a": {Slots: 2}}}
+	r.JITLoadByEngine = map[string]bool{"lmstudio": true}
+	b, err = json.Marshal(r)
+	require.NoError(t, err)
+	var keys map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(b, &keys))
+	assert.Contains(t, keys, "slotsByEngine")
+	assert.Contains(t, keys, "jitLoadByEngine")
+}
