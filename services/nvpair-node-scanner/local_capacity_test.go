@@ -6,6 +6,7 @@ package main
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,7 +46,7 @@ func TestRefreshSlotChangeReportsChange(t *testing.T) {
 func TestApplyModelsObservedAtHeartbeat(t *testing.T) {
 	d := newDirectory()
 	d.upsert(noderec.DirectoryNode{
-		HostUUID: "p", IP: "10.0.0.9", Models: []string{"a"}, ModelsObservedAt: 1000,
+		HostUUID: "p", IP: "10.0.0.9", Models: []string{"a"}, LocalNodeExt: noderec.LocalNodeExt{ModelsObservedAt: 1000},
 		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
 	})
 	inv := modelInventory{models: []string{"a"}}
@@ -54,4 +55,81 @@ func TestApplyModelsObservedAtHeartbeat(t *testing.T) {
 	n, changed, _ := d.applyModels("p", "10.0.0.9", 14322, inv, 1000+modelsObservedHeartbeat.Milliseconds())
 	require.True(t, changed && n.ModelsObservedAt == 1000+modelsObservedHeartbeat.Milliseconds(),
 		"sweep past heartbeat: changed=%v at=%d", changed, n.ModelsObservedAt)
+}
+
+// Step-2 characterization (scanner heartbeat/observed-at and slot/jit caches),
+// written against pre-step develop; assertions must hold unchanged after the
+// daemon.go seams (S4) land.
+
+// newLocalTestDaemon is newRefreshTestDaemon plus the fork's enrichment state.
+func newLocalTestDaemon() *daemon {
+	d := newRefreshTestDaemon()
+	d.local = newLocalScanState()
+	return d
+}
+
+func slotBody(slots int, jit bool) map[string]any {
+	return map[string]any{
+		"models":          []string{"a"},
+		"modelsByEngine":  map[string][]string{"lmstudio": {"a"}},
+		"loadedByEngine":  map[string][]string{"lmstudio": {"a"}},
+		"slotsByEngine":   map[string]map[string]map[string]int{"lmstudio": {"a": {"slots": slots}}},
+		"jitLoadByEngine": map[string]bool{"lmstudio": jit},
+	}
+}
+
+func emNode(hostUUID string, port int) noderec.DirectoryNode {
+	return noderec.DirectoryNode{HostUUID: hostUUID, Services: map[noderec.ServiceKey]noderec.ServiceStatus{
+		noderec.ServiceEngineManager: {Port: port}}}
+}
+
+// TestLocalEnrichSetsSlotsAndObservedAt: a successful enrichment carries slots,
+// jit_load and a fresh ModelsObservedAt onto the node.
+func TestLocalEnrichSetsSlotsAndObservedAt(t *testing.T) {
+	d := newLocalTestDaemon()
+	_, port := startModelsStub(t, http.StatusOK, slotBody(3, true))
+	n := emNode("p", port)
+	before := time.Now().UnixMilli()
+	d.enrichModelsCandidates(&n, []string{"127.0.0.1"})
+	assert.Equal(t, 3, n.SlotsByEngine["lmstudio"]["a"].Slots)
+	assert.True(t, n.JITLoadByEngine["lmstudio"])
+	assert.True(t, n.ModelsObservedAt >= before && n.ModelsObservedAt <= time.Now().UnixMilli())
+}
+
+// TestLocalEnrichFallbackRestoresSlots: a failed fetch restores the cached
+// slots, jit_load and observed-at from the last refresh.
+func TestLocalEnrichFallbackRestoresSlots(t *testing.T) {
+	d := newLocalTestDaemon()
+	stub, port := startModelsStub(t, http.StatusOK, slotBody(2, true))
+	seedEMNode(d, "p", "127.0.0.1", port)
+	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""))
+	got, _ := d.dir.get("p")
+	require.NotZero(t, got.ModelsObservedAt)
+	stub.set(http.StatusInternalServerError, nil)
+	n := emNode("p", port)
+	d.enrichModelsCandidates(&n, []string{"127.0.0.1"})
+	assert.Equal(t, 2, n.SlotsByEngine["lmstudio"]["a"].Slots)
+	assert.True(t, n.JITLoadByEngine["lmstudio"])
+	assert.Equal(t, got.ModelsObservedAt, n.ModelsObservedAt)
+}
+
+// TestLocalForgetAndDropSelfSlotCaches: forget drops the slot caches; dropSelf
+// migrates them to the new host UUID.
+func TestLocalForgetAndDropSelfSlotCaches(t *testing.T) {
+	d := newLocalTestDaemon()
+	stub, port := startModelsStub(t, http.StatusOK, slotBody(2, false))
+	seedEMNode(d, "old", "127.0.0.1", port)
+	seedEMNode(d, "gone", "127.0.0.1", port)
+	require.True(t, d.refreshNodeModels("old", "127.0.0.1", port, ""))
+	require.True(t, d.refreshNodeModels("gone", "127.0.0.1", port, ""))
+	d.dropSelf("old", "new")
+	d.forget("gone")
+	stub.set(http.StatusInternalServerError, nil)
+	moved, gone := emNode("new", port), emNode("gone", port)
+	d.enrichModelsCandidates(&moved, []string{"127.0.0.1"})
+	d.enrichModelsCandidates(&gone, []string{"127.0.0.1"})
+	assert.Equal(t, 2, moved.SlotsByEngine["lmstudio"]["a"].Slots)
+	assert.NotZero(t, moved.ModelsObservedAt)
+	assert.Nil(t, gone.SlotsByEngine)
+	assert.Zero(t, gone.ModelsObservedAt)
 }

@@ -12,7 +12,7 @@ import (
 )
 
 func dnode(id string, loaded []string, slots map[string]noderec.SlotInfo, obs int64) noderec.DirectoryNode {
-	n := noderec.DirectoryNode{HostUUID: id, ModelsObservedAt: obs}
+	n := noderec.DirectoryNode{HostUUID: id, LocalNodeExt: noderec.LocalNodeExt{ModelsObservedAt: obs}}
 	if loaded != nil {
 		n.LoadedByEngine = map[string][]string{"ollama": loaded}
 	}

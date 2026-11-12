@@ -226,11 +226,6 @@ files: services/nvpair-ui-broker/discovery_test.go
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
 
-### L-services-shared-noderec-noderec-go
-files: services/shared/noderec/noderec.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
 ### L-services-shared-schedulerwire-schedulerwire-go
 files: services/shared/schedulerwire/schedulerwire.go
 kind: legacy
@@ -240,3 +235,19 @@ recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against
 files: services/shared/schedulerwire/schedulerwire_test.go
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
+
+## Hook records (catch-up step 2)
+
+`daemon.go` keeps its legacy record alongside S4 until step 4 drops the unmarked S8 hand edits (conversion rule, plan section 5.2). `noderec.go` has no inline edit outside S1, so its legacy record is converted.
+
+### S1
+files: services/shared/noderec/noderec.go
+kind: hook
+recipe: Take upstream noderec.go; add `// fork:S1` then `LocalNodeExt` as the last DirectoryNode field (after LastSeen, so gofmt does not realign it); the type lives in services/shared/noderec/local_ext.go.
+Tests: services/shared ./noderec/ -run 'TestS1_Nil|TestLocalNodeExtJSONKeys'
+
+### S4
+files: services/nvpair-node-scanner/daemon.go
+kind: hook
+recipe: Take upstream daemon.go; add the `local *localScanState` field and its newDaemon init, `d.local.migrate` in dropSelf, `d.local.forget` in forget, `node.LocalNodeExt = d.local.record(...)` on enrich success, `cachedExt := d.local.cached(...)` plus `node.LocalNodeExt = cachedExt` on the enrich fallback, and `observed := d.local.record(...).ModelsObservedAt` in refreshNodeModelsCandidates, each marked `// fork:S4`; bodies in local_capacity.go.
+Tests: services/nvpair-node-scanner . -run 'TestS4_Nil|TestLocal'

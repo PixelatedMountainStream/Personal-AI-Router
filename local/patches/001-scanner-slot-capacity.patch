@@ -1,0 +1,303 @@
+From ac8d61a04c2997f76511e807b4938aeb9444c23b Mon Sep 17 00:00:00 2001
+From: "erik.hauan" <erik.hauan@radiantvs.com>
+Date: Thu, 12 Nov 2026 10:55:37 -0800
+Subject: [PATCH] node-scanner, noderec: slot capacity, jit_load and
+ observed-at behind S1/S4
+
+Behaviour: the scanner carries per-engine slot capacity (SlotsByEngine),
+jit_load flags (JITLoadByEngine) and the models-observed heartbeat
+(ModelsObservedAt) on each DirectoryNode. A successful /v1/models fetch
+records them; a transient miss restores the last recorded values; forget
+drops them; dropSelf migrates them to the new host UUID.
+
+Seams used: S1 (noderec.DirectoryNode embeds LocalNodeExt, defined in
+services/shared/noderec/local_ext.go; wire keys unchanged), S4 (daemon field
+local *localScanState plus one-line nil-safe hooks record/cached/migrate/
+forget; bodies in services/nvpair-node-scanner/local_capacity.go).
+
+Proving tests: TestS1_Nil, TestLocalNodeExtJSONKeys (shared ./noderec/);
+TestS4_Nil, TestLocalEnrichSetsSlotsAndObservedAt,
+TestLocalEnrichFallbackRestoresSlots, TestLocalForgetAndDropSelfSlotCaches,
+TestRefreshSlotChangeReportsChange, TestApplyModelsObservedAtHeartbeat
+(nvpair-node-scanner).
+
+Feature-group commit for catch-up step 2, exported as
+local/patches/001-scanner-slot-capacity.patch. It touches only upstream files
+and new files so it replays onto NVIDIA; fork-test fallout and records follow
+in the next commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ services/nvpair-node-scanner/daemon.go        |  9 +++
+ .../nvpair-node-scanner/local_capacity.go     | 63 +++++++++++++++++++
+ services/nvpair-node-scanner/local_s4_test.go | 31 +++++++++
+ services/shared/noderec/local_ext.go          | 39 ++++++++++++
+ services/shared/noderec/local_s1_test.go      | 24 +++++++
+ services/shared/noderec/noderec.go            |  2 +
+ 6 files changed, 168 insertions(+)
+ create mode 100644 services/nvpair-node-scanner/local_capacity.go
+ create mode 100644 services/nvpair-node-scanner/local_s4_test.go
+ create mode 100644 services/shared/noderec/local_ext.go
+ create mode 100644 services/shared/noderec/local_s1_test.go
+
+diff --git a/services/nvpair-node-scanner/daemon.go b/services/nvpair-node-scanner/daemon.go
+index 89d484c..54e7951 100644
+--- a/services/nvpair-node-scanner/daemon.go
++++ b/services/nvpair-node-scanner/daemon.go
+@@ -110,6 +110,8 @@ type daemon struct {
+ 	// same /v1/models fetch, so a transient miss reuses it rather than blanking
+ 	// a remote node's loaded state. Keyed by hostUuid.
+ 	lastLoadedByEngine map[string]map[string][]string
++	// fork:S4
++	local *localScanState
+ 	// nodeInfoDown holds the nodes whose last node-info enrichment failed, so
+ 	// the outage is reported when it starts and when it ends rather than once
+ 	// per sweep. Guarded by infoMu with the caches it explains: the reason a
+@@ -368,6 +370,7 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string, tlsHTTP
+ 		lastModels:         make(map[string][]string),
+ 		lastModelsByEngine: make(map[string]map[string][]string),
+ 		lastLoadedByEngine: make(map[string]map[string][]string),
++		local:              newLocalScanState(), // fork:S4
+ 		nodeInfoDown:       make(map[string]bool),
+ 		lastActivityAt:     make(map[string]time.Time),
+ 	}
+@@ -834,6 +837,7 @@ func (d *daemon) dropSelf(oldHostUUID, newHostUUID string) {
+ 	delete(d.lastModels, oldHostUUID)
+ 	delete(d.lastModelsByEngine, oldHostUUID)
+ 	delete(d.lastLoadedByEngine, oldHostUUID)
++	d.local.migrate(oldHostUUID, newHostUUID) // fork:S4
+ 	d.infoMu.Unlock()
+ 	if existed {
+ 		d.emit(noderec.NotifyNodeRemoved, noderec.DirectoryNode{HostUUID: oldHostUUID, Name: node.Name})
+@@ -1351,6 +1355,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
+ 		d.lastModels[node.HostUUID] = inventory.models
+ 		d.lastModelsByEngine[node.HostUUID] = inventory.byEngine
+ 		d.lastLoadedByEngine[node.HostUUID] = inventory.loadedByEngine
++		node.LocalNodeExt = d.local.record(node.HostUUID, inventory, time.Now()) // fork:S4
+ 		d.infoMu.Unlock()
+ 		node.Models = inventory.models
+ 		node.ModelsByEngine = inventory.byEngine
+@@ -1361,8 +1366,10 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
+ 	cached, had := d.lastModels[node.HostUUID]
+ 	cachedByEngine := d.lastModelsByEngine[node.HostUUID]
+ 	cachedLoaded := d.lastLoadedByEngine[node.HostUUID]
++	cachedExt := d.local.cached(node.HostUUID) // fork:S4
+ 	d.infoMu.Unlock()
+ 	if had {
++		node.LocalNodeExt = cachedExt // fork:S4
+ 		node.Models = cached
+ 		node.ModelsByEngine = cachedByEngine
+ 		node.LoadedByEngine = cachedLoaded
+@@ -1839,6 +1846,7 @@ func (d *daemon) refreshNodeModelsCandidates(hostUUID, guardIP string, hosts []s
+ 	d.lastModels[hostUUID] = models
+ 	d.lastModelsByEngine[hostUUID] = byEngine
+ 	d.lastLoadedByEngine[hostUUID] = loadedByEngine
++	observed = d.local.record(hostUUID, inventory, time.Now()).ModelsObservedAt // fork:S4
+ 	d.infoMu.Unlock()
+ 
+ 	node, changed, valid := d.dir.applyModels(hostUUID, guardIP, emPort, inventory, observed)
+@@ -1861,6 +1869,7 @@ func (d *daemon) forget(hostUUID string) {
+ 	delete(d.lastModels, hostUUID)
+ 	delete(d.lastModelsByEngine, hostUUID)
+ 	delete(d.lastLoadedByEngine, hostUUID)
++	d.local.forget(hostUUID) // fork:S4
+ 	delete(d.nodeInfoDown, hostUUID)
+ 	d.infoMu.Unlock()
+ 	d.activityMu.Lock()
+diff --git a/services/nvpair-node-scanner/local_capacity.go b/services/nvpair-node-scanner/local_capacity.go
+new file mode 100644
+index 0000000..34c3bfc
+--- /dev/null
++++ b/services/nvpair-node-scanner/local_capacity.go
+@@ -0,0 +1,63 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"time"
++
++	"nvpair-shared/noderec"
++)
++
++// localScanState is the fork's enrichment cache (seam S4): per-node slot
++// capacity, jit_load flags and models-observed time from the last successful
++// /v1/models fetch, reused on a transient miss exactly like upstream's
++// lastModels caches. Every method is nil-safe; a nil state leaves the daemon on
++// upstream's code path. Callers hold d.infoMu, which guards it with the
++// upstream caches it parallels.
++type localScanState struct {
++	ext map[string]noderec.LocalNodeExt // keyed by hostUuid
++}
++
++func newLocalScanState() *localScanState {
++	return &localScanState{ext: make(map[string]noderec.LocalNodeExt)}
++}
++
++// record caches a successful fetch's slot/jit data observed at now and returns
++// the node extension to publish (zero when s is nil).
++func (s *localScanState) record(hostUUID string, inv modelInventory, now time.Time) noderec.LocalNodeExt {
++	if s == nil {
++		return noderec.LocalNodeExt{}
++	}
++	e := noderec.LocalNodeExt{SlotsByEngine: inv.slotsByEngine, JITLoadByEngine: inv.jitByEngine,
++		ModelsObservedAt: now.UnixMilli()}
++	s.ext[hostUUID] = e
++	return e
++}
++
++// cached returns the last recorded extension for a node (zero if none).
++func (s *localScanState) cached(hostUUID string) noderec.LocalNodeExt {
++	if s == nil {
++		return noderec.LocalNodeExt{}
++	}
++	return s.ext[hostUUID]
++}
++
++// migrate moves a node's cache to its new host UUID (dropSelf).
++func (s *localScanState) migrate(oldHostUUID, newHostUUID string) {
++	if s == nil {
++		return
++	}
++	if e, ok := s.ext[oldHostUUID]; ok {
++		s.ext[newHostUUID] = e
++	}
++	delete(s.ext, oldHostUUID)
++}
++
++// forget drops a node's cache on eviction.
++func (s *localScanState) forget(hostUUID string) {
++	if s == nil {
++		return
++	}
++	delete(s.ext, hostUUID)
++}
+diff --git a/services/nvpair-node-scanner/local_s4_test.go b/services/nvpair-node-scanner/local_s4_test.go
+new file mode 100644
+index 0000000..d08f52a
+--- /dev/null
++++ b/services/nvpair-node-scanner/local_s4_test.go
+@@ -0,0 +1,31 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++
++	"nvpair-shared/noderec"
++)
++
++// TestS4_Nil: with no fork state the hooks are inert and enrichment publishes a
++// zero LocalNodeExt, i.e. upstream's record.
++func TestS4_Nil(t *testing.T) {
++	var s *localScanState
++	assert.Zero(t, s.record("p", modelInventory{}, time.Now()))
++	assert.Zero(t, s.cached("p"))
++	s.migrate("p", "q")
++	s.forget("p")
++	d := newRefreshTestDaemon()
++	_, port := startModelsStub(t, http.StatusOK, map[string]any{"models": []string{"a"}})
++	n := noderec.DirectoryNode{HostUUID: "p", Services: map[noderec.ServiceKey]noderec.ServiceStatus{
++		noderec.ServiceEngineManager: {Port: port}}}
++	d.enrichModelsCandidates(&n, []string{"127.0.0.1"})
++	assert.Equal(t, []string{"a"}, n.Models)
++	assert.Zero(t, n.LocalNodeExt)
++}
+diff --git a/services/shared/noderec/local_ext.go b/services/shared/noderec/local_ext.go
+new file mode 100644
+index 0000000..fc9c596
+--- /dev/null
++++ b/services/shared/noderec/local_ext.go
+@@ -0,0 +1,39 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package noderec
++
++// LocalNodeExt is the fork's extension of DirectoryNode (seam S1): per-engine
++// slot capacity, jit_load flags and the models-observed heartbeat. It is
++// embedded, so encoding/json flattens it and the wire keys are unchanged.
++type LocalNodeExt struct {
++	// SlotsByEngine is the parallel capacity of each engine's loaded models
++	// (engine -> model -> SlotInfo), enriched from engine-manager's em /v1/models
++	// slotsByEngine field with node-settings overrides applied. A missing engine
++	// or model means "capacity unknown" (never "one slot"). Absent on records from
++	// older peers.
++	SlotsByEngine map[string]map[string]SlotInfo `json:"slotsByEngine,omitempty"`
++	// JITLoadByEngine says whether an engine loads a missing model on demand
++	// (engine -> bool), resolved from the jit_load.<engine> setting or the engine
++	// default (see DefaultJITLoad). A missing engine key means the peer did not
++	// say; treat as the engine default.
++	JITLoadByEngine map[string]bool `json:"jitLoadByEngine,omitempty"`
++	// ModelsObservedAt is when (Unix milliseconds) the scanner last completed a
++	// successful models fetch for this node, whether or not the inventory
++	// changed. An unchanged sweep advances it only once it is 30s ahead of the
++	// published value, so it is a bounded-staleness heartbeat (<= ~30s plus a
++	// sweep behind the true last fetch), not a per-sweep value. 0 when never set
++	// (older peers).
++	ModelsObservedAt int64 `json:"modelsObservedAt,omitempty"`
++}
++
++// SlotInfo is a loaded model's parallel capacity: concurrent request slots and
++// the context window each slot gets (0 when unknown). It mirrors the
++// engine-manager wire shape.
++type SlotInfo struct {
++	Slots      int `json:"slots"`
++	CtxPerSlot int `json:"ctxPerSlot,omitempty"`
++	// Bytes is the model's resident size when a record declares "bytes"
++	// (model_sizes); internal, never part of the wire shape.
++	Bytes int64 `json:"-"`
++}
+diff --git a/services/shared/noderec/local_s1_test.go b/services/shared/noderec/local_s1_test.go
+new file mode 100644
+index 0000000..1857619
+--- /dev/null
++++ b/services/shared/noderec/local_s1_test.go
+@@ -0,0 +1,24 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package noderec
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++// TestS1_Nil: a zero LocalNodeExt adds no keys, so a DirectoryNode marshals
++// exactly as upstream's does.
++func TestS1_Nil(t *testing.T) {
++	b, err := json.Marshal(DirectoryNode{HostUUID: "h"})
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, k := range []string{"slotsByEngine", "jitLoadByEngine", "modelsObservedAt"} {
++		if strings.Contains(string(b), k) {
++			t.Errorf("zero ext leaked %s: %s", k, b)
++		}
++	}
++}
+diff --git a/services/shared/noderec/noderec.go b/services/shared/noderec/noderec.go
+index f44a263..3909867 100644
+--- a/services/shared/noderec/noderec.go
++++ b/services/shared/noderec/noderec.go
+@@ -516,6 +516,8 @@ type DirectoryNode struct {
+ 	// didn't report loaded state for it. Omitted when the peer reports none.
+ 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+ 	LastSeen       int64               `json:"lastSeen"` // Unix seconds
++	// fork:S1
++	LocalNodeExt
+ }
+ 
+ // Clustered reports whether the node advertises a cluster identity.
+-- 
+2.53.0
+

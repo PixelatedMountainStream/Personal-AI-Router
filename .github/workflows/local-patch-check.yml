@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Advisory patch-series consistency check (PLAN-pair-upstream-sync.md section 5.2).
+# Its own workflow on purpose: not in local-ci.yml, so neither required_checks nor
+# the Local CI workflow_run trigger sees it, and it never blocks enrollment or a merge.
+# Applies local/patches/ onto the candidate's own sha= pin and diffs the patched paths
+# (minus legacy-record files) against the candidate.
+name: Local patch check
+
+on:
+    pull_request:
+        branches: [develop]
+    push:
+        branches: [develop]
+
+permissions:
+    contents: read
+
+concurrency:
+    group: local-patch-check-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    patch-check:
+        name: Patch series (advisory)
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+              with:
+                  fetch-depth: 0
+            - name: Fetch the pinned upstream sha
+              run: |
+                  sha=$(sed -n 's/^sha=//p' local/UPSTREAM_VERSION.txt)
+                  git cat-file -e "$sha^{commit}" 2>/dev/null || {
+                      git remote add upstream https://github.com/NVIDIA/Personal-AI-Router.git
+                      git fetch --no-tags upstream "$sha" || git fetch --no-tags upstream
+                  }
+            - name: Reapply series and compare
+              run: bash local/scripts/reapply_patches.sh --check HEAD
