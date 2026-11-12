@@ -4,9 +4,10 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"log/slog"
-	"sort"
+	"slices"
 	"time"
 
 	"nvpair-shared/engines"
@@ -83,7 +84,6 @@ func (m *Manager) rank() ([]string, []NodeRank) {
 func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 	m.mu.Lock()
 	pending := make(map[string]int, len(m.nodes))
-	pendingBy := make(map[string]map[string]int)
 	for id := range m.nodes {
 		pending[id] = 0
 	}
@@ -96,12 +96,6 @@ func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 		}
 		if _, ok := m.nodes[w.ScheduledOn]; ok {
 			pending[w.ScheduledOn]++
-			if w.Model != "" {
-				if pendingBy[w.ScheduledOn] == nil {
-					pendingBy[w.ScheduledOn] = make(map[string]int)
-				}
-				pendingBy[w.ScheduledOn][schedulerwire.PendingKey(w.Engine, w.Model)]++
-			}
 		}
 	}
 	ranks := make([]NodeRank, 0, len(m.nodes))
@@ -111,22 +105,17 @@ func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 			ID:          id,
 			Pending:     pending[id],
 			GPUPressure: effectiveGPUPressure(state, ok, now),
-			PendingBy:   pendingBy[id],
-			ComputedAt:  now.UnixMilli(),
 		})
 	}
+	m.localAnnotateRanks(ranks, now) // fork:S3
 	m.mu.Unlock()
 
-	sort.Slice(ranks, func(i, j int) bool {
-		leftLoad := ranks[i].Pending + ranks[i].GPUPressure
-		rightLoad := ranks[j].Pending + ranks[j].GPUPressure
-		if leftLoad != rightLoad {
-			return leftLoad < rightLoad
-		}
-		if ranks[i].GPUPressure != ranks[j].GPUPressure {
-			return ranks[i].GPUPressure < ranks[j].GPUPressure
-		}
-		return ranks[i].ID < ranks[j].ID
+	slices.SortFunc(ranks, func(a, b NodeRank) int {
+		return cmp.Or(
+			cmp.Compare(a.Pending+a.GPUPressure, b.Pending+b.GPUPressure),
+			cmp.Compare(a.GPUPressure, b.GPUPressure),
+			cmp.Compare(a.ID, b.ID),
+		)
 	})
 	order := make([]string, len(ranks))
 	for i := range ranks {
@@ -144,7 +133,7 @@ func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 func (m *Manager) emitIfChanged(engine string, order []string, ranks []NodeRank, force bool) {
 	m.mu.Lock()
 	prev := m.emitted[engine]
-	changed := force || !equalRanks(prev.ranks, ranks)
+	changed := force || !localRankUnchanged(prev.ranks, ranks) // fork:S3
 	m.mu.Unlock()
 
 	if !changed {
@@ -182,16 +171,4 @@ func (m *Manager) status() statusResult {
 type statusResult struct {
 	IntervalMs int64                     `json:"interval_ms"`
 	Engines    map[string]EngineSchedule `json:"engines"`
-}
-
-func equalRanks(a, b []NodeRank) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if !a[i].Equal(b[i]) {
-			return false
-		}
-	}
-	return true
 }

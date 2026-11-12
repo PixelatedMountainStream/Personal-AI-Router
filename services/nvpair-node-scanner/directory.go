@@ -4,9 +4,9 @@
 package main
 
 import (
+	"cmp"
 	"log/slog"
-	"reflect"
-	"sort"
+	"slices"
 	"sync"
 	"time"
 
@@ -159,7 +159,9 @@ func (d *directory) supersedeCandidates(n noderec.DirectoryNode, selfUUID string
 		}
 		candidates = append(candidates, other)
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].HostUUID < candidates[j].HostUUID })
+	slices.SortFunc(candidates, func(a, b noderec.DirectoryNode) int {
+		return cmp.Compare(a.HostUUID, b.HostUUID)
+	})
 	return candidates
 }
 
@@ -186,7 +188,9 @@ func (d *directory) upsertEvicting(n noderec.DirectoryNode, proven []noderec.Dir
 		delete(d.nodes, old.HostUUID)
 		evicted = append(evicted, current)
 	}
-	sort.Slice(evicted, func(i, j int) bool { return evicted[i].HostUUID < evicted[j].HostUUID })
+	slices.SortFunc(evicted, func(a, b noderec.DirectoryNode) int {
+		return cmp.Compare(a.HostUUID, b.HostUUID)
+	})
 	d.nodes[n.HostUUID] = n
 	return evicted
 }
@@ -221,13 +225,11 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 		out = append(out, n)
 	}
 	d.mu.RUnlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].HostUUID < out[j].HostUUID })
+	slices.SortFunc(out, func(a, b noderec.DirectoryNode) int {
+		return cmp.Compare(a.HostUUID, b.HostUUID)
+	})
 	return out
 }
-
-// modelsObservedHeartbeat bounds how often an unchanged inventory republishes a
-// fresher ModelsObservedAt.
-const modelsObservedHeartbeat = 30 * time.Second
 
 // applyModels atomically reconciles one node's model inventory from a completed
 // /v1/models fetch, guarded against a node that was removed or re-addressed
@@ -249,6 +251,7 @@ const modelsObservedHeartbeat = 30 * time.Second
 func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory, observedAt int64) (node noderec.DirectoryNode, changed, ok bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	defer d.localMergeCapacity(hostUUID, inv, observedAt, &node, &changed, &ok) // fork:S5
 	n, present := d.nodes[hostUUID]
 	if !present {
 		return noderec.DirectoryNode{}, false, false
@@ -257,24 +260,12 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInvent
 	if !has || n.IP != ip || em.Port != emPort {
 		return n, false, false
 	}
-	if sameStringSet(n.Models, inv.models) && sameByEngine(n.ModelsByEngine, inv.byEngine) && sameByEngine(n.LoadedByEngine, inv.loadedByEngine) &&
-		reflect.DeepEqual(n.SlotsByEngine, inv.slotsByEngine) && reflect.DeepEqual(n.JITLoadByEngine, inv.jitByEngine) {
-		// Identical inventory: still a fresh successful observation. Publish the
-		// newer time only once it is modelsObservedHeartbeat ahead of the stored
-		// one, so steady sweeps do not churn the directory on every pass.
-		if observedAt-n.ModelsObservedAt < modelsObservedHeartbeat.Milliseconds() {
-			return n, false, true
-		}
-		n.ModelsObservedAt = observedAt
-		d.nodes[hostUUID] = n
-		return n, true, true
+	if sameStringSet(n.Models, inv.models) && sameByEngine(n.ModelsByEngine, inv.byEngine) && sameByEngine(n.LoadedByEngine, inv.loadedByEngine) {
+		return n, false, true
 	}
 	n.Models = inv.models
 	n.ModelsByEngine = inv.byEngine
 	n.LoadedByEngine = inv.loadedByEngine
-	n.SlotsByEngine = inv.slotsByEngine
-	n.JITLoadByEngine = inv.jitByEngine
-	n.ModelsObservedAt = observedAt
 	d.nodes[hostUUID] = n
 	return n, true, true
 }

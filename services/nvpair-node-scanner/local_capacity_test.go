@@ -133,3 +133,24 @@ func TestLocalForgetAndDropSelfSlotCaches(t *testing.T) {
 	assert.Nil(t, gone.SlotsByEngine)
 	assert.Zero(t, gone.ModelsObservedAt)
 }
+
+// TestLocalApplyModelsCapacityMerge (step-3 characterization): a capacity-only
+// change is a change that stores the slots, and a model change carries the
+// capacity and stamps the new observed-at.
+func TestLocalApplyModelsCapacityMerge(t *testing.T) {
+	d := newDirectory()
+	n0 := emNode("p", 14322)
+	n0.IP = "10.0.0.9"
+	n0.Models = []string{"a"}
+	n0.ModelsObservedAt = 1000
+	d.upsert(n0)
+	slots := map[string]map[string]noderec.SlotInfo{"lmstudio": {"a": {Slots: 2}}}
+	n, changed, ok := d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"a"}, slotsByEngine: slots}, 1500)
+	require.True(t, ok && changed, "capacity-only change: changed=%v ok=%v", changed, ok)
+	assert.Equal(t, 2, n.SlotsByEngine["lmstudio"]["a"].Slots, "stored slots")
+	assert.Equal(t, int64(1500), n.ModelsObservedAt, "observed-at on capacity change")
+	n, changed, _ = d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"a", "b"}, slotsByEngine: slots}, 1600)
+	require.True(t, changed, "model change must report a change")
+	assert.Equal(t, int64(1600), n.ModelsObservedAt, "observed-at on model change")
+	assert.Equal(t, 2, n.SlotsByEngine["lmstudio"]["a"].Slots, "slots carried on model change")
+}
