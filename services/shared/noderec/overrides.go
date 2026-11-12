@@ -40,8 +40,8 @@ func DefaultJITLoad(engine string) bool {
 // value but only applies to a model the engine reports loaded (loaded maps
 // engine -> loaded models), so an override never fabricates residency. Values
 // that are not positive integers (slots, ctx) or booleans (jit) are ignored.
-// slots is not mutated.
-func ApplyCapacityOverrides(raw map[string]json.RawMessage, engines []string, loaded map[string][]string, slots map[string]map[string]SlotInfo) (map[string]map[string]SlotInfo, map[string]bool) {
+// An engine in loadedOnly (vLLM) is never JIT, whatever the settings. slots is not mutated.
+func ApplyCapacityOverrides(raw map[string]json.RawMessage, engines []string, loaded map[string][]string, slots map[string]map[string]SlotInfo, loadedOnly map[string]bool) (map[string]map[string]SlotInfo, map[string]bool) {
 	out := make(map[string]map[string]SlotInfo, len(slots))
 	for e, m := range slots {
 		c := make(map[string]SlotInfo, len(m))
@@ -97,8 +97,8 @@ func ApplyCapacityOverrides(raw map[string]json.RawMessage, engines []string, lo
 	}
 	jit := make(map[string]bool, len(engines))
 	for _, e := range engines {
-		jit[e] = DefaultJITLoad(e)
-		if v, ok := raw[SettingJITLoad+e]; ok {
+		jit[e] = DefaultJITLoad(e) && !loadedOnly[e]
+		if v, ok := raw[SettingJITLoad+e]; ok && !loadedOnly[e] {
 			if b, err := strconv.ParseBool(strings.Trim(string(v), `"`)); err == nil {
 				jit[e] = b
 			}
