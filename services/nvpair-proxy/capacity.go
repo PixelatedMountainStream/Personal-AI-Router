@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"nvpair-shared/engines"
+	"nvpair-shared/noderec"
 )
 
 // Residency is what the directory says about a model on a node's engine.
@@ -71,12 +71,12 @@ func (settingsCapacity) Residency(_, _, _ string) (Residency, time.Time) {
 	return ResidencyUnknown, time.Time{}
 }
 
-// JITLoad defaults to true for Ollama and llama.cpp and false for LM Studio.
+// JITLoad defaults to noderec.DefaultJITLoad (vLLM and LM Studio false).
 func (c settingsCapacity) JITLoad(_, engine string) bool {
 	if v, ok := c.jit[engine]; ok {
 		return v
 	}
-	return engine != engines.NameLMStudio
+	return noderec.DefaultJITLoad(engine)
 }
 
 // parseCapacitySettings reads the flat settings object. The model is

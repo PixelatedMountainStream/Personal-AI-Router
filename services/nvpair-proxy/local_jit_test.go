@@ -5,6 +5,7 @@ package main
 
 import (
 	"testing"
+	"time"
 
 	"nvpair-shared/noderec"
 )
@@ -23,6 +24,47 @@ func TestLocalJITFallbackLMStudioParity(t *testing.T) {
 		}
 		if got := d.JITLoad("n", e); got != want {
 			t.Errorf("directory JITLoad(%s) = %v, want %v", e, got, want)
+		}
+	}
+}
+
+// TestLocalVLLMDownloadedOnlyNeverEligible: NVIDIA owns vLLM's model switch,
+// so a model a vLLM node has only downloaded (downloadedByEngine, not served)
+// is never eligible, whether the node said jit_load false or nothing; the
+// served name (modelsByEngine) is eligible as Loaded although loadedByEngine
+// names the --model root; a stopped vLLM serves nothing.
+func TestLocalVLLMDownloadedOnlyNeverEligible(t *testing.T) {
+	if (settingsCapacity{}).JITLoad("n", "vllm") {
+		t.Fatal("settings fallback must not JIT vLLM")
+	}
+	vllm := func(id string, served, loaded []string, jit map[string]bool) noderec.DirectoryNode {
+		n := noderec.DirectoryNode{HostUUID: id,
+			LoadedByEngine:     map[string][]string{"vllm": loaded},
+			DownloadedByEngine: map[string][]string{"vllm": {"org/m", "org/other"}},
+			LocalNodeExt:       noderec.LocalNodeExt{JITLoadByEngine: jit}}
+		if served != nil {
+			n.ModelsByEngine = map[string][]string{"vllm": served}
+		}
+		return n
+	}
+	d := newDirectoryCapacity(nil)
+	d.update("vllm", []noderec.DirectoryNode{
+		vllm("quiet", []string{"qwen-api"}, []string{"org/m"}, nil),
+		vllm("said", []string{"qwen-api"}, []string{"org/m"}, map[string]bool{"vllm": false}),
+		vllm("stopped", nil, []string{}, map[string]bool{"vllm": false}),
+	})
+	p := &Proxy{suppressed: map[inflightKey]time.Time{}, now: time.Now}
+	p.capacity = d
+	for _, id := range []string{"quiet", "said", "stopped"} {
+		for _, m := range []string{"org/other", "org/m"} {
+			if p.eligible(id, "vllm", m) {
+				t.Errorf("%s: downloaded-only %s must never be eligible", id, m)
+			}
+		}
+	}
+	for _, id := range []string{"quiet", "said"} {
+		if r, _ := d.Residency(id, "vllm", "qwen-api"); r != ResidencyLoaded || !p.eligible(id, "vllm", "qwen-api") {
+			t.Errorf("%s: served name residency %v", id, r)
 		}
 	}
 }

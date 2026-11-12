@@ -105,6 +105,7 @@ func (d *directoryCapacity) Residency(nodeID, engine, model string) (Residency, 
 	if !present {
 		return ResidencyUnknown, time.Time{}
 	}
+	loaded = localServedLoaded(e.node, engine, loaded)
 	want := modelKey(engine, model)
 	var observed time.Time
 	if ms := e.node.ModelsObservedAt; ms > 0 {
@@ -124,7 +125,7 @@ func (d *directoryCapacity) JITLoad(nodeID, engine string) bool {
 			return v
 		}
 	}
-	return engine != engines.NameLMStudio
+	return noderec.DefaultJITLoad(engine)
 }
 
 // overrideCapacity layers explicit node-settings overrides (env) over a base
