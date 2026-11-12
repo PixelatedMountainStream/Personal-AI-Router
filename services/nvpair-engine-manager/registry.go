@@ -354,6 +354,8 @@ type Action struct {
 	// only a restart makes the deletion visible to clients. A stopped engine is
 	// left stopped; a restart failure fails the action.
 	RestartAfter bool `json:"restart_after,omitempty"`
+	// fork:E10
+	LocalActionExt
 }
 
 // ActionResult is the list-extraction spec on an Action (see Action.Result).
@@ -374,6 +376,8 @@ type ActionResult struct {
 	// model it loaded as "root" (its --model): peers and the proxy are told the
 	// id, and the loaded marker on the model list uses the root.
 	InventoryField string `json:"inventory_field,omitempty"`
+	// fork:E10
+	LocalResultExt
 }
 
 // ResultMatch is the optional row filter on an ActionResult. Exactly one of
@@ -386,6 +390,8 @@ type ResultMatch struct {
 	Field    string   `json:"field"`              // element field to test, e.g. "state" / "loaded_instances"
 	In       []string `json:"in,omitempty"`       // accepted string values, e.g. ["loaded"]
 	Nonempty bool     `json:"nonempty,omitempty"` // true → Field must be a nonempty JSON array
+	// fork:E10
+	LocalMatchExt
 }
 
 // ActionRemovePath deletes a filesystem path declared in the manifest.
@@ -1123,7 +1129,10 @@ func (a *Action) validate(name string) error {
 			return fmt.Errorf("action %q: unsupported progress_protocol %q", name, a.ProgressProtocol)
 		}
 	}
-	if a.Result != nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") {
+	if err := a.localValidate(name); err != nil { // fork:E10
+		return err
+	}
+	if a.Result != nil && a.Result.Record == nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") { // fork:E10
 		return fmt.Errorf("action %q: result.array and result.field are required when result is set", name)
 	}
 	if a.Result != nil && a.Result.InventoryField != "" {
