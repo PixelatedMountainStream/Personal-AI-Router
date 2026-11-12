@@ -102,6 +102,8 @@ type daemon struct {
 	lastInfo      map[string]NodeInfoResponse
 	lastInfoAt    map[string]time.Time
 	lastInventory map[string]modelInventory
+	// fork:S4
+	local *localScanState
 	// nodeInfoDown holds the nodes whose last node-info enrichment failed, so
 	// the outage is reported when it starts and when it ends rather than once
 	// per sweep. Guarded by infoMu with the caches it explains: the reason a
@@ -358,6 +360,7 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string, tlsHTTP
 		lastInfo:       make(map[string]NodeInfoResponse),
 		lastInfoAt:     make(map[string]time.Time),
 		lastInventory:  make(map[string]modelInventory),
+		local:          newLocalScanState(), // fork:S4
 		nodeInfoDown:   make(map[string]bool),
 		lastActivityAt: make(map[string]time.Time),
 	}
@@ -1324,6 +1327,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
 		d.cacheInventory(node.HostUUID, inventory)
 		d.infoMu.Unlock()
 		inventory.applyTo(node)
+		inventory.local.applyTo(node) // fork:S4
 		return
 	}
 	d.infoMu.Lock()
@@ -1331,6 +1335,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
 	d.infoMu.Unlock()
 	if had {
 		cached.applyTo(node)
+		cached.local.applyTo(node) // fork:S4
 	}
 }
 
@@ -1381,6 +1386,8 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
 		ModelsByEngine     map[string][]string `json:"modelsByEngine"`
 		LoadedByEngine     map[string][]string `json:"loadedByEngine"`
 		DownloadedByEngine map[string][]string `json:"downloadedByEngine"`
+		// fork:S8
+		localModelsWire
 	}
 	reader := io.LimitReader(resp.Body, modelsMaxResponseBytes)
 	if err := json.NewDecoder(reader).Decode(&body); err != nil {
@@ -1391,6 +1398,7 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
 		byEngine:           body.ModelsByEngine,
 		loadedByEngine:     body.LoadedByEngine,
 		downloadedByEngine: body.DownloadedByEngine,
+		local:              d.local.ext(body.localModelsWire), // fork:S8
 	}, true
 }
 

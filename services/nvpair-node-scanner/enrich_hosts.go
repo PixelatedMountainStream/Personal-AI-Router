@@ -18,6 +18,7 @@ type modelInventory struct {
 	byEngine           map[string][]string
 	loadedByEngine     map[string][]string
 	downloadedByEngine map[string][]string
+	local              modelInventoryExt // fork:S8
 }
 
 // applyTo copies the inventory onto a directory entry's model fields.

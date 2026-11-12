@@ -526,6 +526,8 @@ type DirectoryNode struct {
 	// field; omitted when no engine reports one.
 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
 	LastSeen           int64               `json:"lastSeen"` // Unix seconds
+	// fork:S1
+	LocalNodeExt
 }
 
 // Clustered reports whether the node advertises a cluster identity.
