@@ -9,7 +9,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+<<<<<<< HEAD
 	"strconv"
+=======
+	"slices"
+>>>>>>> 4a8b67d38a845ac10739c883a8f367992e5c6c57
 	"strings"
 	"sync"
 	"time"
@@ -119,9 +123,13 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 		if listSpec == nil && loadedSpec == nil {
 			continue
 		}
+<<<<<<< HEAD
 		wg.Add(1)
 		go func(i int, name string, listSpec, loadedSpec *ActionResult, slotsAct *Action) {
 			defer wg.Done()
+=======
+		wg.Go(func() {
+>>>>>>> 4a8b67d38a845ac10739c883a8f367992e5c6c57
 			st, err := e.Status(name)
 			if err != nil || !st.Running {
 				return
@@ -149,10 +157,14 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 					slog.Debug("engine:models loaded_models returned an invalid inventory", "engine", name)
 				}
 			}
+<<<<<<< HEAD
 			if slotsAct != nil && loadedOK[i] {
 				slots[i] = e.querySlots(ctx, name, slotsAct, loaded[i])
 			}
 		}(i, name, listSpec, loadedSpec, slotsAct)
+=======
+		})
+>>>>>>> 4a8b67d38a845ac10739c883a8f367992e5c6c57
 	}
 	wg.Wait()
 
@@ -482,12 +494,16 @@ func classifyRow(el map[string]json.RawMessage, m *ResultMatch) (match, ok bool)
 	if err := json.Unmarshal(fv, &s); err != nil {
 		return false, false
 	}
+<<<<<<< HEAD
 	for _, want := range m.In {
 		if s == want {
 			return true, true
 		}
 	}
 	return false, true
+=======
+	return slices.Contains(m.In, s)
+>>>>>>> 4a8b67d38a845ac10739c883a8f367992e5c6c57
 }
 
 func resolveObjectPath(obj map[string]json.RawMessage, path string) (json.RawMessage, bool) {
