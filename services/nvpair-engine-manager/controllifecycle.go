@@ -59,7 +59,7 @@ func (s *controlServer) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 	// A start the peer's own Stop cut short answers with the status, stopped.
 	if err := s.exec.StartWith(r.Context(), req.Engine, startOpts{Port: req.Port, Bind: "127.0.0.1"}); err != nil && !errors.Is(err, errStartStopped) {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		localStartError(w, err) // fork:E14
 		return
 	}
 	s.writeStatus(w, req.Engine)
