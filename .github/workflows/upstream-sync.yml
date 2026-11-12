@@ -99,7 +99,7 @@ jobs:
           git remote add upstream https://github.com/NVIDIA/Personal-AI-Router.git
           git fetch upstream --tags --quiet
           git fetch origin --quiet
-          for l in "upstream-sync 0e8a16 Upstream sync" "upstream-release 1d76db Sync carries a new upstream tag" "sync-failing d93f0b Sync needs repair" "workflow-review fbca04 Upstream workflow changes held for manual porting" "ci-failing b60205 Sync PR checks failing" "sync-demo c5def5 Simulated-upstream demo sync" "surface-budget-raise 5319e7 Raises the local surface budget" "sync-conflict e99695 Merge conflicts escalated; a human removes this after repairing"; do
+          for l in "upstream-sync 0e8a16 Upstream sync" "upstream-release 1d76db Sync carries a new upstream tag" "sync-failing d93f0b Sync needs repair" "workflow-review fbca04 Upstream workflow changes held for manual porting" "legacy-touch fbca04 Upstream touched legacy fork files; held for manual review" "ci-failing b60205 Sync PR checks failing" "sync-demo c5def5 Simulated-upstream demo sync" "surface-budget-raise 5319e7 Raises the local surface budget" "sync-conflict e99695 Merge conflicts escalated; a human removes this after repairing"; do
             set -- $l; gh label create "$1" --color "$2" --description "${*:3}" 2>/dev/null || true
           done
 

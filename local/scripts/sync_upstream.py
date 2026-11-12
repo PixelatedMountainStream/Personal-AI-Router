@@ -184,6 +184,7 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False, dem
     hold_from = read_version(root, tags_base or base)[0]
     held = {"files": [{"status": st, "path": pth} for st, pth in workflow_changes(root, hold_from, target)],
             "commits": nul_list(git(root, "log", "-z", "--format=%h %s", f"{hold_from}..{target}", "--", WF).stdout)[:30]}
+    legacy, legacy_error = legacy_touched(root, hold_from, target)   # same range as `held`: pin..upstream ref
     rtags = tags = []   # demo mode has no tag lookup
     if not demo_ref:
         rtags = newer_tags(root, remote, cfg, last_tag, target)   # tags this branch has not recorded yet
@@ -200,7 +201,7 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False, dem
         mode = "none"
     commits = int(out(root, "rev-list", "--count", f"{base_sha}..{target}")) if new else 0
     return {"mode": mode, "new": new, "base_sha": base_sha, "target": target, "short": target[:10],
-            "commits": commits, "tags": tags, "rtags": rtags, "held": held, "newest_tag": tags[-1] if tags else "",
+            "commits": commits, "tags": tags, "rtags": rtags, "held": held, "legacy_touched": legacy, "legacy_error": legacy_error, "newest_tag": tags[-1] if tags else "",
             "release": bool(tags), "last_release_tag": last_tag, "remote": remote, "demo": bool(demo_ref)}
 
 
@@ -222,6 +223,22 @@ def workflow_changes(root, old, new):
     """[(status, path)] for upstream's workflow changes, NUL-delimited, renames split into D + A."""
     raw = nul_list(git(root, "diff", "-z", "--name-status", "--no-renames", f"{old}..{new}", "--", WF).stdout)
     return list(zip(raw[0::2], raw[1::2]))
+
+
+def legacy_touched(root, old, new):
+    """(sorted hits, error). Hits: paths upstream changed in old..new (NUL-delimited, renames split) that a `legacy`
+    fork-surface record covers. Seam (`hook`) and `data` records never count: only inline edits can merge clean yet
+    be wrong. Fail closed: a missing/unparseable records file or a git failure returns ([], error text), never a
+    quiet empty result; the run then refuses enrollment (never the legacy-touch label)."""
+    try:
+        recs = cfs.parse_records(root)
+        legacy = [f for r in recs if r["kind"] == "legacy" for f in r["files"]]
+        if not legacy or old == new:
+            return [], ""
+        changed = nul_list(git(root, "diff", "-z", "--name-only", "--no-renames", f"{old}..{new}").stdout)
+    except (cfs.ToolError, Escalate, OSError) as e:
+        return [], f"legacy-touch guard error: {str(e)[:200]}"
+    return sorted({c for c in changed if cfs.matches(c, legacy)}), ""
 
 
 def hold_workflows(root, base):
@@ -503,8 +520,16 @@ def held_of(st, mg):
     return next((h for h in (st.get("held"), mg.get("held")) if isinstance(h, dict) and h.get("files")), {})
 
 
+def legacy_of(st, mg):
+    return next((x for x in (st.get("legacy_touched"), mg.get("legacy_touched")) if isinstance(x, list) and x), [])
+
+
+def legacy_error_of(st, mg):
+    return next((x for x in (st.get("legacy_error"), mg.get("legacy_error")) if isinstance(x, str) and x), "")
+
+
 def derive_outcome(st, mg, guard, ck, check_code, stalled=False, veto=None):
-    """(outcome, extra): clean | failing | escalate | workflow_review. Held drift is never clean (and so
+    """(outcome, extra): clean | failing | escalate | workflow_review | legacy_touch | enroll_refused (guard error). Held drift is never clean (and so
     never enrolled); `extra` carries enroll_stalled, which does not change the outcome."""
     extra = ["enroll_stalled"] if stalled else []
     if not st or not st.get("ok", False):   # status failed (exit 2/3) or missing
@@ -521,6 +546,10 @@ def derive_outcome(st, mg, guard, ck, check_code, stalled=False, veto=None):
         return "failing", extra
     if held_of(st, mg).get("files"):
         return "workflow_review", extra
+    if legacy_of(st, mg):   # upstream edited a file the fork edits inline: a human re-checks it, never auto-merged
+        return "legacy_touch", extra
+    if legacy_error_of(st, mg):   # guard could not scan (fail closed): never clean, no label; the normal enroll_refused issue
+        return "enroll_refused", extra
     if veto in ("escalate", "failing"):   # head-pinned veto: an unchanged head never turns clean
         return veto, extra
     return "clean", extra
@@ -572,11 +601,13 @@ def cmd_report(a, root):
     short, tags = st.get("short", "?"), st.get("tags", [])
     held = held_of(st, mg)
     held_files = held.get("files") or []
+    legacy_files = [x for x in legacy_of(st, mg) if isinstance(x, str)]
     if a.demo:   # the demo PR is found and swept by its own label only
         labels = ["sync-demo"]
     else:
         labels = ["upstream-sync"] + (["upstream-release"] if st.get("release") else []) \
             + (["workflow-review"] if held_files else []) \
+            + (["legacy-touch"] if legacy_files else []) \
             + (["sync-failing"] if outcome in ("failing", "escalate") else [])
     if conflict_escalation(outcome, mg, ck):   # sticky: only a human removes it, after repairing
         labels.append("sync-conflict")
@@ -603,7 +634,9 @@ def cmd_report(a, root):
             if nmark and not any(v for k, v in kinds.items() if k != "generated" and v != "unknown"):
                 kinds.update({k: "unknown" for k in KINDS if k != "generated"})   # never 0 over markers
     L = [f"## {title}", "", f"Result: {'PASS' if outcome == 'clean' else 'FAIL'} ({outcome})",
-         f"Outcome: {outcome}", "Enrollment: pending", ""]
+         f"Outcome: {outcome}", f"Enrollment: refused: {legacy_error_of(st, mg)}" if outcome == "enroll_refused" else "Enrollment: pending", ""]
+    if legacy_error_of(st, mg) and outcome != "enroll_refused":   # an earlier outcome won: still show the guard error
+        L += ["### Legacy-touch guard error (fail closed)", f"- {legacy_error_of(st, mg)}", ""]
     if tags:
         L += ["### Upstream tags included", *(f"- {t}" for t in tags), ""]
     L += ["### Conflicts by kind", *(f"- {KIND_LABEL.get(k, k)}: {n}" for k, n in kinds.items()), ""]
@@ -619,6 +652,9 @@ def cmd_report(a, root):
         L += ["### Held workflow changes (kept identical to develop; port by hand)",
               *(f"- `{h['path']}` ({h['status']})" for h in held_files),
               "", "Upstream commits:", *(f"- {c}" for c in held.get("commits", [])), ""]
+    if legacy_files:
+        L += ["### Legacy fork files touched upstream (auto-merge held; review by hand)",
+              *(f"- `{x}`" for x in legacy_files), ""]
     if no_push:
         L += ["### Workflow guard failed (nothing was pushed)",
               *(f"- `{b['path']}`" for b in guard.get("blocked", [])), ""]
@@ -635,7 +671,8 @@ def cmd_report(a, root):
         Path(a.out).write_text(md)
     prefix = "Upstream sync demo" if a.demo else "Upstream sync"
     return emit("report", True, 0, "publish", outcome=outcome, title=title, labels=labels,
-                draft=outcome == "escalate", issue=outcome != "clean",
+                draft=outcome == "escalate", issue=outcome not in ("clean", "legacy_touch"),   # legacy-touch: PR + label + listing only, no issue
+                
                 push=not no_push,
                 issue_key="workflow-review workflow_review" if outcome == "workflow_review"
                 else f"{branch or 'upstream-sync'} {outcome}",

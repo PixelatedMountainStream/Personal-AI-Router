@@ -275,7 +275,7 @@ def check_prereqs(a):
         reasons.append("PR is cross-repository")
     if pr["isDraft"]:
         reasons.append("PR is still a draft")
-    for veto in ("workflow-review", "sync-failing", "ci-failing", "sync-conflict"):
+    for veto in ("workflow-review", "legacy-touch", "sync-failing", "ci-failing", "sync-conflict"):
         if veto in names(pr):
             reasons.append(f"PR carries the {veto} label")
     return reasons
