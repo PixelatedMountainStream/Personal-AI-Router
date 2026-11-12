@@ -44,6 +44,8 @@ type ModelsResult struct {
 	Models         []string            `json:"models"`
 	ByEngine       map[string][]string `json:"modelsByEngine,omitempty"`
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+	// fork:E11
+	LocalModelsExt
 }
 
 // Models returns the union of model names served by every installed, running
@@ -81,12 +83,14 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 	listOK := make([]bool, len(engineNames))
 	loaded := make([][]string, len(engineNames))
 	loadedOK := make([]bool, len(engineNames))
+	lx := newLocalSlotSweep(len(engineNames)) // fork:E11
 	var wg sync.WaitGroup
 	for i, name := range engineNames {
 		mf, ok := e.reg.Get(name)
 		if !ok {
 			continue
 		}
+		lx.prepare(i, mf) // fork:E11
 		var listSpec, loadedSpec *ActionResult
 		if act, ok := mf.Actions["list_models"]; ok {
 			listSpec = act.Result
@@ -125,6 +129,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 					slog.Debug("engine:models loaded_models returned an invalid inventory", "engine", name)
 				}
 			}
+			lx.collect(ctx, e, i, name, loadedOK[i], loaded[i]) // fork:E11
 		})
 	}
 	wg.Wait()
@@ -162,6 +167,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 			res.LoadedByEngine[engineNames[i]] = ld
 		}
 	}
+	lx.finish(e, &res, engineNames) // fork:E11
 	return res
 }
 
@@ -197,6 +203,7 @@ func extractStringsResult(raw json.RawMessage, spec *ActionResult) ([]string, bo
 		return nil, false
 	}
 	out := make([]string, 0)
+	arr, _ = expandInstances(arr, spec, false) // fork:E11
 	for _, el := range arr {
 		if spec.Match != nil && !matchRow(el, spec.Match) {
 			continue
