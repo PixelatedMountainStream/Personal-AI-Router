@@ -107,6 +107,7 @@ func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 			GPUPressure: effectiveGPUPressure(state, ok, now),
 		})
 	}
+	m.localAnnotateRanks(ranks, now) // fork:S3
 	m.mu.Unlock()
 
 	slices.SortFunc(ranks, func(a, b NodeRank) int {
@@ -132,7 +133,7 @@ func (m *Manager) rankAt(now time.Time) ([]string, []NodeRank) {
 func (m *Manager) emitIfChanged(engine string, order []string, ranks []NodeRank, force bool) {
 	m.mu.Lock()
 	prev := m.emitted[engine]
-	changed := force || !slices.Equal(prev.ranks, ranks)
+	changed := force || !localRankUnchanged(prev.ranks, ranks) // fork:S3
 	m.mu.Unlock()
 
 	if !changed {

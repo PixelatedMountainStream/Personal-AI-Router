@@ -19,6 +19,8 @@ type NodeRank struct {
 	Pending     int    `json:"pending"`
 	GPUPressure int    `json:"gpuPressure"`
 	Rank        int    `json:"rank"`
+	// fork:S2
+	LocalRankExt
 }
 
 // Priority is the payload accepted by a proxy's node/set-priority method.
@@ -54,7 +56,7 @@ func (p Priority) Clone() Priority {
 	return Priority{
 		Generation: p.Generation,
 		Nodes:      append([]string(nil), p.Nodes...),
-		Ranks:      append([]NodeRank(nil), p.Ranks...),
+		Ranks:      CloneRanks(p.Ranks), // fork:S2
 	}
 }
 
@@ -66,7 +68,7 @@ func (p Priority) Clone() Priority {
 // the two agree on every reachable value here, but DeepEqual would separate
 // nil from empty if a producer ever sent one.
 func (p Priority) SameRanking(other Priority) bool {
-	return slices.Equal(p.Nodes, other.Nodes) && slices.Equal(p.Ranks, other.Ranks)
+	return slices.Equal(p.Nodes, other.Nodes) && slices.EqualFunc(p.Ranks, other.Ranks, NodeRank.Equal) // fork:S2
 }
 
 // EnginePriority is the schedule:priority notification emitted by the scheduler.
@@ -81,6 +83,6 @@ type EnginePriority struct {
 func (p EnginePriority) Snapshot() Priority {
 	return Priority{
 		Nodes: append([]string(nil), p.Nodes...),
-		Ranks: append([]NodeRank(nil), p.Ranks...),
+		Ranks: CloneRanks(p.Ranks), // fork:S2
 	}
 }
