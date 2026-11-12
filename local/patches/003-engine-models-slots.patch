@@ -1,49 +1,51 @@
-From 9769ca04e089a3dbe3d02cd84c3743af05c78732 Mon Sep 17 00:00:00 2001
+From 5bfcca58fb602784a1b74907c0a1a638060bb9e4 Mon Sep 17 00:00:00 2001
 From: "erik.hauan" <erik.hauan@radiantvs.com>
-Date: Thu, 12 Nov 2026 13:56:09 -0800
+Date: Thu, 12 Nov 2026 15:26:24 -0800
 Subject: [PATCH] engine-manager: slot capacity and jit_load in ModelsResult
- behind E11
+ behind E11, vLLM gated off
 
 Behaviour: the engine:models sweep runs each engine's optional slots action
 (a record spec; array-shaped once, query-shaped once per loaded model) after
 its loaded_models query succeeds, publishes the capacity as SlotsByEngine,
 applies node-settings overrides and resolves JITLoadByEngine for every
 reporting engine; list/loaded extraction expands per-instance rows
-(spec.Each). classifyRow (matchRow with an "unclassifiable" result, JSON null
-included) serves the slots extraction and exclusive.go's residency check.
+(spec.Each). A loaded-only engine (advertised_models "loaded", vLLM) takes
+NVIDIA's loadedOnlyEngineModels path, which the slots hook does not touch:
+its jit_load is forced false and its slot overrides are keyed on the served
+name (modelsByEngine), not the --model root NVIDIA puts in loadedByEngine.
 
-Seams used: E11 (models.go: ModelsResult embeds LocalModelsExt; one-line
-nil-safe sweep hooks newLocalSlotSweep/prepare/collect/finish in
-ModelsResult, and expandInstances in extractStringsResult, each marked
-// fork:E11; bodies, querySlots, the record extractors and classifyRow in
-services/nvpair-engine-manager/local_models.go). NVIDIA's #195 idioms are
-kept (wg.Go closure, slices.Contains in matchRow); the moved code uses
-strings.SplitSeq, maps.Clone and slices.Collect.
+Seams used: E11 (models.go: ModelsResult embeds LocalModelsExt after
+NVIDIA's DownloadedByEngine; `lx := newLocalSlotSweep(e, engineNames)` after
+perEngine (it now also finds each engine's slots action and the loaded-only
+set, replacing the per-engine prepare hook), `lx.collect(...)` after
+`perEngine[i] = r`, `lx.finish(...)` before `return res`, and
+expandInstances in extractStringsResult; each marked // fork:E11; bodies in
+local_models.go).
 
-Proving tests: TestE11_Nil, TestLocalModelsResultJSONKeys, TestExtractRecords,
-TestBundledSlotsQueryThroughManifests, TestApplySettingsOverrides
-(nvpair-engine-manager).
+Proving tests: TestE11_Nil, TestLocalLoadedOnlyEngineNeverJITAndSlotsOnServedName,
+TestLocalLMStudioModelsThroughBundledManifest, TestBundledSlotsQueryThroughManifests,
+TestApplySettingsOverrides, TestLocalModelsResultJSONKeys (nvpair-engine-manager).
 
-Feature-group commit for catch-up step 3, exported as
-local/patches/003-engine-models-slots.patch. It touches only upstream files
-and new files so it replays onto NVIDIA; fork-test fallout and records follow
-in the fix-up commit.
+Feature-group commit for catch-up step 4, exported as
+local/patches/003-engine-models-slots.patch (refreshed in place).
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../nvpair-engine-manager/local_e11_test.go   |  28 ++
- .../nvpair-engine-manager/local_models.go     | 306 ++++++++++++++++++
- services/nvpair-engine-manager/models.go      |   7 +
- 3 files changed, 341 insertions(+)
+ .../nvpair-engine-manager/local_e11_test.go   |  27 ++
+ .../nvpair-engine-manager/local_models.go     | 332 ++++++++++++++++++
+ .../nvpair-engine-manager/local_vllm_test.go  |  43 +++
+ services/nvpair-engine-manager/models.go      |   6 +
+ 4 files changed, 408 insertions(+)
  create mode 100644 services/nvpair-engine-manager/local_e11_test.go
  create mode 100644 services/nvpair-engine-manager/local_models.go
+ create mode 100644 services/nvpair-engine-manager/local_vllm_test.go
 
 diff --git a/services/nvpair-engine-manager/local_e11_test.go b/services/nvpair-engine-manager/local_e11_test.go
 new file mode 100644
-index 0000000..894668e
+index 0000000..b7d9c71
 --- /dev/null
 +++ b/services/nvpair-engine-manager/local_e11_test.go
-@@ -0,0 +1,28 @@
+@@ -0,0 +1,27 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -63,7 +65,6 @@ index 0000000..894668e
 +func TestE11_Nil(t *testing.T) {
 +	var lx *localSlotSweep
 +	res := ModelsResult{Models: []string{"a"}, LoadedByEngine: map[string][]string{"e": {"a"}}}
-+	lx.prepare(0, &Manifest{})
 +	lx.collect(context.Background(), nil, 0, "e", true, []string{"a"})
 +	lx.finish(nil, &res, []string{"e"})
 +	assert.Nil(t, res.SlotsByEngine, "slots")
@@ -74,10 +75,10 @@ index 0000000..894668e
 +}
 diff --git a/services/nvpair-engine-manager/local_models.go b/services/nvpair-engine-manager/local_models.go
 new file mode 100644
-index 0000000..ca20758
+index 0000000..1443874
 --- /dev/null
 +++ b/services/nvpair-engine-manager/local_models.go
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,332 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -118,29 +119,40 @@ index 0000000..ca20758
 +type SlotInfo = noderec.SlotInfo
 +
 +// localSlotSweep is the slots part of one ModelsResult sweep, indexed by engine
-+// position like upstream's per-engine slices. Every method is nil-safe; a nil
++// position like upstream's per-engine results. Every method is nil-safe; a nil
 +// sweep leaves ModelsResult on upstream's code path.
 +type localSlotSweep struct {
-+	acts  []*Action
-+	slots []map[string]SlotInfo
++	acts       []*Action
++	slots      []map[string]SlotInfo
++	loadedOnly map[string]bool // engines with advertised_models "loaded" (vLLM)
 +}
 +
-+func newLocalSlotSweep(n int) *localSlotSweep {
-+	return &localSlotSweep{acts: make([]*Action, n), slots: make([]map[string]SlotInfo, n)}
-+}
-+
-+// prepare records engine i's optional slots action (one with a record spec).
-+func (s *localSlotSweep) prepare(i int, mf *Manifest) {
-+	if s == nil {
-+		return
++// newLocalSlotSweep records each engine's optional slots action (one with a
++// record spec) and which engines advertise only their loaded models.
++func newLocalSlotSweep(e *Executor, engineNames []string) *localSlotSweep {
++	s := &localSlotSweep{acts: make([]*Action, len(engineNames)), slots: make([]map[string]SlotInfo, len(engineNames))}
++	for i, name := range engineNames {
++		mf, ok := e.reg.Get(name)
++		if !ok {
++			continue
++		}
++		if act, ok := mf.Actions["slots"]; ok && act.Result != nil && act.Result.Record != nil {
++			s.acts[i] = &act
++		}
++		if mf.AdvertisedModels == advertisedModelsLoaded {
++			if s.loadedOnly == nil {
++				s.loadedOnly = map[string]bool{}
++			}
++			s.loadedOnly[name] = true
++		}
 +	}
-+	if act, ok := mf.Actions["slots"]; ok && act.Result != nil && act.Result.Record != nil {
-+		s.acts[i] = &act
-+	}
++	return s
 +}
 +
 +// collect queries engine i's slots once its loaded_models query succeeded.
 +// Called from engine i's sweep goroutine; each goroutine writes only index i.
++// A loaded-only engine (vLLM) takes NVIDIA's loadedOnlyEngineModels path,
++// which never reaches this hook: the fork does not query its slots.
 +func (s *localSlotSweep) collect(ctx context.Context, e *Executor, i int, name string, loadedOK bool, loaded []string) {
 +	if s == nil || s.acts[i] == nil || !loadedOK {
 +		return
@@ -163,13 +175,19 @@ index 0000000..ca20758
 +		}
 +		res.SlotsByEngine[engineNames[i]] = sl
 +	}
-+	res.applySettingsOverrides(e.settingsOverrides)
++	res.applySettingsOverrides(e.settingsOverrides, s.loadedOnly)
 +}
 +
 +// applySettingsOverrides merges node-settings engine overrides (slots, ctx per
 +// slot for loaded models) into the result and resolves jit_load for every
 +// engine that reported. A nil source still resolves the jit_load defaults.
-+func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage) {
++//
++// A loaded-only engine (advertised_models "loaded", vLLM) switches models only
++// by an operator action that restarts it (NVIDIA #181), never on demand: its
++// jit_load is false whatever the settings say, and its slot overrides are
++// keyed on the served name (modelsByEngine, what a request names), not on the
++// --model root that its loadedByEngine entry uses.
++func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage, loadedOnly map[string]bool) {
 +	var raw map[string]json.RawMessage
 +	if src != nil {
 +		raw = src()
@@ -182,7 +200,16 @@ index 0000000..ca20758
 +		reported[n] = true
 +	}
 +	names := slices.Collect(maps.Keys(reported))
-+	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, r.LoadedByEngine, r.SlotsByEngine)
++	served := r.LoadedByEngine
++	if len(loadedOnly) > 0 {
++		served = maps.Clone(r.LoadedByEngine)
++		for n := range loadedOnly {
++			if _, ok := served[n]; ok {
++				served[n] = r.ByEngine[n]
++			}
++		}
++	}
++	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, served, r.SlotsByEngine, loadedOnly)
 +}
 +
 +// querySlots runs an engine's optional slots action and returns capacity keyed
@@ -384,51 +411,93 @@ index 0000000..ca20758
 +	}
 +	return slices.Contains(m.In, s), true
 +}
+diff --git a/services/nvpair-engine-manager/local_vllm_test.go b/services/nvpair-engine-manager/local_vllm_test.go
+new file mode 100644
+index 0000000..72be1c9
+--- /dev/null
++++ b/services/nvpair-engine-manager/local_vllm_test.go
+@@ -0,0 +1,43 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"encoding/json"
++	"runtime"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// TestLocalLoadedOnlyEngineNeverJITAndSlotsOnServedName: NVIDIA owns vLLM's
++// model switch (an operator action that restarts it), so a loaded-only engine
++// reports jit_load false even when a setting asks for true, and a slot override
++// applies to the served name (--served-model-name, what a request names), not
++// to the --model root its loadedByEngine entry uses.
++func TestLocalLoadedOnlyEngineNeverJITAndSlotsOnServedName(t *testing.T) {
++	m := loadedOnlyManifest(t, fakeEngineBin)
++	key := runtime.GOOS + "/" + runtime.GOARCH
++	plat := m.Platforms[key]
++	plat.Runtime.Env = map[string]string{"OLLAMA_HOST": "127.0.0.1:{port}", "FAKE_SERVED_MODEL_NAME": "qwen-api"}
++	m.Platforms[key] = plat
++	ex := newTestExecutor(t, m)
++	ex.settingsOverrides = func() map[string]json.RawMessage {
++		return map[string]json.RawMessage{"jit_load.fake": json.RawMessage(`true`),
++			"engine_slots.fake.qwen-api": json.RawMessage(`4`), "engine_slots.fake.llama3.2:1b": json.RawMessage(`5`)}
++	}
++	ctx := t.Context()
++
++	res := ex.ModelsResult(ctx) // stopped: reported (nothing loaded), never JIT
++	assert.Equal(t, map[string]bool{"fake": false}, res.JITLoadByEngine, "stopped")
++	assert.Nil(t, res.SlotsByEngine, "stopped")
++
++	t.Cleanup(func() { _ = ex.Stop("fake") })
++	require.NoError(t, ex.Start(ctx, "fake"))
++	res = ex.ModelsResult(ctx)
++	require.Equal(t, map[string][]string{"fake": {"llama3.2:1b"}}, res.LoadedByEngine, "NVIDIA loaded marker uses the root")
++	assert.Equal(t, map[string]bool{"fake": false}, res.JITLoadByEngine, "running")
++	assert.Equal(t, map[string]map[string]SlotInfo{"fake": {"qwen-api": {Slots: 4}}}, res.SlotsByEngine)
++}
 diff --git a/services/nvpair-engine-manager/models.go b/services/nvpair-engine-manager/models.go
-index 449249b..f7c3c40 100644
+index 95624e3..c357268 100644
 --- a/services/nvpair-engine-manager/models.go
 +++ b/services/nvpair-engine-manager/models.go
-@@ -44,6 +44,8 @@ type ModelsResult struct {
- 	Models         []string            `json:"models"`
- 	ByEngine       map[string][]string `json:"modelsByEngine,omitempty"`
- 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
+@@ -58,6 +58,8 @@ type ModelsResult struct {
+ 	ByEngine           map[string][]string `json:"modelsByEngine,omitempty"`
+ 	LoadedByEngine     map[string][]string `json:"loadedByEngine,omitempty"`
+ 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
 +	// fork:E11
 +	LocalModelsExt
  }
  
  // Models returns the union of model names served by every installed, running
-@@ -81,12 +83,14 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
- 	listOK := make([]bool, len(engineNames))
- 	loaded := make([][]string, len(engineNames))
- 	loadedOK := make([]bool, len(engineNames))
-+	lx := newLocalSlotSweep(len(engineNames)) // fork:E11
+@@ -102,6 +104,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
+ 	// Results indexed by engine position so the flattened output stays
+ 	// deterministic (registration order) despite concurrent completion.
+ 	perEngine := make([]engineModels, len(engineNames))
++	lx := newLocalSlotSweep(e, engineNames) // fork:E11
  	var wg sync.WaitGroup
  	for i, name := range engineNames {
  		mf, ok := e.reg.Get(name)
- 		if !ok {
- 			continue
- 		}
-+		lx.prepare(i, mf) // fork:E11
- 		var listSpec, loadedSpec *ActionResult
- 		if act, ok := mf.Actions["list_models"]; ok {
- 			listSpec = act.Result
-@@ -125,6 +129,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
- 					slog.Debug("engine:models loaded_models returned an invalid inventory", "engine", name)
- 				}
+@@ -140,6 +143,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
+ 				r.loaded, r.loadedOK = e.queryModelList(ctx, name, "loaded_models", loadedSpec)
  			}
-+			lx.collect(ctx, e, i, name, loadedOK[i], loaded[i]) // fork:E11
+ 			perEngine[i] = r
++			lx.collect(ctx, e, i, name, r.loadedOK, r.loaded) // fork:E11
  		})
  	}
  	wg.Wait()
-@@ -162,6 +167,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
- 			res.LoadedByEngine[engineNames[i]] = ld
+@@ -164,6 +168,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
+ 			res.DownloadedByEngine = withModels(res.DownloadedByEngine, name, r.downloaded)
  		}
  	}
 +	lx.finish(e, &res, engineNames) // fork:E11
  	return res
  }
  
-@@ -197,6 +203,7 @@ func extractStringsResult(raw json.RawMessage, spec *ActionResult) ([]string, bo
+@@ -268,6 +273,7 @@ func extractStringsResult(raw json.RawMessage, spec *ActionResult) ([]string, bo
  		return nil, false
  	}
  	out := make([]string, 0)

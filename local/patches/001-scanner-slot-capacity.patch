@@ -1,184 +1,236 @@
-From ac8d61a04c2997f76511e807b4938aeb9444c23b Mon Sep 17 00:00:00 2001
+From aea7270d7259ca9b6dbb79067e4aefcc35c5dff4 Mon Sep 17 00:00:00 2001
 From: "erik.hauan" <erik.hauan@radiantvs.com>
-Date: Thu, 12 Nov 2026 10:55:37 -0800
+Date: Thu, 12 Nov 2026 15:26:23 -0800
 Subject: [PATCH] node-scanner, noderec: slot capacity, jit_load and
- observed-at behind S1/S4
+ observed-at on NVIDIA's modelInventory behind S1/S4/S5/S8
 
-Behaviour: the scanner carries per-engine slot capacity (SlotsByEngine),
-jit_load flags (JITLoadByEngine) and the models-observed heartbeat
-(ModelsObservedAt) on each DirectoryNode. A successful /v1/models fetch
-records them; a transient miss restores the last recorded values; forget
-drops them; dropSelf migrates them to the new host UUID.
+Behaviour: the scanner decodes slotsByEngine and jitLoadByEngine from a
+node's /v1/models in the same pass as NVIDIA's fields and stamps the fetch
+time (ModelsObservedAt) into the inventory; enrichment and its cached
+fallback publish them on the directory node; applyModels stores them when
+NVIDIA's compare (models, modelsByEngine, loadedByEngine, downloadedByEngine)
+changed, when the capacity changed, or on the 30s observed-at heartbeat.
 
-Seams used: S1 (noderec.DirectoryNode embeds LocalNodeExt, defined in
-services/shared/noderec/local_ext.go; wire keys unchanged), S4 (daemon field
-local *localScanState plus one-line nil-safe hooks record/cached/migrate/
-forget; bodies in services/nvpair-node-scanner/local_capacity.go).
+Seams used: S8 (enrich_hosts.go: modelInventory gains one field,
+`local modelInventoryExt`; daemon.go fetchModels: the decode struct embeds
+localModelsWire and the return literal sets `local: d.local.ext(...)`).
+NVIDIA's #181 modelInventory, applyTo, fetchModels and 4-argument
+applyModels are kept verbatim, so S8 is no longer a signature change and the
+test call sites need no edit. S4 (daemon.go: `local *localScanState` and its
+init; `inventory.local.applyTo(node)` and `cached.local.applyTo(node)` in
+enrichModelsCandidates); NVIDIA's lastInventory cache now carries the
+extension, so the migrate/forget/record/cached hooks are gone. S5
+(directory.go: deferred localMergeCapacity exit hook). S1 (noderec.go:
+LocalNodeExt embed after NVIDIA's new DownloadedByEngine/LastSeen). observedAt
+lives in modelInventoryExt.observedAt, stamped at fetch by a non-nil
+localScanState (0 with nil state).
 
-Proving tests: TestS1_Nil, TestLocalNodeExtJSONKeys (shared ./noderec/);
-TestS4_Nil, TestLocalEnrichSetsSlotsAndObservedAt,
-TestLocalEnrichFallbackRestoresSlots, TestLocalForgetAndDropSelfSlotCaches,
-TestRefreshSlotChangeReportsChange, TestApplyModelsObservedAtHeartbeat
-(nvpair-node-scanner).
+Proving tests: TestS1_Nil, TestS4_Nil, TestS5_Nil, TestS8_Nil,
+TestLocalDownloadedChangeKeepsCapacity, TestLocal*, TestRefreshSlotChangeReportsChange,
+TestApplyModelsObservedAtHeartbeat (nvpair-node-scanner, nvpair-shared/noderec).
 
-Feature-group commit for catch-up step 2, exported as
-local/patches/001-scanner-slot-capacity.patch. It touches only upstream files
-and new files so it replays onto NVIDIA; fork-test fallout and records follow
-in the next commit.
+Feature-group commit for catch-up step 4, exported as
+local/patches/001-scanner-slot-capacity.patch.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- services/nvpair-node-scanner/daemon.go        |  9 +++
- .../nvpair-node-scanner/local_capacity.go     | 63 +++++++++++++++++++
- services/nvpair-node-scanner/local_s4_test.go | 31 +++++++++
- services/shared/noderec/local_ext.go          | 39 ++++++++++++
- services/shared/noderec/local_s1_test.go      | 24 +++++++
+ services/nvpair-node-scanner/daemon.go        |  8 ++
+ services/nvpair-node-scanner/directory.go     |  1 +
+ services/nvpair-node-scanner/enrich_hosts.go  |  1 +
+ .../nvpair-node-scanner/local_capacity.go     | 89 +++++++++++++++++++
+ services/nvpair-node-scanner/local_s4_test.go | 30 +++++++
+ services/nvpair-node-scanner/local_s5_test.go | 27 ++++++
+ services/nvpair-node-scanner/local_s8_test.go | 65 ++++++++++++++
+ services/shared/noderec/local_ext.go          | 39 ++++++++
+ services/shared/noderec/local_s1_test.go      | 24 +++++
  services/shared/noderec/noderec.go            |  2 +
- 6 files changed, 168 insertions(+)
+ 10 files changed, 286 insertions(+)
  create mode 100644 services/nvpair-node-scanner/local_capacity.go
  create mode 100644 services/nvpair-node-scanner/local_s4_test.go
+ create mode 100644 services/nvpair-node-scanner/local_s5_test.go
+ create mode 100644 services/nvpair-node-scanner/local_s8_test.go
  create mode 100644 services/shared/noderec/local_ext.go
  create mode 100644 services/shared/noderec/local_s1_test.go
 
 diff --git a/services/nvpair-node-scanner/daemon.go b/services/nvpair-node-scanner/daemon.go
-index 89d484c..54e7951 100644
+index f386548..d88ec52 100644
 --- a/services/nvpair-node-scanner/daemon.go
 +++ b/services/nvpair-node-scanner/daemon.go
-@@ -110,6 +110,8 @@ type daemon struct {
- 	// same /v1/models fetch, so a transient miss reuses it rather than blanking
- 	// a remote node's loaded state. Keyed by hostUuid.
- 	lastLoadedByEngine map[string]map[string][]string
+@@ -102,6 +102,8 @@ type daemon struct {
+ 	lastInfo      map[string]NodeInfoResponse
+ 	lastInfoAt    map[string]time.Time
+ 	lastInventory map[string]modelInventory
 +	// fork:S4
 +	local *localScanState
  	// nodeInfoDown holds the nodes whose last node-info enrichment failed, so
  	// the outage is reported when it starts and when it ends rather than once
  	// per sweep. Guarded by infoMu with the caches it explains: the reason a
-@@ -368,6 +370,7 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string, tlsHTTP
- 		lastModels:         make(map[string][]string),
- 		lastModelsByEngine: make(map[string]map[string][]string),
- 		lastLoadedByEngine: make(map[string]map[string][]string),
-+		local:              newLocalScanState(), // fork:S4
- 		nodeInfoDown:       make(map[string]bool),
- 		lastActivityAt:     make(map[string]time.Time),
+@@ -358,6 +360,7 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string, tlsHTTP
+ 		lastInfo:       make(map[string]NodeInfoResponse),
+ 		lastInfoAt:     make(map[string]time.Time),
+ 		lastInventory:  make(map[string]modelInventory),
++		local:          newLocalScanState(), // fork:S4
+ 		nodeInfoDown:   make(map[string]bool),
+ 		lastActivityAt: make(map[string]time.Time),
  	}
-@@ -834,6 +837,7 @@ func (d *daemon) dropSelf(oldHostUUID, newHostUUID string) {
- 	delete(d.lastModels, oldHostUUID)
- 	delete(d.lastModelsByEngine, oldHostUUID)
- 	delete(d.lastLoadedByEngine, oldHostUUID)
-+	d.local.migrate(oldHostUUID, newHostUUID) // fork:S4
- 	d.infoMu.Unlock()
- 	if existed {
- 		d.emit(noderec.NotifyNodeRemoved, noderec.DirectoryNode{HostUUID: oldHostUUID, Name: node.Name})
-@@ -1351,6 +1355,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
- 		d.lastModels[node.HostUUID] = inventory.models
- 		d.lastModelsByEngine[node.HostUUID] = inventory.byEngine
- 		d.lastLoadedByEngine[node.HostUUID] = inventory.loadedByEngine
-+		node.LocalNodeExt = d.local.record(node.HostUUID, inventory, time.Now()) // fork:S4
+@@ -1324,6 +1327,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
+ 		d.cacheInventory(node.HostUUID, inventory)
  		d.infoMu.Unlock()
- 		node.Models = inventory.models
- 		node.ModelsByEngine = inventory.byEngine
-@@ -1361,8 +1366,10 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
- 	cached, had := d.lastModels[node.HostUUID]
- 	cachedByEngine := d.lastModelsByEngine[node.HostUUID]
- 	cachedLoaded := d.lastLoadedByEngine[node.HostUUID]
-+	cachedExt := d.local.cached(node.HostUUID) // fork:S4
+ 		inventory.applyTo(node)
++		inventory.local.applyTo(node) // fork:S4
+ 		return
+ 	}
+ 	d.infoMu.Lock()
+@@ -1331,6 +1335,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
  	d.infoMu.Unlock()
  	if had {
-+		node.LocalNodeExt = cachedExt // fork:S4
- 		node.Models = cached
- 		node.ModelsByEngine = cachedByEngine
- 		node.LoadedByEngine = cachedLoaded
-@@ -1839,6 +1846,7 @@ func (d *daemon) refreshNodeModelsCandidates(hostUUID, guardIP string, hosts []s
- 	d.lastModels[hostUUID] = models
- 	d.lastModelsByEngine[hostUUID] = byEngine
- 	d.lastLoadedByEngine[hostUUID] = loadedByEngine
-+	observed = d.local.record(hostUUID, inventory, time.Now()).ModelsObservedAt // fork:S4
- 	d.infoMu.Unlock()
+ 		cached.applyTo(node)
++		cached.local.applyTo(node) // fork:S4
+ 	}
+ }
  
- 	node, changed, valid := d.dir.applyModels(hostUUID, guardIP, emPort, inventory, observed)
-@@ -1861,6 +1869,7 @@ func (d *daemon) forget(hostUUID string) {
- 	delete(d.lastModels, hostUUID)
- 	delete(d.lastModelsByEngine, hostUUID)
- 	delete(d.lastLoadedByEngine, hostUUID)
-+	d.local.forget(hostUUID) // fork:S4
- 	delete(d.nodeInfoDown, hostUUID)
- 	d.infoMu.Unlock()
- 	d.activityMu.Lock()
+@@ -1381,6 +1386,8 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
+ 		ModelsByEngine     map[string][]string `json:"modelsByEngine"`
+ 		LoadedByEngine     map[string][]string `json:"loadedByEngine"`
+ 		DownloadedByEngine map[string][]string `json:"downloadedByEngine"`
++		// fork:S8
++		localModelsWire
+ 	}
+ 	reader := io.LimitReader(resp.Body, modelsMaxResponseBytes)
+ 	if err := json.NewDecoder(reader).Decode(&body); err != nil {
+@@ -1391,6 +1398,7 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
+ 		byEngine:           body.ModelsByEngine,
+ 		loadedByEngine:     body.LoadedByEngine,
+ 		downloadedByEngine: body.DownloadedByEngine,
++		local:              d.local.ext(body.localModelsWire), // fork:S8
+ 	}, true
+ }
+ 
+diff --git a/services/nvpair-node-scanner/directory.go b/services/nvpair-node-scanner/directory.go
+index 1ddc9f9..b769203 100644
+--- a/services/nvpair-node-scanner/directory.go
++++ b/services/nvpair-node-scanner/directory.go
+@@ -251,6 +251,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode
+ func (d *directory) applyModels(hostUUID, ip string, emPort int, inventory modelInventory) (node noderec.DirectoryNode, changed, ok bool) {
+ 	d.mu.Lock()
+ 	defer d.mu.Unlock()
++	defer d.localMergeCapacity(hostUUID, inventory, &node, &changed, &ok) // fork:S5
+ 	n, present := d.nodes[hostUUID]
+ 	if !present {
+ 		return noderec.DirectoryNode{}, false, false
+diff --git a/services/nvpair-node-scanner/enrich_hosts.go b/services/nvpair-node-scanner/enrich_hosts.go
+index 715328c..b7e15f0 100644
+--- a/services/nvpair-node-scanner/enrich_hosts.go
++++ b/services/nvpair-node-scanner/enrich_hosts.go
+@@ -18,6 +18,7 @@ type modelInventory struct {
+ 	byEngine           map[string][]string
+ 	loadedByEngine     map[string][]string
+ 	downloadedByEngine map[string][]string
++	local              modelInventoryExt // fork:S8
+ }
+ 
+ // applyTo copies the inventory onto a directory entry's model fields.
 diff --git a/services/nvpair-node-scanner/local_capacity.go b/services/nvpair-node-scanner/local_capacity.go
 new file mode 100644
-index 0000000..34c3bfc
+index 0000000..7838545
 --- /dev/null
 +++ b/services/nvpair-node-scanner/local_capacity.go
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,89 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package main
 +
 +import (
++	"reflect"
 +	"time"
 +
 +	"nvpair-shared/noderec"
 +)
 +
-+// localScanState is the fork's enrichment cache (seam S4): per-node slot
-+// capacity, jit_load flags and models-observed time from the last successful
-+// /v1/models fetch, reused on a transient miss exactly like upstream's
-+// lastModels caches. Every method is nil-safe; a nil state leaves the daemon on
-+// upstream's code path. Callers hold d.infoMu, which guards it with the
-+// upstream caches it parallels.
++// modelInventoryExt is the fork's part of a /v1/models answer (seam S8), held
++// in modelInventory.local so NVIDIA's lastInventory cache, dropSelf migration
++// and forget carry it with the upstream fields: slot capacity and jit_load as
++// the engine manager reported them, and observedAt, the Unix milliseconds of
++// the fetch, stamped at fetch time by a non-nil localScanState (0 otherwise).
++// The zero value is an upstream-shaped answer.
++type modelInventoryExt struct {
++	slotsByEngine map[string]map[string]noderec.SlotInfo
++	jitByEngine   map[string]bool
++	observedAt    int64
++}
++
++// node is the extension published on a directory entry.
++func (x modelInventoryExt) node() noderec.LocalNodeExt {
++	return noderec.LocalNodeExt{SlotsByEngine: x.slotsByEngine, JITLoadByEngine: x.jitByEngine, ModelsObservedAt: x.observedAt}
++}
++
++// applyTo publishes the extension on a directory entry, alongside upstream's
++// modelInventory.applyTo (seam S4, enrichment and its cached fallback).
++func (x modelInventoryExt) applyTo(node *noderec.DirectoryNode) {
++	node.LocalNodeExt = x.node()
++}
++
++// localModelsWire is embedded in fetchModels' decode struct (seam S8), so the
++// fork's /v1/models keys decode in the same pass as upstream's.
++type localModelsWire struct {
++	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine"`
++	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine"`
++}
++
++// localScanState is the daemon's fork state (seam S4). Its only job since
++// step 4 is the observed-at clock: NVIDIA's lastInventory caches the whole
++// modelInventory, extension included. Every method is nil-safe; a nil state
++// stamps no observedAt, so with an upstream-shaped answer the extension is zero.
 +type localScanState struct {
-+	ext map[string]noderec.LocalNodeExt // keyed by hostUuid
++	now func() time.Time
 +}
 +
 +func newLocalScanState() *localScanState {
-+	return &localScanState{ext: make(map[string]noderec.LocalNodeExt)}
++	return &localScanState{now: time.Now}
 +}
 +
-+// record caches a successful fetch's slot/jit data observed at now and returns
-+// the node extension to publish (zero when s is nil).
-+func (s *localScanState) record(hostUUID string, inv modelInventory, now time.Time) noderec.LocalNodeExt {
-+	if s == nil {
-+		return noderec.LocalNodeExt{}
++// ext builds a fetch's extension from the decoded fork keys (seam S8).
++func (s *localScanState) ext(w localModelsWire) modelInventoryExt {
++	x := modelInventoryExt{slotsByEngine: w.SlotsByEngine, jitByEngine: w.JITLoadByEngine}
++	if s != nil {
++		x.observedAt = s.now().UnixMilli()
 +	}
-+	e := noderec.LocalNodeExt{SlotsByEngine: inv.slotsByEngine, JITLoadByEngine: inv.jitByEngine,
-+		ModelsObservedAt: now.UnixMilli()}
-+	s.ext[hostUUID] = e
-+	return e
++	return x
 +}
 +
-+// cached returns the last recorded extension for a node (zero if none).
-+func (s *localScanState) cached(hostUUID string) noderec.LocalNodeExt {
-+	if s == nil {
-+		return noderec.LocalNodeExt{}
-+	}
-+	return s.ext[hostUUID]
-+}
++// modelsObservedHeartbeat bounds how often an unchanged inventory republishes a
++// fresher ModelsObservedAt.
++const modelsObservedHeartbeat = 30 * time.Second
 +
-+// migrate moves a node's cache to its new host UUID (dropSelf).
-+func (s *localScanState) migrate(oldHostUUID, newHostUUID string) {
-+	if s == nil {
++// localMergeCapacity is applyModels' exit hook (seam S5), deferred under the
++// directory lock so it sees applyModels' named results. Upstream's compare
++// covers models, modelsByEngine, loadedByEngine and downloadedByEngine; on a
++// valid apply this stores the fetch's extension when that compare changed, when
++// the slots or jit_load changed, or when an identical inventory is a heartbeat
++// newer than the stored observation; the last two report a change. With a zero
++// extension (an upstream-shaped answer to a nil localScanState) it stores the
++// zero extension, leaving upstream's result unchanged.
++func (d *directory) localMergeCapacity(hostUUID string, inv modelInventory, node *noderec.DirectoryNode, changed, ok *bool) {
++	if !*ok {
 +		return
 +	}
-+	if e, ok := s.ext[oldHostUUID]; ok {
-+		s.ext[newHostUUID] = e
-+	}
-+	delete(s.ext, oldHostUUID)
-+}
-+
-+// forget drops a node's cache on eviction.
-+func (s *localScanState) forget(hostUUID string) {
-+	if s == nil {
++	n, x := d.nodes[hostUUID], inv.local
++	if !*changed && reflect.DeepEqual(n.SlotsByEngine, x.slotsByEngine) &&
++		reflect.DeepEqual(n.JITLoadByEngine, x.jitByEngine) &&
++		x.observedAt-n.ModelsObservedAt < modelsObservedHeartbeat.Milliseconds() {
 +		return
 +	}
-+	delete(s.ext, hostUUID)
++	x.applyTo(&n)
++	d.nodes[hostUUID] = n
++	*node, *changed = n, true
 +}
 diff --git a/services/nvpair-node-scanner/local_s4_test.go b/services/nvpair-node-scanner/local_s4_test.go
 new file mode 100644
-index 0000000..d08f52a
+index 0000000..34ddee9
 --- /dev/null
 +++ b/services/nvpair-node-scanner/local_s4_test.go
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,30 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -187,7 +239,6 @@ index 0000000..d08f52a
 +import (
 +	"net/http"
 +	"testing"
-+	"time"
 +
 +	"github.com/stretchr/testify/assert"
 +
@@ -198,10 +249,10 @@ index 0000000..d08f52a
 +// zero LocalNodeExt, i.e. upstream's record.
 +func TestS4_Nil(t *testing.T) {
 +	var s *localScanState
-+	assert.Zero(t, s.record("p", modelInventory{}, time.Now()))
-+	assert.Zero(t, s.cached("p"))
-+	s.migrate("p", "q")
-+	s.forget("p")
++	assert.Zero(t, s.ext(localModelsWire{}))
++	var n0 noderec.DirectoryNode
++	modelInventoryExt{}.applyTo(&n0)
++	assert.Zero(t, n0.LocalNodeExt)
 +	d := newRefreshTestDaemon()
 +	_, port := startModelsStub(t, http.StatusOK, map[string]any{"models": []string{"a"}})
 +	n := noderec.DirectoryNode{HostUUID: "p", Services: map[noderec.ServiceKey]noderec.ServiceStatus{
@@ -209,6 +260,110 @@ index 0000000..d08f52a
 +	d.enrichModelsCandidates(&n, []string{"127.0.0.1"})
 +	assert.Equal(t, []string{"a"}, n.Models)
 +	assert.Zero(t, n.LocalNodeExt)
++}
+diff --git a/services/nvpair-node-scanner/local_s5_test.go b/services/nvpair-node-scanner/local_s5_test.go
+new file mode 100644
+index 0000000..c666678
+--- /dev/null
++++ b/services/nvpair-node-scanner/local_s5_test.go
+@@ -0,0 +1,27 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++// TestS5_Nil: upstream-shaped inventories (no slots/jit) observed at 0, as a
++// nil localScanState reports (a zero modelInventoryExt), give upstream's changed/ok and no extension.
++func TestS5_Nil(t *testing.T) {
++	d := newDirectory()
++	n0 := emNode("p", 14322)
++	n0.IP = "10.0.0.9"
++	n0.Models = []string{"a"}
++	d.upsert(n0)
++	_, changed, ok := d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"a"}})
++	assert.True(t, ok && !changed, "identical inventory: changed=%v ok=%v", changed, ok)
++	n, changed, ok := d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"b"}})
++	assert.True(t, ok && changed, "new inventory: changed=%v ok=%v", changed, ok)
++	assert.Zero(t, n.LocalNodeExt, "extension")
++	_, changed, ok = d.applyModels("p", "10.0.0.1", 14322, modelInventory{models: []string{"c"}})
++	assert.True(t, !ok && !changed, "stale address: changed=%v ok=%v", changed, ok)
++}
+diff --git a/services/nvpair-node-scanner/local_s8_test.go b/services/nvpair-node-scanner/local_s8_test.go
+new file mode 100644
+index 0000000..0c9f234
+--- /dev/null
++++ b/services/nvpair-node-scanner/local_s8_test.go
+@@ -0,0 +1,65 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"net/http"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// TestS8_Nil: S8 is a field carry on NVIDIA's modelInventory, not a signature
++// change. Upstream-shaped /v1/models JSON fetched by a daemon without fork
++// state yields a zero modelInventoryExt (observedAt lives in the extension and
++// is stamped only by a non-nil localScanState at fetch time), and refresh then
++// reports changed exactly as upstream: first populate, not an identical sweep,
++// a downloadedByEngine-only change.
++func TestS8_Nil(t *testing.T) {
++	d := newRefreshTestDaemon()
++	body := map[string]any{"models": []string{"a"}, "modelsByEngine": map[string][]string{"vllm": {"a"}},
++		"loadedByEngine": map[string][]string{"vllm": {"a"}}, "downloadedByEngine": map[string][]string{"vllm": {"a"}}}
++	stub, port := startModelsStub(t, http.StatusOK, body)
++	inv, ok := d.fetchModels("127.0.0.1", port, "")
++	require.True(t, ok)
++	assert.Zero(t, inv.local, "upstream-shaped answer must give a zero extension")
++	seedEMNode(d, "p", "127.0.0.1", port)
++	assert.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "first populate")
++	assert.False(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "identical sweep")
++	body["downloadedByEngine"] = map[string][]string{"vllm": {"a", "b"}}
++	stub.set(http.StatusOK, body)
++	assert.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "downloadedByEngine-only change")
++	got, _ := d.dir.get("p")
++	assert.Equal(t, []string{"a", "b"}, got.DownloadedByEngine["vllm"])
++	assert.Zero(t, got.LocalNodeExt)
++}
++
++// TestLocalDownloadedChangeKeepsCapacity: with fork state, a
++// downloadedByEngine-only change stores the fetch's slots, jit_load and a fresh
++// observed-at, and a capacity-only change keeps upstream's downloaded set.
++func TestLocalDownloadedChangeKeepsCapacity(t *testing.T) {
++	d := newLocalTestDaemon()
++	body := slotBody(2, false)
++	stub, port := startModelsStub(t, http.StatusOK, body)
++	seedEMNode(d, "p", "127.0.0.1", port)
++	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""))
++	body["downloadedByEngine"] = map[string][]string{"lmstudio": {"a", "z"}}
++	stub.set(http.StatusOK, body)
++	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "downloaded-only change")
++	got, _ := d.dir.get("p")
++	assert.Equal(t, []string{"a", "z"}, got.DownloadedByEngine["lmstudio"])
++	assert.Equal(t, 2, got.SlotsByEngine["lmstudio"]["a"].Slots)
++	assert.NotZero(t, got.ModelsObservedAt)
++	stub.set(http.StatusOK, mergeBody(slotBody(5, false), "downloadedByEngine", body["downloadedByEngine"]))
++	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "capacity-only change")
++	got, _ = d.dir.get("p")
++	assert.Equal(t, 5, got.SlotsByEngine["lmstudio"]["a"].Slots)
++	assert.Equal(t, []string{"a", "z"}, got.DownloadedByEngine["lmstudio"])
++}
++
++func mergeBody(b map[string]any, k string, v any) map[string]any {
++	b[k] = v
++	return b
 +}
 diff --git a/services/shared/noderec/local_ext.go b/services/shared/noderec/local_ext.go
 new file mode 100644
@@ -286,143 +441,18 @@ index 0000000..1857619
 +	}
 +}
 diff --git a/services/shared/noderec/noderec.go b/services/shared/noderec/noderec.go
-index f44a263..3909867 100644
+index bd908a9..b5e1fd1 100644
 --- a/services/shared/noderec/noderec.go
 +++ b/services/shared/noderec/noderec.go
-@@ -516,6 +516,8 @@ type DirectoryNode struct {
- 	// didn't report loaded state for it. Omitted when the peer reports none.
- 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
- 	LastSeen       int64               `json:"lastSeen"` // Unix seconds
+@@ -526,6 +526,8 @@ type DirectoryNode struct {
+ 	// field; omitted when no engine reports one.
+ 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
+ 	LastSeen           int64               `json:"lastSeen"` // Unix seconds
 +	// fork:S1
 +	LocalNodeExt
  }
  
  // Clustered reports whether the node advertises a cluster identity.
--- 
-2.53.0
-
-From 140b8dfe46995b5dd96c45101a29f827626495ec Mon Sep 17 00:00:00 2001
-From: "erik.hauan" <erik.hauan@radiantvs.com>
-Date: Thu, 12 Nov 2026 13:57:58 -0800
-Subject: [PATCH] node-scanner: directory capacity merge behind S5
-
-Behaviour: applyModels stores the fetch's slot capacity, jit_load flags and
-observed-at with the inventory; a capacity-only or jit-only change is a
-directory change, and an identical inventory republishes a fresher
-ModelsObservedAt only once it is modelsObservedHeartbeat (30s) newer.
-
-Seams used: S5 (directory.go: one deferred call,
-d.localMergeCapacity(hostUUID, inv, observedAt, &node, &changed, &ok), placed
-after upstream's deferred unlock so it runs under the lock and adjusts the
-named results; body in services/nvpair-node-scanner/local_capacity.go). The
-deferred form keeps applyModels' upstream body untouched, so the hook does
-not touch the unmarked S8 lines (signature, compare, assign) that stay until
-step 4.
-
-Proving tests: TestS5_Nil, TestLocalApplyModelsCapacityMerge,
-TestApplyModelsObservedAtHeartbeat, TestRefreshSlotChangeReportsChange
-(nvpair-node-scanner).
-
-Scanner slot-capacity feature group, continuing step 2's S1/S4; exported by
-refreshing local/patches/001-scanner-slot-capacity.patch in place (now two
-patches).
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
----
- services/nvpair-node-scanner/directory.go     |  1 +
- .../nvpair-node-scanner/local_capacity.go     | 28 +++++++++++++++++++
- services/nvpair-node-scanner/local_s5_test.go | 27 ++++++++++++++++++
- 3 files changed, 56 insertions(+)
- create mode 100644 services/nvpair-node-scanner/local_s5_test.go
-
-diff --git a/services/nvpair-node-scanner/directory.go b/services/nvpair-node-scanner/directory.go
-index eb86527..0bf49c0 100644
---- a/services/nvpair-node-scanner/directory.go
-+++ b/services/nvpair-node-scanner/directory.go
-@@ -251,6 +251,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode
- func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory, observedAt int64) (node noderec.DirectoryNode, changed, ok bool) {
- 	d.mu.Lock()
- 	defer d.mu.Unlock()
-+	defer d.localMergeCapacity(hostUUID, inv, observedAt, &node, &changed, &ok) // fork:S5
- 	n, present := d.nodes[hostUUID]
- 	if !present {
- 		return noderec.DirectoryNode{}, false, false
-diff --git a/services/nvpair-node-scanner/local_capacity.go b/services/nvpair-node-scanner/local_capacity.go
-index 34c3bfc..60914dc 100644
---- a/services/nvpair-node-scanner/local_capacity.go
-+++ b/services/nvpair-node-scanner/local_capacity.go
-@@ -4,6 +4,7 @@
- package main
- 
- import (
-+	"reflect"
- 	"time"
- 
- 	"nvpair-shared/noderec"
-@@ -61,3 +62,30 @@ func (s *localScanState) forget(hostUUID string) {
- 	}
- 	delete(s.ext, hostUUID)
- }
-+
-+// modelsObservedHeartbeat bounds how often an unchanged inventory republishes a
-+// fresher ModelsObservedAt.
-+const modelsObservedHeartbeat = 30 * time.Second
-+
-+// localMergeCapacity is applyModels' capacity merge (seam S5), deferred under
-+// the directory lock so it sees applyModels' named results. On a valid apply it
-+// stores the fetch's slots/jit_load and observedAt when upstream's inventory
-+// changed, when the capacity changed, or when an identical inventory is a
-+// heartbeat newer than the stored observation; the last two report a change.
-+// With a zero extension and observedAt 0 (a nil localScanState) it stores the
-+// zero extension, leaving upstream's result unchanged.
-+func (d *directory) localMergeCapacity(hostUUID string, inv modelInventory, observedAt int64, node *noderec.DirectoryNode, changed, ok *bool) {
-+	if !*ok {
-+		return
-+	}
-+	n := d.nodes[hostUUID]
-+	if !*changed && reflect.DeepEqual(n.SlotsByEngine, inv.slotsByEngine) &&
-+		reflect.DeepEqual(n.JITLoadByEngine, inv.jitByEngine) &&
-+		observedAt-n.ModelsObservedAt < modelsObservedHeartbeat.Milliseconds() {
-+		return
-+	}
-+	n.LocalNodeExt = noderec.LocalNodeExt{SlotsByEngine: inv.slotsByEngine, JITLoadByEngine: inv.jitByEngine,
-+		ModelsObservedAt: observedAt}
-+	d.nodes[hostUUID] = n
-+	*node, *changed = n, true
-+}
-diff --git a/services/nvpair-node-scanner/local_s5_test.go b/services/nvpair-node-scanner/local_s5_test.go
-new file mode 100644
-index 0000000..5e10962
---- /dev/null
-+++ b/services/nvpair-node-scanner/local_s5_test.go
-@@ -0,0 +1,27 @@
-+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-+// SPDX-License-Identifier: Apache-2.0
-+
-+package main
-+
-+import (
-+	"testing"
-+
-+	"github.com/stretchr/testify/assert"
-+)
-+
-+// TestS5_Nil: upstream-shaped inventories (no slots/jit) observed at 0, as a
-+// nil localScanState reports, give upstream's changed/ok and no extension.
-+func TestS5_Nil(t *testing.T) {
-+	d := newDirectory()
-+	n0 := emNode("p", 14322)
-+	n0.IP = "10.0.0.9"
-+	n0.Models = []string{"a"}
-+	d.upsert(n0)
-+	_, changed, ok := d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"a"}}, 0)
-+	assert.True(t, ok && !changed, "identical inventory: changed=%v ok=%v", changed, ok)
-+	n, changed, ok := d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"b"}}, 0)
-+	assert.True(t, ok && changed, "new inventory: changed=%v ok=%v", changed, ok)
-+	assert.Zero(t, n.LocalNodeExt, "extension")
-+	_, changed, ok = d.applyModels("p", "10.0.0.1", 14322, modelInventory{models: []string{"c"}}, 0)
-+	assert.True(t, !ok && !changed, "stale address: changed=%v ok=%v", changed, ok)
-+}
 -- 
 2.53.0
 

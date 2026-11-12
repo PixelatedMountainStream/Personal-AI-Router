@@ -17,8 +17,6 @@ import (
 	"time"
 )
 
-const gib = int64(1) << 30
-
 // fakeOps simulates engines in memory and records the call order.
 type fakeOps struct {
 	mu         sync.Mutex

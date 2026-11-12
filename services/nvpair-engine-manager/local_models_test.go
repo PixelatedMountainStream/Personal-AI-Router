@@ -17,9 +17,9 @@ import (
 )
 
 func TestExtractRecords(t *testing.T) {
-	lm := &ActionResult{Array: "models", Field: "key", Record: &ResultRecord{Fields: map[string]string{
-		"slots": "loaded_instances.0.config.parallel", "ctx": "loaded_instances.0.config.context_length"}}}
-	oll := &ActionResult{Array: "models", Field: "name", Record: &ResultRecord{Static: map[string]int{"slots": 1}}}
+	lm := &ActionResult{Array: "models", Field: "key", LocalResultExt: LocalResultExt{Record: &ResultRecord{Fields: map[string]string{
+		"slots": "loaded_instances.0.config.parallel", "ctx": "loaded_instances.0.config.context_length"}}}}
+	oll := &ActionResult{Array: "models", Field: "name", LocalResultExt: LocalResultExt{Record: &ResultRecord{Static: map[string]int{"slots": 1}}}}
 	llama := &ResultRecord{Fields: map[string]string{"slots": "total_slots", "ctx": "default_generation_settings.n_ctx"}}
 
 	for _, tc := range []struct {
@@ -107,7 +107,7 @@ func TestApplySettingsOverrides(t *testing.T) {
 	}
 	r.applySettingsOverrides(func() map[string]json.RawMessage {
 		return map[string]json.RawMessage{"engine_slots.lmstudio.m": json.RawMessage(`3`), "engine_slots.ollama.q": json.RawMessage(`2`)}
-	})
+	}, nil)
 	assert.Equal(t, 3, r.SlotsByEngine["lmstudio"]["m"].Slots, "override not applied: %v", r.SlotsByEngine)
 	assert.NotContains(t, r.SlotsByEngine, "ollama", "override for a non-loaded model must not apply")
 	assert.False(t, r.JITLoadByEngine["lmstudio"], "jit defaults = %v", r.JITLoadByEngine)
