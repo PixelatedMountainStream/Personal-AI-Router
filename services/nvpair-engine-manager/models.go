@@ -58,6 +58,8 @@ type ModelsResult struct {
 	ByEngine           map[string][]string `json:"modelsByEngine,omitempty"`
 	LoadedByEngine     map[string][]string `json:"loadedByEngine,omitempty"`
 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
+	// fork:E11
+	LocalModelsExt
 }
 
 // Models returns the union of model names served by every installed, running
@@ -102,6 +104,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 	// Results indexed by engine position so the flattened output stays
 	// deterministic (registration order) despite concurrent completion.
 	perEngine := make([]engineModels, len(engineNames))
+	lx := newLocalSlotSweep(e, engineNames) // fork:E11
 	var wg sync.WaitGroup
 	for i, name := range engineNames {
 		mf, ok := e.reg.Get(name)
@@ -140,6 +143,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 				r.loaded, r.loadedOK = e.queryModelList(ctx, name, "loaded_models", loadedSpec)
 			}
 			perEngine[i] = r
+			lx.collect(ctx, e, i, name, r.loadedOK, r.loaded) // fork:E11
 		})
 	}
 	wg.Wait()
@@ -164,6 +168,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 			res.DownloadedByEngine = withModels(res.DownloadedByEngine, name, r.downloaded)
 		}
 	}
+	lx.finish(e, &res, engineNames) // fork:E11
 	return res
 }
 
@@ -268,6 +273,7 @@ func extractStringsResult(raw json.RawMessage, spec *ActionResult) ([]string, bo
 		return nil, false
 	}
 	out := make([]string, 0)
+	arr, _ = expandInstances(arr, spec, false) // fork:E11
 	for _, el := range arr {
 		if spec.Match != nil && !matchRow(el, spec.Match) {
 			continue

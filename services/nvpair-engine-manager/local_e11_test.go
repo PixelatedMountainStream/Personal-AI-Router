@@ -17,7 +17,6 @@ import (
 func TestE11_Nil(t *testing.T) {
 	var lx *localSlotSweep
 	res := ModelsResult{Models: []string{"a"}, LoadedByEngine: map[string][]string{"e": {"a"}}}
-	lx.prepare(0, &Manifest{})
 	lx.collect(context.Background(), nil, 0, "e", true, []string{"a"})
 	lx.finish(nil, &res, []string{"e"})
 	assert.Nil(t, res.SlotsByEngine, "slots")
