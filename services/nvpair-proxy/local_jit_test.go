@@ -68,3 +68,21 @@ func TestLocalVLLMDownloadedOnlyNeverEligible(t *testing.T) {
 		}
 	}
 }
+
+// TestLocalVLLMServedAliasWithoutDownloadedInventory: a failed HF-cache read
+// omits downloadedByEngine.vllm, but the served alias is still Loaded (not
+// compared with the --model root) and eligible.
+func TestLocalVLLMServedAliasWithoutDownloadedInventory(t *testing.T) {
+	d := newDirectoryCapacity(nil)
+	d.update("vllm", []noderec.DirectoryNode{{HostUUID: "n",
+		ModelsByEngine: map[string][]string{"vllm": {"qwen-api"}},
+		LoadedByEngine: map[string][]string{"vllm": {"org/model"}}}})
+	p := &Proxy{suppressed: map[inflightKey]time.Time{}, now: time.Now}
+	p.capacity = d
+	if r, _ := d.Residency("n", "vllm", "qwen-api"); r != ResidencyLoaded || !p.eligible("n", "vllm", "qwen-api") {
+		t.Fatalf("served alias residency %v", r)
+	}
+	if p.eligible("n", "vllm", "org/other") {
+		t.Fatal("unserved model must not be eligible")
+	}
+}
