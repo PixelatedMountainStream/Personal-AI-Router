@@ -516,6 +516,8 @@ type DirectoryNode struct {
 	// didn't report loaded state for it. Omitted when the peer reports none.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
 	LastSeen       int64               `json:"lastSeen"` // Unix seconds
+	// fork:S1
+	LocalNodeExt
 }
 
 // Clustered reports whether the node advertises a cluster identity.

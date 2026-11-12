@@ -110,6 +110,8 @@ type daemon struct {
 	// same /v1/models fetch, so a transient miss reuses it rather than blanking
 	// a remote node's loaded state. Keyed by hostUuid.
 	lastLoadedByEngine map[string]map[string][]string
+	// fork:S4
+	local *localScanState
 	// nodeInfoDown holds the nodes whose last node-info enrichment failed, so
 	// the outage is reported when it starts and when it ends rather than once
 	// per sweep. Guarded by infoMu with the caches it explains: the reason a
@@ -368,6 +370,7 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string, tlsHTTP
 		lastModels:         make(map[string][]string),
 		lastModelsByEngine: make(map[string]map[string][]string),
 		lastLoadedByEngine: make(map[string]map[string][]string),
+		local:              newLocalScanState(), // fork:S4
 		nodeInfoDown:       make(map[string]bool),
 		lastActivityAt:     make(map[string]time.Time),
 	}
@@ -834,6 +837,7 @@ func (d *daemon) dropSelf(oldHostUUID, newHostUUID string) {
 	delete(d.lastModels, oldHostUUID)
 	delete(d.lastModelsByEngine, oldHostUUID)
 	delete(d.lastLoadedByEngine, oldHostUUID)
+	d.local.migrate(oldHostUUID, newHostUUID) // fork:S4
 	d.infoMu.Unlock()
 	if existed {
 		d.emit(noderec.NotifyNodeRemoved, noderec.DirectoryNode{HostUUID: oldHostUUID, Name: node.Name})
@@ -1351,6 +1355,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
 		d.lastModels[node.HostUUID] = inventory.models
 		d.lastModelsByEngine[node.HostUUID] = inventory.byEngine
 		d.lastLoadedByEngine[node.HostUUID] = inventory.loadedByEngine
+		node.LocalNodeExt = d.local.record(node.HostUUID, inventory, time.Now()) // fork:S4
 		d.infoMu.Unlock()
 		node.Models = inventory.models
 		node.ModelsByEngine = inventory.byEngine
@@ -1361,8 +1366,10 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
 	cached, had := d.lastModels[node.HostUUID]
 	cachedByEngine := d.lastModelsByEngine[node.HostUUID]
 	cachedLoaded := d.lastLoadedByEngine[node.HostUUID]
+	cachedExt := d.local.cached(node.HostUUID) // fork:S4
 	d.infoMu.Unlock()
 	if had {
+		node.LocalNodeExt = cachedExt // fork:S4
 		node.Models = cached
 		node.ModelsByEngine = cachedByEngine
 		node.LoadedByEngine = cachedLoaded
@@ -1839,6 +1846,7 @@ func (d *daemon) refreshNodeModelsCandidates(hostUUID, guardIP string, hosts []s
 	d.lastModels[hostUUID] = models
 	d.lastModelsByEngine[hostUUID] = byEngine
 	d.lastLoadedByEngine[hostUUID] = loadedByEngine
+	observed = d.local.record(hostUUID, inventory, time.Now()).ModelsObservedAt // fork:S4
 	d.infoMu.Unlock()
 
 	node, changed, valid := d.dir.applyModels(hostUUID, guardIP, emPort, inventory, observed)
@@ -1861,6 +1869,7 @@ func (d *daemon) forget(hostUUID string) {
 	delete(d.lastModels, hostUUID)
 	delete(d.lastModelsByEngine, hostUUID)
 	delete(d.lastLoadedByEngine, hostUUID)
+	d.local.forget(hostUUID) // fork:S4
 	delete(d.nodeInfoDown, hostUUID)
 	d.infoMu.Unlock()
 	d.activityMu.Lock()
