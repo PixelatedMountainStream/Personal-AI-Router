@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"nvpair-shared/clustertrust"
+	"nvpair-shared/httpcon"
 	"nvpair-shared/mdns"
 	"nvpair-shared/netmon"
 	"nvpair-shared/netpick"
@@ -157,7 +158,7 @@ type daemon struct {
 // nodeInfoFetchTimeout bounds each node-info enrichment HTTP(S) GET, shared by
 // the plain and (opt-in) TLS clients.
 const nodeInfoFetchTimeout = 3 * time.Second
-const nodeInfoResponseDrainLimit = 64 << 10
+const nodeInfoMaxResponseBytes = 1 << 20
 
 // nodeInfoDialTimeout bounds only the TCP connect of that GET.
 //
@@ -193,6 +194,7 @@ func nodeInfoTransport(tlsConfig *tls.Config) *http.Transport {
 // own models-sweep cap (modelsTimeout, 5s) so the fetch waits for a bounded
 // sweep to finish instead of timing out partway through it.
 const modelsFetchTimeout = 6 * time.Second
+const modelsMaxResponseBytes = 16 << 20
 
 // peerRefreshInterval is the cadence of the mDNS-independent convergence loop
 // (refreshPeersLoop). The event-driven enrichment still handles fast initial
@@ -1320,15 +1322,13 @@ func (d *daemon) fetchNodeInfoWithin(ctx context.Context, ip string, port int) (
 		slog.Debug("node-info fetch failed", "ip", ip, "url", url, "err", err)
 		return NodeInfoResponse{}, false
 	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, nodeInfoResponseDrainLimit))
-		_ = resp.Body.Close()
-	}()
+	defer httpcon.DrainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return NodeInfoResponse{}, false
 	}
 	var info NodeInfoResponse
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+	reader := io.LimitReader(resp.Body, nodeInfoMaxResponseBytes)
+	if err := json.NewDecoder(reader).Decode(&info); err != nil {
 		return NodeInfoResponse{}, false
 	}
 	return info, true
@@ -1430,7 +1430,7 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
 		slog.Debug("model enrichment failed", "ip", ip, "url", url, "err", err)
 		return modelInventory{}, false
 	}
-	defer resp.Body.Close()
+	defer httpcon.DrainAndClose(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return modelInventory{}, false
 	}
@@ -1441,8 +1441,14 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
 		SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine"`
 		JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine"`
 	}
+<<<<<<< HEAD
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return modelInventory{}, false
+=======
+	reader := io.LimitReader(resp.Body, modelsMaxResponseBytes)
+	if err := json.NewDecoder(reader).Decode(&body); err != nil {
+		return nil, nil, nil, false
+>>>>>>> 5f0a93f22a6ce601b3a374ce57a9946b7684d37a
 	}
 	return modelInventory{models: body.Models, byEngine: body.ModelsByEngine, loadedByEngine: body.LoadedByEngine,
 		slotsByEngine: body.SlotsByEngine, jitByEngine: body.JITLoadByEngine}, true
