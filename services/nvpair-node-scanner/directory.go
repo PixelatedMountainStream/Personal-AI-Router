@@ -240,7 +240,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 // It confirms the node still exists AND still advertises the same em endpoint
 // (ip + port) the fetch targeted, so an in-flight result can never resurrect a
 // removed node or overwrite one that has since been re-addressed. It then
-// compares the fetched flat, per-engine, and loaded inventories
+// compares the fetched flat, per-engine, loaded, and downloaded inventories
 // order-insensitively with the stored entry and, only when any changed, updates
 // just the model fields in place — preserving every other field (identity,
 // services, node-info, trust) the browse path owns.
@@ -248,7 +248,11 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 // Returns the (possibly updated) node, whether the inventory changed, and
 // whether the guarded apply was valid. ok == false means the result is stale
 // (node gone or re-addressed) and the caller must not cache or emit it.
+<<<<<<< HEAD
 func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory, observedAt int64) (node noderec.DirectoryNode, changed, ok bool) {
+=======
+func (d *directory) applyModels(hostUUID, ip string, emPort int, inventory modelInventory) (node noderec.DirectoryNode, changed, ok bool) {
+>>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	defer d.localMergeCapacity(hostUUID, inv, observedAt, &node, &changed, &ok) // fork:S5
@@ -260,14 +264,53 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInvent
 	if !has || n.IP != ip || em.Port != emPort {
 		return n, false, false
 	}
+<<<<<<< HEAD
 	if sameStringSet(n.Models, inv.models) && sameByEngine(n.ModelsByEngine, inv.byEngine) && sameByEngine(n.LoadedByEngine, inv.loadedByEngine) {
 		return n, false, true
 	}
 	n.Models = inv.models
 	n.ModelsByEngine = inv.byEngine
 	n.LoadedByEngine = inv.loadedByEngine
+=======
+	if sameStringSet(n.Models, inventory.models) &&
+		sameByEngine(n.ModelsByEngine, inventory.byEngine) &&
+		sameByEngine(n.LoadedByEngine, inventory.loadedByEngine) &&
+		sameByEngine(n.DownloadedByEngine, inventory.downloadedByEngine) {
+		return n, false, true
+	}
+	inventory.applyTo(&n)
+>>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	d.nodes[hostUUID] = n
 	return n, true, true
+}
+
+// applyInfo writes a node's node-info enrichment — GPUs, CPU and memory — in
+// place. Unlike applyModels it does not compare before writing: the three facets
+// are a handful of scalars, so a field-by-field compare costs about what the
+// write does, and a caller that republishes figures which happen to be unchanged
+// does no harm downstream.
+//
+// The guard is the node-info service and the endpoint the caller read the figures
+// from. A node whose address or port moved between the fetch and this call is left
+// alone, because the figures in hand came from the old endpoint; the next refresh
+// re-reads it where it lives now. ok == false means the result is stale (node gone
+// or re-addressed) and the caller must not cache or emit it.
+func (d *directory) applyInfo(hostUUID, ip string, niPort int, gpus []noderec.GPUInfo, cpu *noderec.CPUInfo, memory *noderec.MemoryInfo) (node noderec.DirectoryNode, ok bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n, present := d.nodes[hostUUID]
+	if !present {
+		return noderec.DirectoryNode{}, false
+	}
+	ni, has := n.Services[noderec.ServiceNodeInfo]
+	if !has || n.IP != ip || ni.Port != niPort {
+		return n, false
+	}
+	n.GPUs = gpus
+	n.CPU = cpu
+	n.Memory = memory
+	d.nodes[hostUUID] = n
+	return n, true
 }
 
 // applyClusterIdentity sets one node's cluster principal and the trust annotation
