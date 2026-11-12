@@ -9,6 +9,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"nvpair-shared/schedulerwire"
 )
 
 // TestEmit_IncludesPendingRanksLocalExt is the fork twin of
@@ -25,7 +27,7 @@ func TestEmit_IncludesPendingRanksLocalExt(t *testing.T) {
 	require.Len(t, got, 1, "priority snapshots")
 	want := []NodeRank{
 		{ID: "a", Pending: 0, GPUPressure: unknownGPUPressure, Rank: 0},
-		{ID: "b", Pending: 1, GPUPressure: unknownGPUPressure, Rank: 1, PendingBy: map[string]int{"ollama/m": 1}},
+		{ID: "b", Pending: 1, GPUPressure: unknownGPUPressure, Rank: 1, LocalRankExt: schedulerwire.LocalRankExt{PendingBy: map[string]int{"ollama/m": 1}}},
 	}
 	require.Len(t, got[0].Ranks, len(want), "ranks")
 	for i := range want {

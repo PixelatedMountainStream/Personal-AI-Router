@@ -59,7 +59,7 @@ func TestPriorityCopies_DoNotShareBackingSlices(t *testing.T) {
 }
 
 func TestSameRankingIgnoresComputedAtButNotPendingBy(t *testing.T) {
-	a := Priority{Nodes: []string{"n"}, Ranks: []NodeRank{{ID: "n", PendingBy: map[string]int{"e/m": 1}, ComputedAt: 1}}}
+	a := Priority{Nodes: []string{"n"}, Ranks: []NodeRank{{ID: "n", LocalRankExt: LocalRankExt{PendingBy: map[string]int{"e/m": 1}, ComputedAt: 1}}}}
 	b := a.Clone()
 	b.Ranks[0].ComputedAt = 2
 	if !a.SameRanking(b) {

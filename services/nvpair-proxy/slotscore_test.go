@@ -88,7 +88,7 @@ func TestSlotScore_OccupancyUsesPendingByAndDiscountsCompletions(t *testing.T) {
 	p.now = func() time.Time { return now }
 	key := schedulerwire.PendingKey(f.profile.Name, "m")
 	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a"}, Ranks: []schedulerwire.NodeRank{
-		{ID: "a", Pending: 9, PendingBy: map[string]int{key: 2}, ComputedAt: 9_000}}})
+		{ID: "a", Pending: 9, LocalRankExt: schedulerwire.LocalRankExt{PendingBy: map[string]int{key: 2}, ComputedAt: 9_000}}}})
 	k := inflightKey{f.profile.Name, "m", "a"}
 	p.priorityMu.Lock()
 	if got := p.occLocked(k); got != 2 {
@@ -237,7 +237,7 @@ func TestSlotScore_AffinityHitUsesLocalInflight(t *testing.T) {
 	p.releaseReservation(r)
 	// Stale scheduler pending says a is full; our own inflight says it is free.
 	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b"}, Ranks: []schedulerwire.NodeRank{
-		{ID: "a", Pending: 5, ComputedAt: time.Now().UnixMilli() + 1000}, {ID: "b"}}})
+		{ID: "a", Pending: 5, LocalRankExt: schedulerwire.LocalRankExt{ComputedAt: time.Now().UnixMilli() + 1000}}, {ID: "b"}}})
 	_, _, d := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "k", "m")
 	if d != affinityHit {
 		t.Fatalf("decision = %q, want hit", d)

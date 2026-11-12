@@ -140,7 +140,7 @@ func (e *Executor) pinnedOps() *pinnedOps {
 // queried or any row cannot be classified (a partial view could hide a large
 // resident model). Sizes and slots come from the helpers the watcher shares.
 func (e *Executor) residentStrict(ctx context.Context) ([]residentModel, error) {
-	res := ModelsResult{LoadedByEngine: map[string][]string{}, SlotsByEngine: map[string]map[string]SlotInfo{}}
+	res := ModelsResult{LoadedByEngine: map[string][]string{}, LocalModelsExt: LocalModelsExt{SlotsByEngine: map[string]map[string]SlotInfo{}}}
 	loadingSet := map[string]bool{}
 	for _, name := range e.reg.Names() {
 		mf, ok := e.reg.Get(name)
