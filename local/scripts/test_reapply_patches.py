@@ -28,13 +28,13 @@ def commit(repo, files, msg):
 
 
 class ReapplyPatchesTest(unittest.TestCase):
-    def check(self, feature, fork_b):
+    def check(self, feature, fork_b, surface="# records\n"):
         with tempfile.TemporaryDirectory() as d:
             repo = Path(d)
             git(repo, "init", "-q", "-b", "main")
             pin = commit(repo, {"a.txt": "1\n2\n3\n", "b.txt": "x\ny\nz\n"}, "upstream")
             commit(repo, {"b.txt": fork_b, "local/UPSTREAM_VERSION.txt": f"sha={pin}\n",
-                          "local/FORK_SURFACE.md": "# records\n"}, "fork")
+                          "local/FORK_SURFACE.md": surface}, "fork")
             commit(repo, feature, "feature")
             patch = git(repo, "format-patch", "-1", "HEAD", "--stdout")
             commit(repo, {"local/patches/001-feature.patch": patch}, "export")
@@ -48,6 +48,13 @@ class ReapplyPatchesTest(unittest.TestCase):
     def test_patch_conflicts(self):
         # The fork edited b.txt before the feature, so the series cannot rebuild it on the pin.
         r = self.check({"b.txt": "x\nYY\nz\n"}, "x\nY\nz\n")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("does not apply", r.stderr)
+
+    def test_conflict_on_legacy_file_fails(self):
+        # Legacy records only narrow the comparison; an am conflict still fails.
+        legacy = "### L-b\nfiles: b.txt\nkind: legacy\nrecipe: x\n"
+        r = self.check({"b.txt": "x\nYY\nz\n"}, "x\nY\nz\n", legacy)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("does not apply", r.stderr)
 

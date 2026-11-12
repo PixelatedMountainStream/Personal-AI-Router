@@ -63,14 +63,15 @@ while read -r p; do
     grep -qxF -- "$p" <<<"$legacy" && continue
     paths+=("$p")
 done < <(cat "$tmp"/patches/*.patch 2>/dev/null | sed -n 's|^diff --git a/.* b/||p' | sort -u)
-if [ ${#paths[@]} -eq 0 ]; then
-    echo "patch-check: path set empty (every patched file is under a legacy record); pass"
-    exit 0
-fi
+# Always apply first: an am conflict fails even when legacy records empty the path set.
 git worktree add -q --detach "$wt" "$pin"
 if ! (cd "$wt" && apply_series "$tmp/patches"); then
     echo "patch-check: FAIL: series does not apply onto pin $pin" >&2
     exit 1
+fi
+if [ ${#paths[@]} -eq 0 ]; then
+    echo "patch-check: series applies; path set empty (every patched file is under a legacy record); pass"
+    exit 0
 fi
 if ! git -C "$wt" diff --exit-code HEAD "$cand" -- "${paths[@]}"; then
     echo "patch-check: FAIL: series on $pin differs from $cand over: ${paths[*]}" >&2
