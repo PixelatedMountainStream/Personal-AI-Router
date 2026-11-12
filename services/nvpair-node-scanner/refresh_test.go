@@ -392,11 +392,7 @@ func TestApplyModels_RejectsRemovedNodeAndStaleAddress(t *testing.T) {
 	d := newDirectory()
 
 	// Removed mid-sweep: node absent -> not resurrected.
-<<<<<<< HEAD
-	_, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, modelInventory{models: []string{"a"}}, 1)
-=======
 	_, changed, ok := d.applyModels("ghost", "127.0.0.1", 14322, modelInventory{models: []string{"a"}})
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	assert.False(t, ok, "applyModels on an absent node = (changed (%v, %v)", changed, ok)
 	assert.False(t, changed, "applyModels on an absent node = (changed (%v, %v)", changed, ok)
 	_, present := d.get("ghost")
@@ -409,19 +405,11 @@ func TestApplyModels_RejectsRemovedNodeAndStaleAddress(t *testing.T) {
 		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
 		Models:   []string{"old"},
 	})
-<<<<<<< HEAD
-	_, changed, ok = d.applyModels("peer-E", "127.0.0.1", 14322, modelInventory{models: []string{"new"}}, 1)
-	assert.False(t, ok, "applyModels with a stale IP = (changed (%v, %v)", changed, ok)
-	assert.False(t, changed, "applyModels with a stale IP = (changed (%v, %v)", changed, ok)
-	// em port changed -> also discarded.
-	_, changed, ok = d.applyModels("peer-E", "10.0.0.9", 99999, modelInventory{models: []string{"new"}}, 1)
-=======
 	_, changed, ok = d.applyModels("peer-E", "127.0.0.1", 14322, modelInventory{models: []string{"new"}})
 	assert.False(t, ok, "applyModels with a stale IP = (changed (%v, %v)", changed, ok)
 	assert.False(t, changed, "applyModels with a stale IP = (changed (%v, %v)", changed, ok)
 	// em port changed -> also discarded.
 	_, changed, ok = d.applyModels("peer-E", "10.0.0.9", 99999, modelInventory{models: []string{"new"}})
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	assert.False(t, ok, "applyModels with a stale em port = (changed (%v, %v)", changed, ok)
 	assert.False(t, changed, "applyModels with a stale em port = (changed (%v, %v)", changed, ok)
 	got, _ := d.get("peer-E")

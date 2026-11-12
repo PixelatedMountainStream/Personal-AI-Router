@@ -92,28 +92,6 @@ type daemon struct {
 	// ignores our own uuid — so this is the sole self-key writer lock.
 	selfMu sync.Mutex
 
-<<<<<<< HEAD
-	// lastInfo / lastModels cache each node's last successful enrichment (keyed by
-	// hostUuid) — GPU/CPU/memory from node-info and the model list from
-	// engine-manager — so a transient fetch failure reuses the prior values
-	// instead of blanking the node card. Same resilience the legacy scanner path
-	// had via its own lastInfo cache.
-	infoMu     sync.Mutex
-	lastInfo   map[string]NodeInfoResponse
-	lastInfoAt map[string]time.Time
-	lastModels map[string][]string
-	// lastModelsByEngine caches the per-engine attribution (engine name ->
-	// models) alongside the flat lastModels union, so a transient /v1/models
-	// miss reuses both rather than blanking the per-engine card. Keyed by
-	// hostUuid like the other enrichment caches.
-	lastModelsByEngine map[string]map[string][]string
-	// lastLoadedByEngine caches the per-engine loaded (in-memory) set from the
-	// same /v1/models fetch, so a transient miss reuses it rather than blanking
-	// a remote node's loaded state. Keyed by hostUuid.
-	lastLoadedByEngine map[string]map[string][]string
-	// fork:S4
-	local *localScanState
-=======
 	// lastInfo / lastInventory cache each node's last successful enrichment
 	// (keyed by hostUuid) — GPU/CPU/memory from node-info and the whole
 	// /v1/models answer from engine-manager (the flat union, the per-engine
@@ -124,7 +102,6 @@ type daemon struct {
 	lastInfo      map[string]NodeInfoResponse
 	lastInfoAt    map[string]time.Time
 	lastInventory map[string]modelInventory
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	// nodeInfoDown holds the nodes whose last node-info enrichment failed, so
 	// the outage is reported when it starts and when it ends rather than once
 	// per sweep. Guarded by infoMu with the caches it explains: the reason a
@@ -367,27 +344,6 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string, tlsHTTP
 
 	instance, _ := os.Hostname()
 	d := &daemon{
-<<<<<<< HEAD
-		codec:              codec,
-		mesh:               mesh,
-		reg:                reg,
-		instance:           instance,
-		baseDir:            baseDir,
-		clusterDir:         clusterDir,
-		dir:                newDirectory(),
-		http:               &http.Client{Timeout: nodeInfoFetchTimeout, Transport: nodeInfoTransport(nil)},
-		modelsHTTP:         &http.Client{Timeout: modelsFetchTimeout},
-		modelsClients:      clustertrust.NewPeerClientPool(mesh, modelsFetchTimeout),
-		tlsHTTP:            tlsHTTP,
-		lastInfo:           make(map[string]NodeInfoResponse),
-		lastInfoAt:         make(map[string]time.Time),
-		lastModels:         make(map[string][]string),
-		lastModelsByEngine: make(map[string]map[string][]string),
-		lastLoadedByEngine: make(map[string]map[string][]string),
-		local:              newLocalScanState(), // fork:S4
-		nodeInfoDown:       make(map[string]bool),
-		lastActivityAt:     make(map[string]time.Time),
-=======
 		codec:          codec,
 		mesh:           mesh,
 		reg:            reg,
@@ -404,7 +360,6 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string, tlsHTTP
 		lastInventory:  make(map[string]modelInventory),
 		nodeInfoDown:   make(map[string]bool),
 		lastActivityAt: make(map[string]time.Time),
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	}
 	// Anti-flap: before evicting a node that's missed the mDNS threshold,
 	// confirm it still answers on node-info (or engine-manager as fallback).
@@ -860,14 +815,7 @@ func (d *daemon) dropSelf(oldHostUUID, newHostUUID string) {
 	}
 	delete(d.lastInfo, oldHostUUID)
 	delete(d.lastInfoAt, oldHostUUID)
-<<<<<<< HEAD
-	delete(d.lastModels, oldHostUUID)
-	delete(d.lastModelsByEngine, oldHostUUID)
-	delete(d.lastLoadedByEngine, oldHostUUID)
-	d.local.migrate(oldHostUUID, newHostUUID) // fork:S4
-=======
 	delete(d.lastInventory, oldHostUUID)
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	d.infoMu.Unlock()
 	if existed {
 		d.emit(noderec.NotifyNodeRemoved, noderec.DirectoryNode{HostUUID: oldHostUUID, Name: node.Name})
@@ -1373,45 +1321,16 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
 	key := hostKey{hostUUID: node.HostUUID, service: noderec.ServiceEngineManager}
 	if _, inventory, ok := askRemembered(&d.enrichHosts, key, hosts, ask); ok {
 		d.infoMu.Lock()
-<<<<<<< HEAD
-		if d.lastModels == nil {
-			d.lastModels = make(map[string][]string)
-		}
-		if d.lastModelsByEngine == nil {
-			d.lastModelsByEngine = make(map[string]map[string][]string)
-		}
-		if d.lastLoadedByEngine == nil {
-			d.lastLoadedByEngine = make(map[string]map[string][]string)
-		}
-		d.lastModels[node.HostUUID] = inventory.models
-		d.lastModelsByEngine[node.HostUUID] = inventory.byEngine
-		d.lastLoadedByEngine[node.HostUUID] = inventory.loadedByEngine
-		node.LocalNodeExt = d.local.record(node.HostUUID, inventory, time.Now()) // fork:S4
-=======
 		d.cacheInventory(node.HostUUID, inventory)
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 		d.infoMu.Unlock()
 		inventory.applyTo(node)
 		return
 	}
 	d.infoMu.Lock()
-<<<<<<< HEAD
-	cached, had := d.lastModels[node.HostUUID]
-	cachedByEngine := d.lastModelsByEngine[node.HostUUID]
-	cachedLoaded := d.lastLoadedByEngine[node.HostUUID]
-	cachedExt := d.local.cached(node.HostUUID) // fork:S4
-	d.infoMu.Unlock()
-	if had {
-		node.LocalNodeExt = cachedExt // fork:S4
-		node.Models = cached
-		node.ModelsByEngine = cachedByEngine
-		node.LoadedByEngine = cachedLoaded
-=======
 	cached, had := d.lastInventory[node.HostUUID]
 	d.infoMu.Unlock()
 	if had {
 		cached.applyTo(node)
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	}
 }
 
@@ -1458,34 +1377,21 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
 		return modelInventory{}, false
 	}
 	var body struct {
-<<<<<<< HEAD
-		Models          []string                               `json:"models"`
-		ModelsByEngine  map[string][]string                    `json:"modelsByEngine"`
-		LoadedByEngine  map[string][]string                    `json:"loadedByEngine"`
-		SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine"`
-		JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine"`
-=======
 		Models             []string            `json:"models"`
 		ModelsByEngine     map[string][]string `json:"modelsByEngine"`
 		LoadedByEngine     map[string][]string `json:"loadedByEngine"`
 		DownloadedByEngine map[string][]string `json:"downloadedByEngine"`
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	}
 	reader := io.LimitReader(resp.Body, modelsMaxResponseBytes)
 	if err := json.NewDecoder(reader).Decode(&body); err != nil {
 		return modelInventory{}, false
 	}
-<<<<<<< HEAD
-	return modelInventory{models: body.Models, byEngine: body.ModelsByEngine, loadedByEngine: body.LoadedByEngine,
-		slotsByEngine: body.SlotsByEngine, jitByEngine: body.JITLoadByEngine}, true
-=======
 	return modelInventory{
 		models:             body.Models,
 		byEngine:           body.ModelsByEngine,
 		loadedByEngine:     body.LoadedByEngine,
 		downloadedByEngine: body.DownloadedByEngine,
 	}, true
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 }
 
 // modelsClient picks the transport for a model fetch: the plain client over
@@ -1931,11 +1837,6 @@ func (d *daemon) refreshNodeModelsCandidates(hostUUID, guardIP string, hosts []s
 	if !fetched {
 		return false
 	}
-<<<<<<< HEAD
-	models, byEngine, loadedByEngine := inventory.models, inventory.byEngine, inventory.loadedByEngine
-	var observed int64
-=======
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	// Refresh the enrichment cache BEFORE touching the directory: the caches
 	// (infoMu) and the directory (dir.mu) are guarded by different locks, so if
 	// the directory were updated first, a concurrent onBrowse->enrichModelsAt whose
@@ -1945,29 +1846,10 @@ func (d *daemon) refreshNodeModelsCandidates(hostUUID, guardIP string, hosts []s
 	// a node applyModels then finds removed — is benign (it is the last-known-good
 	// value the cache exists to preserve, and forget() clears it on eviction).
 	d.infoMu.Lock()
-<<<<<<< HEAD
-	if d.lastModels == nil {
-		d.lastModels = make(map[string][]string)
-	}
-	if d.lastModelsByEngine == nil {
-		d.lastModelsByEngine = make(map[string]map[string][]string)
-	}
-	if d.lastLoadedByEngine == nil {
-		d.lastLoadedByEngine = make(map[string]map[string][]string)
-	}
-	d.lastModels[hostUUID] = models
-	d.lastModelsByEngine[hostUUID] = byEngine
-	d.lastLoadedByEngine[hostUUID] = loadedByEngine
-	observed = d.local.record(hostUUID, inventory, time.Now()).ModelsObservedAt // fork:S4
-	d.infoMu.Unlock()
-
-	node, changed, valid := d.dir.applyModels(hostUUID, guardIP, emPort, inventory, observed)
-=======
 	d.cacheInventory(hostUUID, inventory)
 	d.infoMu.Unlock()
 
 	node, changed, valid := d.dir.applyModels(hostUUID, guardIP, emPort, inventory)
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	if !valid {
 		return false
 	}
@@ -1984,14 +1866,7 @@ func (d *daemon) forget(hostUUID string) {
 	d.infoMu.Lock()
 	delete(d.lastInfo, hostUUID)
 	delete(d.lastInfoAt, hostUUID)
-<<<<<<< HEAD
-	delete(d.lastModels, hostUUID)
-	delete(d.lastModelsByEngine, hostUUID)
-	delete(d.lastLoadedByEngine, hostUUID)
-	d.local.forget(hostUUID) // fork:S4
-=======
 	delete(d.lastInventory, hostUUID)
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	delete(d.nodeInfoDown, hostUUID)
 	d.infoMu.Unlock()
 	d.activityMu.Lock()

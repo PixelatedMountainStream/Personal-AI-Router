@@ -516,11 +516,6 @@ type DirectoryNode struct {
 	// empty list means "running, nothing loaded"; a missing key means the peer
 	// didn't report loaded state for it. Omitted when the peer reports none.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
-<<<<<<< HEAD
-	LastSeen       int64               `json:"lastSeen"` // Unix seconds
-	// fork:S1
-	LocalNodeExt
-=======
 	// DownloadedByEngine is the model inventory of an engine that advertises
 	// only the model it is serving (vLLM), so ModelsByEngine holds just that one
 	// for routing. It lists every model the engine can load, read even while the
@@ -531,7 +526,6 @@ type DirectoryNode struct {
 	// field; omitted when no engine reports one.
 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
 	LastSeen           int64               `json:"lastSeen"` // Unix seconds
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 }
 
 // Clustered reports whether the node advertises a cluster identity.

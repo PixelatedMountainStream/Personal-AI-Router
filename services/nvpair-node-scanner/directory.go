@@ -248,14 +248,9 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode 
 // Returns the (possibly updated) node, whether the inventory changed, and
 // whether the guarded apply was valid. ok == false means the result is stale
 // (node gone or re-addressed) and the caller must not cache or emit it.
-<<<<<<< HEAD
-func (d *directory) applyModels(hostUUID, ip string, emPort int, inv modelInventory, observedAt int64) (node noderec.DirectoryNode, changed, ok bool) {
-=======
 func (d *directory) applyModels(hostUUID, ip string, emPort int, inventory modelInventory) (node noderec.DirectoryNode, changed, ok bool) {
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	defer d.localMergeCapacity(hostUUID, inv, observedAt, &node, &changed, &ok) // fork:S5
 	n, present := d.nodes[hostUUID]
 	if !present {
 		return noderec.DirectoryNode{}, false, false
@@ -264,14 +259,6 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, inventory model
 	if !has || n.IP != ip || em.Port != emPort {
 		return n, false, false
 	}
-<<<<<<< HEAD
-	if sameStringSet(n.Models, inv.models) && sameByEngine(n.ModelsByEngine, inv.byEngine) && sameByEngine(n.LoadedByEngine, inv.loadedByEngine) {
-		return n, false, true
-	}
-	n.Models = inv.models
-	n.ModelsByEngine = inv.byEngine
-	n.LoadedByEngine = inv.loadedByEngine
-=======
 	if sameStringSet(n.Models, inventory.models) &&
 		sameByEngine(n.ModelsByEngine, inventory.byEngine) &&
 		sameByEngine(n.LoadedByEngine, inventory.loadedByEngine) &&
@@ -279,7 +266,6 @@ func (d *directory) applyModels(hostUUID, ip string, emPort int, inventory model
 		return n, false, true
 	}
 	inventory.applyTo(&n)
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	d.nodes[hostUUID] = n
 	return n, true, true
 }

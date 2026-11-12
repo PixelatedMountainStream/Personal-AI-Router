@@ -54,18 +54,10 @@ const modelsTimeout = 5 * time.Second
 // a missing key means it was not read (not installed, or the read failed). An
 // engine whose advertised list is its inventory has no entry here.
 type ModelsResult struct {
-<<<<<<< HEAD
-	Models         []string            `json:"models"`
-	ByEngine       map[string][]string `json:"modelsByEngine,omitempty"`
-	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
-	// fork:E11
-	LocalModelsExt
-=======
 	Models             []string            `json:"models"`
 	ByEngine           map[string][]string `json:"modelsByEngine,omitempty"`
 	LoadedByEngine     map[string][]string `json:"loadedByEngine,omitempty"`
 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 }
 
 // Models returns the union of model names served by every installed, running
@@ -109,22 +101,13 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 	engineNames := e.reg.Names()
 	// Results indexed by engine position so the flattened output stays
 	// deterministic (registration order) despite concurrent completion.
-<<<<<<< HEAD
-	perEngine := make([][]string, len(engineNames))
-	listOK := make([]bool, len(engineNames))
-	loaded := make([][]string, len(engineNames))
-	loadedOK := make([]bool, len(engineNames))
-	lx := newLocalSlotSweep(len(engineNames)) // fork:E11
-=======
 	perEngine := make([]engineModels, len(engineNames))
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 	var wg sync.WaitGroup
 	for i, name := range engineNames {
 		mf, ok := e.reg.Get(name)
 		if !ok {
 			continue
 		}
-		lx.prepare(i, mf) // fork:E11
 		var listSpec, loadedSpec *ActionResult
 		if act, ok := mf.Actions["list_models"]; ok {
 			listSpec = act.Result
@@ -156,11 +139,7 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 				// consumer can tell "running, nothing loaded" apart from "unknown".
 				r.loaded, r.loadedOK = e.queryModelList(ctx, name, "loaded_models", loadedSpec)
 			}
-<<<<<<< HEAD
-			lx.collect(ctx, e, i, name, loadedOK[i], loaded[i]) // fork:E11
-=======
 			perEngine[i] = r
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 		})
 	}
 	wg.Wait()
@@ -185,7 +164,6 @@ func (e *Executor) ModelsResult(ctx context.Context) ModelsResult {
 			res.DownloadedByEngine = withModels(res.DownloadedByEngine, name, r.downloaded)
 		}
 	}
-	lx.finish(e, &res, engineNames) // fork:E11
 	return res
 }
 
@@ -290,7 +268,6 @@ func extractStringsResult(raw json.RawMessage, spec *ActionResult) ([]string, bo
 		return nil, false
 	}
 	out := make([]string, 0)
-	arr, _ = expandInstances(arr, spec, false) // fork:E11
 	for _, el := range arr {
 		if spec.Match != nil && !matchRow(el, spec.Match) {
 			continue

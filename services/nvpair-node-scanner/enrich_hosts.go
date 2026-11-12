@@ -14,13 +14,6 @@ import (
 // value so the concurrent ask can return it and the last-good cache keeps every
 // part of it together.
 type modelInventory struct {
-<<<<<<< HEAD
-	models         []string
-	byEngine       map[string][]string
-	loadedByEngine map[string][]string
-	slotsByEngine  map[string]map[string]noderec.SlotInfo
-	jitByEngine    map[string]bool
-=======
 	models             []string
 	byEngine           map[string][]string
 	loadedByEngine     map[string][]string
@@ -33,7 +26,6 @@ func (inv modelInventory) applyTo(node *noderec.DirectoryNode) {
 	node.ModelsByEngine = inv.byEngine
 	node.LoadedByEngine = inv.loadedByEngine
 	node.DownloadedByEngine = inv.downloadedByEngine
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 }
 
 // hostKey identifies one node's endpoint for one service. Node-info and the engine

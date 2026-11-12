@@ -114,12 +114,6 @@ type AvailableNode struct {
 	// consumer show which of a remote node's models are loaded. Omitted
 	// when no engine reports loaded state.
 	LoadedByEngine map[string][]string `json:"loadedByEngine,omitempty"`
-<<<<<<< HEAD
-	// SlotsByEngine and JITLoadByEngine: per-engine slot capacity (loaded models)
-	// and on-demand-load flags, relayed from the node directory.
-	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine,omitempty"`
-	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine,omitempty"`
-=======
 	// DownloadedByEngine lists every model an engine can load when that engine
 	// advertises only the one it is serving (vLLM), so ModelsByEngine holds just
 	// that one. It is reported even while the engine is stopped, so a remote
@@ -128,7 +122,6 @@ type AvailableNode struct {
 	// inventory was read and is empty; a missing key means it was not read.
 	// Omitted when no engine reports one.
 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 }
 
 // GetNodesResult is the response to "discovery:get-nodes". Wrapped in an

@@ -57,34 +57,16 @@ func (e *Executor) Status(engine string) (EngineStatus, error) {
 // lets upgrade orchestration identify a legacy listener before changing the
 // persisted backend port; successful identification updates the live state.
 func (e *Executor) StatusAtPort(engine string, probePort int) (EngineStatus, error) {
-	return e.statusCtx(context.Background(), engine, probePort, true)
-}
-
-// statusNoWait is Status for callers that may already hold a lifecycle lock
-// (startup gating) or run under a deadline: it never blocks on opMu. When a
-// lifecycle operation owns the lock it returns the in-memory state without
-// re-probing, and the probe honors ctx.
-func (e *Executor) statusNoWait(ctx context.Context, engine string) (EngineStatus, error) {
-	return e.statusCtx(ctx, engine, 0, false)
-}
-
-func (e *Executor) statusCtx(ctx context.Context, engine string, probePort int, wait bool) (EngineStatus, error) {
 	st, err := e.state(engine)
 	if err != nil {
 		return EngineStatus{}, err
 	}
-<<<<<<< HEAD
-	if wait {
-		st.opMu.Lock()
-	} else if !st.opMu.TryLock() {
-=======
 	// A start, stop, install or model switch holds opMu for as long as it takes,
 	// and an engine like vLLM takes a minute or more to become ready. A status
 	// read must not wait that out: callers give it seconds, and the desktop
 	// treats it as a fast read. While an operation runs, what is already known
 	// about the engine is the answer, and the operation reports its own result.
 	if !st.opMu.TryLock() {
->>>>>>> 1bf25148317bb62cb617acbe53ee4563d2be0a04
 		return e.snapshot(engine, st), nil
 	}
 	defer st.opMu.Unlock()
@@ -95,7 +77,7 @@ func (e *Executor) statusCtx(ctx context.Context, engine string, probePort int, 
 	if probePort > 0 {
 		port = probePort
 	}
-	e.reconcilePresence(ctx, engine, st, pathInstalled, port, false)
+	e.reconcilePresence(context.Background(), engine, st, pathInstalled, port, false)
 	return e.snapshot(engine, st), nil
 }
 
