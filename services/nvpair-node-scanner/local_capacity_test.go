@@ -49,10 +49,12 @@ func TestApplyModelsObservedAtHeartbeat(t *testing.T) {
 		HostUUID: "p", IP: "10.0.0.9", Models: []string{"a"}, LocalNodeExt: noderec.LocalNodeExt{ModelsObservedAt: 1000},
 		Services: map[noderec.ServiceKey]noderec.ServiceStatus{noderec.ServiceEngineManager: {Port: 14322}},
 	})
-	inv := modelInventory{models: []string{"a"}}
-	_, changed, ok := d.applyModels("p", "10.0.0.9", 14322, inv, 2000)
+	inv := func(at int64) modelInventory {
+		return modelInventory{models: []string{"a"}, local: modelInventoryExt{observedAt: at}}
+	}
+	_, changed, ok := d.applyModels("p", "10.0.0.9", 14322, inv(2000))
 	require.True(t, ok && !changed, "sweep inside heartbeat: changed=%v ok=%v", changed, ok)
-	n, changed, _ := d.applyModels("p", "10.0.0.9", 14322, inv, 1000+modelsObservedHeartbeat.Milliseconds())
+	n, changed, _ := d.applyModels("p", "10.0.0.9", 14322, inv(1000+modelsObservedHeartbeat.Milliseconds()))
 	require.True(t, changed && n.ModelsObservedAt == 1000+modelsObservedHeartbeat.Milliseconds(),
 		"sweep past heartbeat: changed=%v at=%d", changed, n.ModelsObservedAt)
 }
@@ -145,11 +147,11 @@ func TestLocalApplyModelsCapacityMerge(t *testing.T) {
 	n0.ModelsObservedAt = 1000
 	d.upsert(n0)
 	slots := map[string]map[string]noderec.SlotInfo{"lmstudio": {"a": {Slots: 2}}}
-	n, changed, ok := d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"a"}, slotsByEngine: slots}, 1500)
+	n, changed, ok := d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"a"}, local: modelInventoryExt{slotsByEngine: slots, observedAt: 1500}})
 	require.True(t, ok && changed, "capacity-only change: changed=%v ok=%v", changed, ok)
 	assert.Equal(t, 2, n.SlotsByEngine["lmstudio"]["a"].Slots, "stored slots")
 	assert.Equal(t, int64(1500), n.ModelsObservedAt, "observed-at on capacity change")
-	n, changed, _ = d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"a", "b"}, slotsByEngine: slots}, 1600)
+	n, changed, _ = d.applyModels("p", "10.0.0.9", 14322, modelInventory{models: []string{"a", "b"}, local: modelInventoryExt{slotsByEngine: slots, observedAt: 1600}})
 	require.True(t, changed, "model change must report a change")
 	assert.Equal(t, int64(1600), n.ModelsObservedAt, "observed-at on model change")
 	assert.Equal(t, 2, n.SlotsByEngine["lmstudio"]["a"].Slots, "slots carried on model change")

@@ -57,31 +57,16 @@ func (e *Executor) Status(engine string) (EngineStatus, error) {
 // lets upgrade orchestration identify a legacy listener before changing the
 // persisted backend port; successful identification updates the live state.
 func (e *Executor) StatusAtPort(engine string, probePort int) (EngineStatus, error) {
-	return e.statusCtx(context.Background(), engine, probePort, true)
-}
-
-// statusNoWait is Status for callers that may already hold a lifecycle lock
-// (startup gating) or run under a deadline: it never blocks on opMu. When a
-// lifecycle operation owns the lock it returns the in-memory state without
-// re-probing, and the probe honors ctx.
-func (e *Executor) statusNoWait(ctx context.Context, engine string) (EngineStatus, error) {
-	return e.statusCtx(ctx, engine, 0, false)
-}
-
-func (e *Executor) statusCtx(ctx context.Context, engine string, probePort int, wait bool) (EngineStatus, error) {
 	st, err := e.state(engine)
 	if err != nil {
-		// Known engine with no host-platform block: return a shell status
-		// (matching get-installed) rather than erroring, so status is
-		// consistent for the same engine across methods.
-		if m, ok := e.reg.Get(engine); ok {
-			return EngineStatus{Engine: engine, DisplayName: m.DisplayName}, nil
-		}
 		return EngineStatus{}, err
 	}
-	if wait {
-		st.opMu.Lock()
-	} else if !st.opMu.TryLock() {
+	// A start, stop, install or model switch holds opMu for as long as it takes,
+	// and an engine like vLLM takes a minute or more to become ready. A status
+	// read must not wait that out: callers give it seconds, and the desktop
+	// treats it as a fast read. While an operation runs, what is already known
+	// about the engine is the answer, and the operation reports its own result.
+	if !st.opMu.TryLock() {
 		return e.snapshot(engine, st), nil
 	}
 	defer st.opMu.Unlock()
@@ -92,33 +77,21 @@ func (e *Executor) statusCtx(ctx context.Context, engine string, probePort int, 
 	if probePort > 0 {
 		port = probePort
 	}
-	e.reconcilePresence(ctx, engine, st, pathInstalled, port, false)
+	e.reconcilePresence(context.Background(), engine, st, pathInstalled, port, false)
 	return e.snapshot(engine, st), nil
 }
 
-// GetInstalled lists every known engine with its current status.
+// GetInstalled lists every engine this host can run with its current status.
 func (e *Executor) GetInstalled() []EngineStatus {
 	var out []EngineStatus
 	for _, name := range e.reg.Names() {
-		st, err := e.state(name)
+		status, err := e.Status(name)
 		if err != nil {
-			// Known engine with no block for this host: surface a shell
-			// status so the UI can still list it as unavailable here.
-			dn := name
-			if m, ok := e.reg.Get(name); ok {
-				dn = m.DisplayName
-			}
-			out = append(out, EngineStatus{Engine: name, DisplayName: dn})
+			// No block for this host, such as vLLM on Windows: the engine
+			// cannot be installed or run here, so it is not offered at all.
 			continue
 		}
-		st.opMu.Lock()
-		pathInstalled, _ := e.Detect(name)
-		st.mu.Lock()
-		port := st.port
-		st.mu.Unlock()
-		e.reconcilePresence(context.Background(), name, st, pathInstalled, port, false)
-		out = append(out, e.snapshot(name, st))
-		st.opMu.Unlock()
+		out = append(out, status)
 	}
 	return out
 }
@@ -145,6 +118,7 @@ func (e *Executor) snapshot(engine string, st *engineState) EngineStatus {
 		DisplayName: st.manifest.DisplayName,
 		Installed:   st.installed,
 		Running:     st.running,
+		Starting:    st.starting && !st.running,
 		Healthy:     st.healthy,
 		Port:        st.port,
 	}

@@ -6,7 +6,6 @@ package main
 import (
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -17,10 +16,10 @@ import (
 // zero LocalNodeExt, i.e. upstream's record.
 func TestS4_Nil(t *testing.T) {
 	var s *localScanState
-	assert.Zero(t, s.record("p", modelInventory{}, time.Now()))
-	assert.Zero(t, s.cached("p"))
-	s.migrate("p", "q")
-	s.forget("p")
+	assert.Zero(t, s.ext(localModelsWire{}))
+	var n0 noderec.DirectoryNode
+	modelInventoryExt{}.applyTo(&n0)
+	assert.Zero(t, n0.LocalNodeExt)
 	d := newRefreshTestDaemon()
 	_, port := startModelsStub(t, http.StatusOK, map[string]any{"models": []string{"a"}})
 	n := noderec.DirectoryNode{HostUUID: "p", Services: map[noderec.ServiceKey]noderec.ServiceStatus{

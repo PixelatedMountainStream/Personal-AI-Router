@@ -10,14 +10,23 @@ import (
 	"nvpair-shared/noderec"
 )
 
-// modelInventory is the three-part answer a node's engine manager gives, carried
-// as one value so the concurrent ask can return it.
+// modelInventory is a node engine manager's /v1/models answer, carried as one
+// value so the concurrent ask can return it and the last-good cache keeps every
+// part of it together.
 type modelInventory struct {
-	models         []string
-	byEngine       map[string][]string
-	loadedByEngine map[string][]string
-	slotsByEngine  map[string]map[string]noderec.SlotInfo
-	jitByEngine    map[string]bool
+	models             []string
+	byEngine           map[string][]string
+	loadedByEngine     map[string][]string
+	downloadedByEngine map[string][]string
+	local              modelInventoryExt // fork:S8
+}
+
+// applyTo copies the inventory onto a directory entry's model fields.
+func (inv modelInventory) applyTo(node *noderec.DirectoryNode) {
+	node.Models = inv.models
+	node.ModelsByEngine = inv.byEngine
+	node.LoadedByEngine = inv.loadedByEngine
+	node.DownloadedByEngine = inv.downloadedByEngine
 }
 
 // hostKey identifies one node's endpoint for one service. Node-info and the engine

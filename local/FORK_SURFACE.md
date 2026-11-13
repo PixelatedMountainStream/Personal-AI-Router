@@ -31,11 +31,6 @@ files: services/nvpair-engine-manager/actions.go
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
 
-### L-services-nvpair-engine-manager-controllifecycle-go
-files: services/nvpair-engine-manager/controllifecycle.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
 ### L-services-nvpair-engine-manager-controlmodels-go
 files: services/nvpair-engine-manager/controlmodels.go
 kind: legacy
@@ -106,11 +101,6 @@ files: services/nvpair-engine-manager/models_test.go
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
 
-### L-services-nvpair-engine-manager-registry-go
-files: services/nvpair-engine-manager/registry.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
 ### L-services-nvpair-engine-manager-remote-go
 files: services/nvpair-engine-manager/remote.go
 kind: legacy
@@ -131,11 +121,6 @@ files: services/nvpair-engine-manager/spec.md
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
 
-### L-services-nvpair-engine-manager-status-go
-files: services/nvpair-engine-manager/status.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
 ### L-services-nvpair-job-scheduler-schedule-test-go
 files: services/nvpair-job-scheduler/schedule_test.go
 kind: legacy
@@ -143,31 +128,6 @@ recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against
 
 ### L-services-nvpair-job-scheduler-state-go
 files: services/nvpair-job-scheduler/state.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-node-scanner-connreuse-test-go
-files: services/nvpair-node-scanner/connreuse_test.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-node-scanner-daemon-go
-files: services/nvpair-node-scanner/daemon.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-node-scanner-directory-go
-files: services/nvpair-node-scanner/directory.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-node-scanner-enrich-hosts-go
-files: services/nvpair-node-scanner/enrich_hosts.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-node-scanner-refresh-test-go
-files: services/nvpair-node-scanner/refresh_test.go
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
 
@@ -201,21 +161,6 @@ files: services/nvpair-proxy/reservation_test.go
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
 
-### L-services-nvpair-ui-broker-broker-go
-files: services/nvpair-ui-broker/broker.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-ui-broker-discovery-go
-files: services/nvpair-ui-broker/discovery.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-ui-broker-discovery-test-go
-files: services/nvpair-ui-broker/discovery_test.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
 ### L-services-shared-schedulerwire-schedulerwire-test-go
 files: services/shared/schedulerwire/schedulerwire_test.go
 kind: legacy
@@ -223,23 +168,23 @@ recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against
 
 ## Hook records (catch-up step 2)
 
-`daemon.go` keeps its legacy record alongside S4 until step 4 drops the unmarked S8 hand edits (conversion rule, plan section 5.2). `noderec.go` has no inline edit outside S1, so its legacy record is converted.
+`daemon.go` kept its legacy record alongside S4 until step 4 dropped the unmarked S8 hand edits (conversion rule, plan section 5.2); it is converted at step 4. `noderec.go` has no inline edit outside S1, so its legacy record is converted.
 
 ### S1
 files: services/shared/noderec/noderec.go
 kind: hook
-recipe: Take upstream noderec.go; add `// fork:S1` then `LocalNodeExt` as the last DirectoryNode field (after LastSeen, so gofmt does not realign it); the type lives in services/shared/noderec/local_ext.go.
+recipe: Take upstream noderec.go; add `// fork:S1` then `LocalNodeExt` as the last DirectoryNode field (after DownloadedByEngine/LastSeen, so gofmt does not realign it); the type lives in services/shared/noderec/local_ext.go.
 Tests: services/shared ./noderec/ -run 'TestS1_Nil|TestLocalNodeExtJSONKeys'
 
 ### S4
 files: services/nvpair-node-scanner/daemon.go
 kind: hook
-recipe: Take upstream daemon.go; add the `local *localScanState` field and its newDaemon init, `d.local.migrate` in dropSelf, `d.local.forget` in forget, `node.LocalNodeExt = d.local.record(...)` on enrich success, `cachedExt := d.local.cached(...)` plus `node.LocalNodeExt = cachedExt` on the enrich fallback, and `observed := d.local.record(...).ModelsObservedAt` in refreshNodeModelsCandidates, each marked `// fork:S4`; bodies in local_capacity.go.
+recipe: Take upstream daemon.go; add `// fork:S4` then `local *localScanState` after the lastInventory field, `local: newLocalScanState(), // fork:S4` in the newDaemon literal, and in enrichModelsCandidates `inventory.local.applyTo(node)` after `inventory.applyTo(node)` and `cached.local.applyTo(node)` after `cached.applyTo(node)`, each marked `// fork:S4`; NVIDIA's lastInventory cache (dropSelf, forget, fallback) carries the extension inside modelInventory, so no migrate/forget/record hooks remain; bodies in local_capacity.go. daemon.go also carries S8.
 Tests: services/nvpair-node-scanner . -run 'TestS4_Nil|TestLocal'
 
 ## Hook records (catch-up step 3)
 
-`directory.go` keeps its legacy record alongside S5, and `connreuse_test.go` keeps its legacy record, until step 4 drops the unmarked S8 hand edits (conversion rule, plan section 5.2). `models.go`, `schedule.go` and `schedulerwire.go` have no inline edit outside E11, S3 and S2, so their legacy records are converted.
+`directory.go` kept its legacy record alongside S5, and `connreuse_test.go` kept its legacy record, until step 4 dropped the unmarked S8 hand edits (conversion rule, plan section 5.2); step 4 converts `directory.go` and returns `connreuse_test.go` to NVIDIA verbatim. `models.go`, `schedule.go` and `schedulerwire.go` have no inline edit outside E11, S3 and S2, so their legacy records are converted.
 
 ### S2
 files: services/shared/schedulerwire/schedulerwire.go
@@ -256,11 +201,39 @@ Tests: services/nvpair-job-scheduler . -run 'TestS3_Nil|TestLocalRank|TestEmit_I
 ### S5
 files: services/nvpair-node-scanner/directory.go
 kind: hook
-recipe: Take upstream directory.go; in applyModels add `defer d.localMergeCapacity(hostUUID, inv, observedAt, &node, &changed, &ok)` marked `// fork:S5` right after `defer d.mu.Unlock()` (so it runs under the lock and adjusts the named results); body in local_capacity.go. The applyModels signature/compare/assign edits are S8 (unmarked until step 4).
-Tests: services/nvpair-node-scanner . -run 'TestS5_Nil|TestLocalApplyModels|TestApplyModelsObservedAtHeartbeat|TestRefreshSlotChangeReportsChange'
+recipe: Take upstream directory.go (NVIDIA's 4-argument applyModels, verbatim); add `defer d.localMergeCapacity(hostUUID, inventory, &node, &changed, &ok)` marked `// fork:S5` right after `defer d.mu.Unlock()` (so it runs under the lock and adjusts the named results); it reads inventory.local and stores it when upstream's compare (including downloadedByEngine) changed, the capacity changed or the observed-at heartbeat is due; body in local_capacity.go.
+Tests: services/nvpair-node-scanner . -run 'TestS5_Nil|TestLocalApplyModels|TestApplyModelsObservedAtHeartbeat|TestRefreshSlotChangeReportsChange|TestLocalDownloadedChangeKeepsCapacity'
 
 ### E11
 files: services/nvpair-engine-manager/models.go
 kind: hook
-recipe: Take upstream models.go; add `// fork:E11` then `LocalModelsExt` as the last ModelsResult field; in ModelsResult add `lx := newLocalSlotSweep(len(engineNames))` after the per-engine slices, `lx.prepare(i, mf)` after the registry lookup, `lx.collect(ctx, e, i, name, loadedOK[i], loaded[i])` at the end of the per-engine goroutine and `lx.finish(e, &res, engineNames)` before `return res`; in extractStringsResult add `arr, _ = expandInstances(arr, spec, false)` before the row loop; each marked `// fork:E11`; bodies in local_models.go.
-Tests: services/nvpair-engine-manager . -run 'TestE11_Nil|TestLocalModelsResultJSONKeys|TestExtractRecords|TestBundledSlotsQueryThroughManifests|TestApplySettingsOverrides'
+recipe: Take upstream models.go; add `// fork:E11` then `LocalModelsExt` as the last ModelsResult field (after DownloadedByEngine); in ModelsResult add `lx := newLocalSlotSweep(e, engineNames)` after `perEngine := make(...)`, `lx.collect(ctx, e, i, name, r.loadedOK, r.loaded)` after `perEngine[i] = r` (the normal path; NVIDIA's loadedOnlyEngineModels path is not hooked) and `lx.finish(e, &res, engineNames)` before `return res`; in extractStringsResult add `arr, _ = expandInstances(arr, spec, false)` before the row loop; each marked `// fork:E11`; bodies in local_models.go (loaded-only engines: jit_load forced false, slot overrides keyed on the served name).
+Tests: services/nvpair-engine-manager . -run 'TestE11_Nil|TestLocalModelsResultJSONKeys|TestExtractRecords|TestBundledSlotsQueryThroughManifests|TestApplySettingsOverrides|TestLocalLMStudioModelsThroughBundledManifest|TestLocalLoadedOnlyEngineNeverJITAndSlotsOnServedName'
+
+## Hook records (catch-up step 4)
+
+NVIDIA #181 (vLLM) and #5. NVIDIA owns vLLM model switching (an operator action that restarts the engine); the fork's JIT does not drive it: `noderec.ApplyCapacityOverrides` forces jit_load false for engines whose manifest advertises `"loaded"`, the proxy's jit_load fallback is `noderec.DefaultJITLoad`, vLLM slot overrides and proxy residency use the served name (`modelsByEngine`), and a downloaded-but-not-served vLLM model is never eligible (`TestLocalVLLMDownloadedOnlyNeverEligible`). `daemon.go`, `directory.go`, `enrich_hosts.go`, `registry.go`, `controllifecycle.go`, `broker.go` and `discovery.go` have no inline edit outside S4/S8, S5, S8, E10, E14 and S6, so their legacy records are converted; `status.go`, `connreuse_test.go`, `refresh_test.go` and `discovery_test.go` are NVIDIA verbatim and leave the surface (`statusNoWait` moves to local_executor.go, `TestDirectoryRelaysSlotCapacity` to local_s6_test.go).
+
+### S8
+files: services/nvpair-node-scanner/enrich_hosts.go, services/nvpair-node-scanner/daemon.go
+kind: hook
+recipe: Take upstream enrich_hosts.go and daemon.go (NVIDIA's #181 modelInventory, applyTo, fetchModels and 4-argument applyModels verbatim; no signature change, no test call-site edit); add `local modelInventoryExt // fork:S8` as the last modelInventory field; in fetchModels add `// fork:S8` then `localModelsWire` as the last field of the decode struct and `local: d.local.ext(body.localModelsWire), // fork:S8` as the last field of the returned literal; types and ext in local_capacity.go. observedAt lives in modelInventoryExt.observedAt, stamped at fetch time by a non-nil localScanState (0 with nil state), so NVIDIA's lastInventory cache carries it with the inventory.
+Tests: services/nvpair-node-scanner . -run 'TestS8_Nil|TestLocalDownloadedChangeKeepsCapacity|TestRefreshSlotChangeReportsChange'
+
+### S6
+files: services/nvpair-ui-broker/broker.go, services/nvpair-ui-broker/discovery.go
+kind: hook
+recipe: Take upstream broker.go and discovery.go; add `// fork:S6` then `LocalBrokerExt` as the last AvailableNode and EnrichedNode field; set `LocalBrokerExt: localBrokerExt(n), // fork:S6` last in the directoryToEnriched literal and `LocalBrokerExt: n.LocalBrokerExt, // fork:S6` last in the toAvailable literal; type and projection in local_ext.go.
+Tests: services/nvpair-ui-broker . -run 'TestS6_Nil|TestDirectoryRelaysSlotCapacity|TestLocalBrokerRelayJSONKeys'
+
+### E10
+files: services/nvpair-engine-manager/registry.go
+kind: hook
+recipe: Take upstream registry.go; add `// fork:E10` then `LocalActionExt`, `LocalResultExt` and `LocalMatchExt` as the last field of Action, ActionResult and ResultMatch; in Action.validate, just before upstream's result.array/result.field check, add `if err := a.localValidate(name); err != nil { // fork:E10` (returning err) and add `a.Result.Record == nil &&` to that check, marked `// fork:E10`; types, regexps and localValidate in local_registry.go.
+Tests: services/nvpair-engine-manager . -run 'TestE10_Nil|TestLocalActionExtValidate|TestOptionalArgv'
+
+### E14
+files: services/nvpair-engine-manager/controllifecycle.go
+kind: hook
+recipe: Take upstream controllifecycle.go; in handleStart replace the start-failure `http.Error(w, err.Error(), http.StatusInternalServerError)` with `localStartError(w, err) // fork:E14` (pinned gate errors keep their status; others are the same 500); body in local_http.go.
+Tests: services/nvpair-engine-manager . -run 'TestE14_Nil'

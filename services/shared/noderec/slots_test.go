@@ -37,7 +37,7 @@ func TestApplyCapacityOverrides(t *testing.T) {
 	}
 	loaded := map[string][]string{"lmstudio": {"qwen3.8-27b-mlx"}, "ollama": {"q"}}
 	reported := map[string]map[string]SlotInfo{"ollama": {"q": {Slots: 2}}}
-	slots, jit := ApplyCapacityOverrides(raw, []string{"lmstudio", "ollama", "llamacpp"}, loaded, reported)
+	slots, jit := ApplyCapacityOverrides(raw, []string{"lmstudio", "ollama", "llamacpp"}, loaded, reported, nil)
 	want := map[string]map[string]SlotInfo{"lmstudio": {"qwen3.8-27b-mlx": {Slots: 4, CtxPerSlot: 32768}}, "ollama": {"q": {Slots: 2}}}
 	if !reflect.DeepEqual(slots, want) {
 		t.Errorf("slots = %v, want %v", slots, want)
@@ -48,7 +48,7 @@ func TestApplyCapacityOverrides(t *testing.T) {
 	if reported["ollama"]["q"].Slots != 2 {
 		t.Error("input mutated")
 	}
-	if _, jit := ApplyCapacityOverrides(nil, []string{"lmstudio"}, nil, nil); jit["lmstudio"] {
+	if _, jit := ApplyCapacityOverrides(nil, []string{"lmstudio"}, nil, nil, nil); jit["lmstudio"] {
 		t.Error("lmstudio default must be false")
 	}
 }

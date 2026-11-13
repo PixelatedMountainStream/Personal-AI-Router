@@ -47,10 +47,10 @@ func bundledEngineExec(t *testing.T, name string, h http.Handler) *Executor {
 }
 
 func TestOptionalArgv(t *testing.T) {
-	act := Action{OptionalArgs: map[string][]string{
+	act := Action{LocalActionExt: LocalActionExt{OptionalArgs: map[string][]string{
 		"context_length": {"--context-length", "{context_length}"},
 		"parallel":       {"--parallel", "{parallel}"},
-	}}
+	}}}
 	got, err := optionalArgv(act, json.RawMessage(`{"model":"m","context_length":1000000}`))
 	if err != nil || !reflect.DeepEqual(got, []string{"--context-length", "1000000"}) {
 		t.Fatalf("present/absent/exact: %v %v", got, err)
@@ -61,7 +61,7 @@ func TestOptionalArgv(t *testing.T) {
 		}
 	}
 	for _, k := range []string{"model", "cli", "Bad"} {
-		a := Action{Cmd: []string{"x"}, OptionalArgs: map[string][]string{k: {"--f", "{" + k + "}"}}}
+		a := Action{Cmd: []string{"x"}, LocalActionExt: LocalActionExt{OptionalArgs: map[string][]string{k: {"--f", "{" + k + "}"}}}}
 		if a.validate("load") == nil {
 			t.Fatalf("reserved/invalid key %q must be refused", k)
 		}

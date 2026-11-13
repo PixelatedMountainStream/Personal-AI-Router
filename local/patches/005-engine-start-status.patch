@@ -1,0 +1,142 @@
+From 967841e3e362bc5faf4a4755b13b6e66c5ff4b82 Mon Sep 17 00:00:00 2001
+From: "erik.hauan" <erik.hauan@radiantvs.com>
+Date: Thu, 12 Nov 2026 15:26:24 -0800
+Subject: [PATCH] engine-manager: pinned start errors behind E14; statusNoWait
+ moves to glue
+
+Behaviour: a failed /start whose error is a pinned-load gate error keeps its
+own status and victims body (writePinnedError); any other error is
+NVIDIA's 500. statusNoWait (startup gating's non-blocking, ctx-honoring
+status) moves from status.go to local_executor.go; NVIDIA's #181
+StatusAtPort now uses opMu.TryLock itself, so status.go is NVIDIA verbatim.
+
+Seams used: E14 (controllifecycle.go: the http.Error 500 in handleStart
+becomes `localStartError(w, err)`, marked // fork:E14; body in
+local_http.go). NVIDIA's errStartStopped check on the same line is kept.
+
+Proving tests: TestE14_Nil (nvpair-engine-manager).
+
+Feature-group commit for catch-up step 4, exported as
+local/patches/005-engine-start-status.patch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../nvpair-engine-manager/controllifecycle.go |  2 +-
+ .../nvpair-engine-manager/local_e14_test.go   | 31 +++++++++++++++++++
+ .../nvpair-engine-manager/local_executor.go   | 28 +++++++++++++++++
+ services/nvpair-engine-manager/local_http.go  | 17 ++++++++++
+ 4 files changed, 77 insertions(+), 1 deletion(-)
+ create mode 100644 services/nvpair-engine-manager/local_e14_test.go
+ create mode 100644 services/nvpair-engine-manager/local_executor.go
+ create mode 100644 services/nvpair-engine-manager/local_http.go
+
+diff --git a/services/nvpair-engine-manager/controllifecycle.go b/services/nvpair-engine-manager/controllifecycle.go
+index be9ba72..90fcf6e 100644
+--- a/services/nvpair-engine-manager/controllifecycle.go
++++ b/services/nvpair-engine-manager/controllifecycle.go
+@@ -59,7 +59,7 @@ func (s *controlServer) handleStart(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 	// A start the peer's own Stop cut short answers with the status, stopped.
+ 	if err := s.exec.StartWith(r.Context(), req.Engine, startOpts{Port: req.Port, Bind: "127.0.0.1"}); err != nil && !errors.Is(err, errStartStopped) {
+-		http.Error(w, err.Error(), http.StatusInternalServerError)
++		localStartError(w, err) // fork:E14
+ 		return
+ 	}
+ 	s.writeStatus(w, req.Engine)
+diff --git a/services/nvpair-engine-manager/local_e14_test.go b/services/nvpair-engine-manager/local_e14_test.go
+new file mode 100644
+index 0000000..ffc3413
+--- /dev/null
++++ b/services/nvpair-engine-manager/local_e14_test.go
+@@ -0,0 +1,31 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++// TestE14_Nil: a non-pinned start error is upstream's 500 with the error text;
++// a pinned gate error keeps its own status.
++func TestE14_Nil(t *testing.T) {
++	want := httptest.NewRecorder()
++	http.Error(want, "boom", http.StatusInternalServerError)
++	got := httptest.NewRecorder()
++	localStartError(got, errString("boom"))
++	assert.Equal(t, want.Code, got.Code)
++	assert.Equal(t, want.Body.String(), got.Body.String())
++	got = httptest.NewRecorder()
++	localStartError(got, badParam("x"))
++	assert.Equal(t, pinnedStatus(badParam("x")), got.Code)
++	assert.NotEqual(t, http.StatusInternalServerError, got.Code)
++}
++
++type errString string
++
++func (e errString) Error() string { return string(e) }
+diff --git a/services/nvpair-engine-manager/local_executor.go b/services/nvpair-engine-manager/local_executor.go
+new file mode 100644
+index 0000000..8347931
+--- /dev/null
++++ b/services/nvpair-engine-manager/local_executor.go
+@@ -0,0 +1,28 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import "context"
++
++// statusNoWait is Status for callers that may already hold a lifecycle lock
++// (startup gating) or run under a deadline: it never blocks on opMu (as
++// NVIDIA's StatusAtPort no longer does either), and its presence probe honors
++// ctx where StatusAtPort uses context.Background(). Moved out of status.go at
++// catch-up step 4; status.go is NVIDIA verbatim.
++func (e *Executor) statusNoWait(ctx context.Context, engine string) (EngineStatus, error) {
++	st, err := e.state(engine)
++	if err != nil {
++		return EngineStatus{}, err
++	}
++	if !st.opMu.TryLock() {
++		return e.snapshot(engine, st), nil
++	}
++	defer st.opMu.Unlock()
++	pathInstalled, _ := e.Detect(engine)
++	st.mu.Lock()
++	port := st.port
++	st.mu.Unlock()
++	e.reconcilePresence(ctx, engine, st, pathInstalled, port, false)
++	return e.snapshot(engine, st), nil
++}
+diff --git a/services/nvpair-engine-manager/local_http.go b/services/nvpair-engine-manager/local_http.go
+new file mode 100644
+index 0000000..4db727d
+--- /dev/null
++++ b/services/nvpair-engine-manager/local_http.go
+@@ -0,0 +1,17 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import "net/http"
++
++// localStartError writes a failed /start (seam E14): a pinned-load gate error
++// (a busy or refused startup load) keeps its own status and victims body via
++// writePinnedError; any other error is upstream's 500 with the error text.
++func localStartError(w http.ResponseWriter, err error) {
++	if pinnedStatus(err) != http.StatusInternalServerError {
++		writePinnedError(w, err)
++		return
++	}
++	http.Error(w, err.Error(), http.StatusInternalServerError)
++}
+-- 
+2.53.0
+

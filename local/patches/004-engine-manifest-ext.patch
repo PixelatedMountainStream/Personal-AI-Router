@@ -1,0 +1,253 @@
+From 3ebbccbc9ed7e1a44c0df201259f87fb93ad10b2 Mon Sep 17 00:00:00 2001
+From: "erik.hauan" <erik.hauan@radiantvs.com>
+Date: Thu, 12 Nov 2026 15:26:24 -0800
+Subject: [PATCH] engine-manager: manifest action extensions behind E10
+
+Behaviour: manifests keep the fork's action keys: optional_args (argv
+fragments appended for present integer params, cmd actions only),
+result.record (typed slots/ctx/bytes extraction, whole-response when array and
+field are both empty), result.each/each_field (per loaded instance rows, LM
+Studio's loaded_instances) and match.loading_in (loading rows count as
+occupied for strict residency), each validated as before.
+
+Seams used: E10 (registry.go: Action embeds LocalActionExt, ActionResult
+embeds LocalResultExt, ResultMatch embeds LocalMatchExt, each after NVIDIA's
+last field; Action.validate calls a.localValidate(name) just before
+upstream's result.array/result.field check, which a record result skips;
+each marked // fork:E10; types, regexps and localValidate in
+services/nvpair-engine-manager/local_registry.go). NVIDIA's #181 action kinds
+(hf_cache, launch_model, hf_pull, stop_engine), advertised_models and
+inventory_field are kept verbatim.
+
+Proving tests: TestE10_Nil, TestLocalActionExtValidate, TestOptionalArgv,
+TestExtractRecords (nvpair-engine-manager).
+
+Feature-group commit for catch-up step 4, exported as
+local/patches/004-engine-manifest-ext.patch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../nvpair-engine-manager/local_e10_test.go   |  46 +++++++
+ .../nvpair-engine-manager/local_registry.go   | 113 ++++++++++++++++++
+ services/nvpair-engine-manager/registry.go    |  11 +-
+ 3 files changed, 169 insertions(+), 1 deletion(-)
+ create mode 100644 services/nvpair-engine-manager/local_e10_test.go
+ create mode 100644 services/nvpair-engine-manager/local_registry.go
+
+diff --git a/services/nvpair-engine-manager/local_e10_test.go b/services/nvpair-engine-manager/local_e10_test.go
+new file mode 100644
+index 0000000..7b5ecc2
+--- /dev/null
++++ b/services/nvpair-engine-manager/local_e10_test.go
+@@ -0,0 +1,46 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"encoding/json"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// TestE10_Nil: a zero extension validates exactly as upstream (a result still
++// needs array and field), adds no manifest keys, and the bundled manifests
++// load.
++func TestE10_Nil(t *testing.T) {
++	var a *Action
++	assert.NoError(t, a.localValidate("x"))
++	ok := Action{HTTP: &ActionHTTP{Method: "GET", Path: "/m"}, Result: &ActionResult{Array: "data", Field: "id"}}
++	assert.NoError(t, ok.validate("list_models"))
++	bad := Action{HTTP: &ActionHTTP{Method: "GET", Path: "/m"}, Result: &ActionResult{Array: "data"}}
++	assert.ErrorContains(t, bad.validate("list_models"), "result.array and result.field are required")
++	b, err := json.Marshal(ok)
++	require.NoError(t, err)
++	assert.NotContains(t, string(b), "optional_args")
++	assert.NotContains(t, string(b), "record")
++	assert.NotContains(t, string(b), "loading_in")
++	assert.NotEmpty(t, bundledManifestSet(t))
++}
++
++// TestLocalActionExtValidate: the fork keys decode through the embeds and are
++// validated (a whole-response record may omit array and field).
++func TestLocalActionExtValidate(t *testing.T) {
++	var a Action
++	require.NoError(t, json.Unmarshal([]byte(`{"http":{"method":"GET","path":"/props"},
++		"result":{"record":{"fields":{"slots":"total_slots"}},"each":"inst","match":{"field":"s","in":["loaded"],"loading_in":["loading"]}}}`), &a))
++	assert.Equal(t, "total_slots", a.Result.Record.Fields["slots"])
++	assert.Equal(t, "inst", a.Result.Each)
++	assert.Equal(t, []string{"loading"}, a.Result.Match.LoadingIn)
++	assert.NoError(t, a.validate("slots"))
++	a.Result.Record.Fields = map[string]string{"ctx": "n_ctx"}
++	assert.ErrorContains(t, a.validate("slots"), "requires a slots or bytes")
++	c := Action{Cmd: []string{"x"}, LocalActionExt: LocalActionExt{OptionalArgs: map[string][]string{"model": {"--m"}}}}
++	assert.ErrorContains(t, c.validate("load_model"), "invalid or reserved")
++}
+diff --git a/services/nvpair-engine-manager/local_registry.go b/services/nvpair-engine-manager/local_registry.go
+new file mode 100644
+index 0000000..9f6fdc1
+--- /dev/null
++++ b/services/nvpair-engine-manager/local_registry.go
+@@ -0,0 +1,113 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"fmt"
++	"regexp"
++	"strings"
++)
++
++// The fork's manifest extensions (seam E10). Each is embedded in the upstream
++// struct it extends, so encoding/json flattens it and manifest keys are
++// unchanged; the zero value is an upstream manifest.
++
++// LocalActionExt extends Action.
++type LocalActionExt struct {
++	// OptionalArgs maps a caller param name to an argv fragment appended to Cmd
++	// only when that param is present, e.g. {"context_length": ["--context-length",
++	// "{context_length}"]}. The param value must be a non-negative integer and
++	// replaces {<param>} in the fragment. Cmd actions only.
++	OptionalArgs map[string][]string `json:"optional_args,omitempty"`
++}
++
++// LocalResultExt extends ActionResult.
++type LocalResultExt struct {
++	// Record, when set, additionally extracts typed per-model capacity (see
++	// ResultRecord). With Array/Field set, every array row yields one record
++	// keyed by its Field. With both empty, the whole response is ONE record
++	// (a per-model query such as llama.cpp /props?model=).
++	Record *ResultRecord `json:"record,omitempty"`
++	// Each, when set, names a per-row array of instances (LM Studio's
++	// "loaded_instances"). Each row is expanded to one row per instance, named
++	// by that instance's EachField (default "id"), so residency, sizes and
++	// slots are per loaded instance rather than per model key. Rows with an
++	// empty array stay as they are.
++	Each      string `json:"each,omitempty"`
++	EachField string `json:"each_field,omitempty"`
++}
++
++// LocalMatchExt extends ResultMatch.
++type LocalMatchExt struct {
++	// LoadingIn lists string values that are not matched (not "loaded") but still
++	// occupy memory; strict residency counts them as occupied.
++	LoadingIn []string `json:"loading_in,omitempty"`
++}
++
++// ResultRecord declares how to build a SlotInfo. Fields maps "slots", "ctx" and
++// "bytes" (resident size, used by model_sizes)
++// to dot-separated paths, where a numeric part indexes an array (LM Studio's
++// "loaded_instances.0.config.parallel"). Static supplies "slots" and "ctx"
++// constants for engines that expose no endpoint (Ollama serves 1 slot).
++type ResultRecord struct {
++	Fields map[string]string `json:"fields,omitempty"`
++	Static map[string]int    `json:"static,omitempty"`
++}
++
++// declares reports whether the record maps key by path or by static value.
++func (r *ResultRecord) declares(key string) bool {
++	if _, ok := r.Fields[key]; ok {
++		return true
++	}
++	_, ok := r.Static[key]
++	return ok
++}
++
++var optionalArgKeyRe = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
++
++var recordPathRe = regexp.MustCompile(`^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$`)
++
++// localValidate checks the fork's action extensions (seam E10). It runs in
++// Action.validate just before upstream's result.array/result.field check,
++// which a result with a Record skips: a record result may leave both empty.
++// A zero extension is valid, so upstream manifests validate as before.
++func (a *Action) localValidate(name string) error {
++	if a == nil {
++		return nil
++	}
++	if len(a.OptionalArgs) > 0 {
++		if len(a.Cmd) == 0 {
++			return fmt.Errorf("action %q: optional_args requires a cmd action", name)
++		}
++		for k, frag := range a.OptionalArgs {
++			if !optionalArgKeyRe.MatchString(k) || allowedPlaceholders[k] || k == "model" {
++				return fmt.Errorf("action %q: optional_args key %q is invalid or reserved", name, k)
++			}
++			if len(frag) == 0 {
++				return fmt.Errorf("action %q: optional_args %q has an empty fragment", name, k)
++			}
++		}
++	}
++	r := a.Result
++	if r == nil || r.Record == nil {
++		return nil
++	}
++	if (strings.TrimSpace(r.Array) == "") != (strings.TrimSpace(r.Field) == "") {
++		return fmt.Errorf("action %q: result.array and result.field must both be set or both empty with result.record", name)
++	}
++	for k, path := range r.Record.Fields {
++		if (k != "slots" && k != "ctx" && k != "bytes") || !recordPathRe.MatchString(path) {
++			return fmt.Errorf("action %q: result.record.fields %q=%q invalid (keys slots|ctx|bytes, dot path)", name, k, path)
++		}
++	}
++	for k := range r.Record.Static {
++		if k != "slots" && k != "ctx" && k != "bytes" {
++			return fmt.Errorf("action %q: result.record.static key %q invalid (want slots, ctx or bytes)", name, k)
++		}
++	}
++	if !r.Record.declares("slots") && !r.Record.declares("bytes") {
++		return fmt.Errorf("action %q: result.record requires a slots or bytes field or static value", name)
++	}
++	return nil
++}
+diff --git a/services/nvpair-engine-manager/registry.go b/services/nvpair-engine-manager/registry.go
+index abb1f13..955d774 100644
+--- a/services/nvpair-engine-manager/registry.go
++++ b/services/nvpair-engine-manager/registry.go
+@@ -354,6 +354,8 @@ type Action struct {
+ 	// only a restart makes the deletion visible to clients. A stopped engine is
+ 	// left stopped; a restart failure fails the action.
+ 	RestartAfter bool `json:"restart_after,omitempty"`
++	// fork:E10
++	LocalActionExt
+ }
+ 
+ // ActionResult is the list-extraction spec on an Action (see Action.Result).
+@@ -374,6 +376,8 @@ type ActionResult struct {
+ 	// model it loaded as "root" (its --model): peers and the proxy are told the
+ 	// id, and the loaded marker on the model list uses the root.
+ 	InventoryField string `json:"inventory_field,omitempty"`
++	// fork:E10
++	LocalResultExt
+ }
+ 
+ // ResultMatch is the optional row filter on an ActionResult. Exactly one of
+@@ -386,6 +390,8 @@ type ResultMatch struct {
+ 	Field    string   `json:"field"`              // element field to test, e.g. "state" / "loaded_instances"
+ 	In       []string `json:"in,omitempty"`       // accepted string values, e.g. ["loaded"]
+ 	Nonempty bool     `json:"nonempty,omitempty"` // true → Field must be a nonempty JSON array
++	// fork:E10
++	LocalMatchExt
+ }
+ 
+ // ActionRemovePath deletes a filesystem path declared in the manifest.
+@@ -1123,7 +1129,10 @@ func (a *Action) validate(name string) error {
+ 			return fmt.Errorf("action %q: unsupported progress_protocol %q", name, a.ProgressProtocol)
+ 		}
+ 	}
+-	if a.Result != nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") {
++	if err := a.localValidate(name); err != nil { // fork:E10
++		return err
++	}
++	if a.Result != nil && a.Result.Record == nil && (strings.TrimSpace(a.Result.Array) == "" || strings.TrimSpace(a.Result.Field) == "") { // fork:E10
+ 		return fmt.Errorf("action %q: result.array and result.field are required when result is set", name)
+ 	}
+ 	if a.Result != nil && a.Result.InventoryField != "" {
+-- 
+2.53.0
+

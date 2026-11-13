@@ -38,29 +38,40 @@ type LocalModelsExt struct {
 type SlotInfo = noderec.SlotInfo
 
 // localSlotSweep is the slots part of one ModelsResult sweep, indexed by engine
-// position like upstream's per-engine slices. Every method is nil-safe; a nil
+// position like upstream's per-engine results. Every method is nil-safe; a nil
 // sweep leaves ModelsResult on upstream's code path.
 type localSlotSweep struct {
-	acts  []*Action
-	slots []map[string]SlotInfo
+	acts       []*Action
+	slots      []map[string]SlotInfo
+	loadedOnly map[string]bool // engines with advertised_models "loaded" (vLLM)
 }
 
-func newLocalSlotSweep(n int) *localSlotSweep {
-	return &localSlotSweep{acts: make([]*Action, n), slots: make([]map[string]SlotInfo, n)}
-}
-
-// prepare records engine i's optional slots action (one with a record spec).
-func (s *localSlotSweep) prepare(i int, mf *Manifest) {
-	if s == nil {
-		return
+// newLocalSlotSweep records each engine's optional slots action (one with a
+// record spec) and which engines advertise only their loaded models.
+func newLocalSlotSweep(e *Executor, engineNames []string) *localSlotSweep {
+	s := &localSlotSweep{acts: make([]*Action, len(engineNames)), slots: make([]map[string]SlotInfo, len(engineNames))}
+	for i, name := range engineNames {
+		mf, ok := e.reg.Get(name)
+		if !ok {
+			continue
+		}
+		if act, ok := mf.Actions["slots"]; ok && act.Result != nil && act.Result.Record != nil {
+			s.acts[i] = &act
+		}
+		if mf.AdvertisedModels == advertisedModelsLoaded {
+			if s.loadedOnly == nil {
+				s.loadedOnly = map[string]bool{}
+			}
+			s.loadedOnly[name] = true
+		}
 	}
-	if act, ok := mf.Actions["slots"]; ok && act.Result != nil && act.Result.Record != nil {
-		s.acts[i] = &act
-	}
+	return s
 }
 
 // collect queries engine i's slots once its loaded_models query succeeded.
 // Called from engine i's sweep goroutine; each goroutine writes only index i.
+// A loaded-only engine (vLLM) takes NVIDIA's loadedOnlyEngineModels path,
+// which never reaches this hook: the fork does not query its slots.
 func (s *localSlotSweep) collect(ctx context.Context, e *Executor, i int, name string, loadedOK bool, loaded []string) {
 	if s == nil || s.acts[i] == nil || !loadedOK {
 		return
@@ -83,13 +94,19 @@ func (s *localSlotSweep) finish(e *Executor, res *ModelsResult, engineNames []st
 		}
 		res.SlotsByEngine[engineNames[i]] = sl
 	}
-	res.applySettingsOverrides(e.settingsOverrides)
+	res.applySettingsOverrides(e.settingsOverrides, s.loadedOnly)
 }
 
 // applySettingsOverrides merges node-settings engine overrides (slots, ctx per
 // slot for loaded models) into the result and resolves jit_load for every
 // engine that reported. A nil source still resolves the jit_load defaults.
-func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage) {
+//
+// A loaded-only engine (advertised_models "loaded", vLLM) switches models only
+// by an operator action that restarts it (NVIDIA #181), never on demand: its
+// jit_load is false whatever the settings say, and its slot overrides are
+// keyed on the served name (modelsByEngine, what a request names), not on the
+// --model root that its loadedByEngine entry uses.
+func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage, loadedOnly map[string]bool) {
 	var raw map[string]json.RawMessage
 	if src != nil {
 		raw = src()
@@ -102,7 +119,16 @@ func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMess
 		reported[n] = true
 	}
 	names := slices.Collect(maps.Keys(reported))
-	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, r.LoadedByEngine, r.SlotsByEngine)
+	served := r.LoadedByEngine
+	if len(loadedOnly) > 0 {
+		served = maps.Clone(r.LoadedByEngine)
+		for n := range loadedOnly {
+			if _, ok := served[n]; ok {
+				served[n] = r.ByEngine[n]
+			}
+		}
+	}
+	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, served, r.SlotsByEngine, loadedOnly)
 }
 
 // querySlots runs an engine's optional slots action and returns capacity keyed
