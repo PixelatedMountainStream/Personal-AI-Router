@@ -141,26 +141,6 @@ files: services/nvpair-node-settings/manager_test.go
 kind: legacy
 recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
 
-### L-services-nvpair-proxy-facade-go
-files: services/nvpair-proxy/facade.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-proxy-main-go
-files: services/nvpair-proxy/main.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-proxy-proxy-go
-files: services/nvpair-proxy/proxy.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
-### L-services-nvpair-proxy-reservation-test-go
-files: services/nvpair-proxy/reservation_test.go
-kind: legacy
-recipe: Pre-refactor inline fork edit; re-apply by merging the fork diff against upstream until PR-C..E convert it to a hook.
-
 ### L-services-shared-schedulerwire-schedulerwire-test-go
 files: services/shared/schedulerwire/schedulerwire_test.go
 kind: legacy
@@ -237,3 +217,61 @@ files: services/nvpair-engine-manager/controllifecycle.go
 kind: hook
 recipe: Take upstream controllifecycle.go; in handleStart replace the start-failure `http.Error(w, err.Error(), http.StatusInternalServerError)` with `localStartError(w, err) // fork:E14` (pinned gate errors keep their status; others are the same 500); body in local_http.go.
 Tests: services/nvpair-engine-manager . -run 'TestE14_Nil'
+
+## Hook records (catch-up step 5)
+
+NVIDIA #144 (first-byte cooldown) and #186. proxy.go is NVIDIA's with the fork's proxy behaviour behind P1-P9 (bodies in local_proxy.go, local_capacity.go and local/{affinity,capacity,routing,respnorm}); a nil Proxy.local runs NVIDIA's path. NVIDIA's cooling demotion is the outer stable partition over the fork's slot-aware order (routing.Better: a cooling node never outranks a non-cooling one; all-cooling falls back to slots; a cooling affinity-bound node is rebound). proxy.go, facade.go and main.go have no inline edit outside P1-P9, so their legacy records are converted; reservation_test.go is NVIDIA verbatim again (the nil-state proxy gives NVIDIA's b,b,c) and leaves the surface; the proxy's fork-added files moved to local_*.go and local/ and leave legacy_added.
+
+### P1
+files: services/nvpair-proxy/main.go
+kind: hook
+recipe: Take upstream main.go; after `proxy := NewProxy(codec)` add `proxy.local = newLocalState(nil) // fork:P1`; body in local_proxy.go (directory capacity layered under NVPAIR_PROXY_CAPACITY).
+Tests: services/nvpair-proxy . -run 'TestP1_Nil'
+
+### P2
+files: services/nvpair-proxy/facade.go
+kind: hook
+recipe: Take upstream facade.go; in replaceSubscribed, after the snapshot decodes, add `f.host.local.observeNodes(f.profile.Name, res.Nodes) // fork:P2`.
+Tests: services/nvpair-proxy . -run 'TestP2_Nil|TestDirectoryResidencyAndProjection|TestLocalJIT'
+
+### P3
+files: services/nvpair-proxy/proxy.go
+kind: hook
+recipe: Take upstream proxy.go; add `// fork:P3` then `local *localState` as the last Proxy field (after NVIDIA's coolUntil); state and methods in local_proxy.go and local_capacity.go.
+Tests: services/nvpair-proxy . -run 'TestP3_Nil'
+
+### P4
+files: services/nvpair-proxy/proxy.go
+kind: hook
+recipe: In handleHTTP add `bodyBytes = p.local.rewriteBody(r, bodyBytes) // fork:P4` right after bufferBodyAndModel; body in local_proxy.go and local/respnorm.
+Tests: services/nvpair-proxy . -run 'TestP4_Nil|TestCharResponsesInputNormalisedBeforeForward'
+
+### P5
+files: services/nvpair-proxy/proxy.go
+kind: hook
+recipe: In handleHTTP add `candidates, notLoaded := p.local.filterCandidates(f, routingModel, candidates, !lookup) // fork:P5` after the first resolveCandidates and `round, _ = p.local.filterCandidates(f, routingModel, round, true) // fork:P5` after the round re-resolution; add `rejectionBody, rejectionError, rejectionStatus = localNotLoadedRejection(...) // fork:P5` after the routingModel rejection block; add `// fork:P5` then `local bool` as the last candidate field. In resolveCandidates' add closure add `seenHost[u.Host] = p.local.claimsHost(f, model, n.ID) // fork:P5` after `seenHost[u.Host] = true`, so an ineligible ID does not claim its host. The filter runs after NVIDIA's demoteCooling and keeps its order.
+Tests: services/nvpair-proxy . -run 'TestP5_Nil|TestHandleHTTP_ModelLookupIgnoresResidency|TestCharLMStudio|TestLocalFilterKeepsCoolingOrder|TestLocalSameHostLoadedIDSurvivesDedup'
+
+### P6
+files: services/nvpair-proxy/proxy.go
+kind: hook
+recipe: In handleHTTP add `lr := p.local.request(...) // fork:P6` after P5, replace both `p.reserveCandidate(f, ...)` calls with `p.localReserve(lr, f, ...) // fork:P6`, add `lr.releaseEarly(&resMu, &held) // fork:P6` after `committed = true`, `Affinity: lr.affinityDecision(), // fork:P6` last in the finalize RequestEvent and `"affinity", lr.affinityDecision(), // fork:P6` last in its slog; add `// fork:P6` then `Affinity` as the last RequestEvent field and `localClaim` as the last reservation field; open reserveCandidate with `if out, res, ok := p.localReserveHook(f, candidates); ok { // fork:P6`, releaseReservation (after its Lock/defer) with `if p.localDropLocked(r) { // fork:P6`, moveReservation (after its Lock/defer) with `if res, ok := p.localMoveLocked(r, nodeID); ok { // fork:P6`; add `p.local.applySnapshot(priority) // fork:P6` before setPriorityLocked's return. Cooling (NVIDIA #144) is routing.Better's outer key.
+Tests: services/nvpair-proxy . -run 'TestP6_Nil|TestReserveCandidate_|TestAffinity|TestSlotScore_|TestLocalCooling|TestLocalAllCooling|TestLocalAffinityLeavesCoolingBoundNode|TestLocalAffinityDoesNotYieldToCoolingNode|TestCharLMStudioSlots'
+
+### P7
+files: services/nvpair-proxy/proxy.go
+kind: hook
+recipe: In handleHTTP add `lr.onMove(nodeID, held) // fork:P7` in moveHeld after moveReservation, `lr.resetTried() // fork:P7` after the round's `next = 0`, `cand, skipRound := lr.pick(round, next, cand, &resMu, &held) // fork:P7` plus its 4-line skip block after `cand := round[next]`, `lr.attemptStart(...) // fork:P7` after moveHeld(cand.id) and `lr.attemptEnd(...) // fork:P7` after cancelAttempt().
+Tests: services/nvpair-proxy . -run 'TestP7_Nil|TestSlotScore_FailoverPicksFreeOverFull|TestReserveRechecksEligibility'
+
+### P8
+files: services/nvpair-proxy/proxy.go
+kind: hook
+recipe: In serveModelList replace `models = append(models, item.raw)` with `models = append(models, p.local.annotateModel(f, openAI, candidates, item.key, item.raw)) // fork:P8`.
+Tests: services/nvpair-proxy . -run 'TestP8_Nil|TestMinContextLength|TestContextLengthReplacedOrRemoved'
+
+### P9
+files: services/nvpair-proxy/proxy.go
+kind: hook
+recipe: In the attempt's ModifyResponse, first add `if lr.notLoaded(attemptCtx, resp, cand.id, last, attemptStart) { // fork:P9` with `retry = true; return retrySignal{}` (4 lines); classifier in local/routing.
+Tests: services/nvpair-proxy . -run 'TestP9_Nil|TestNotLoaded_|TestSlotScore_NotLoaded'

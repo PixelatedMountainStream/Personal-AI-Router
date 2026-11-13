@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"nvpair-proxy/local/capacity"
 	"testing"
 	"time"
 
@@ -23,8 +24,8 @@ func dnode(id string, loaded []string, slots map[string]noderec.SlotInfo, obs in
 }
 
 func TestDirectoryResidencyAndProjection(t *testing.T) {
-	d := newDirectoryCapacity(nil)
-	d.update("ollama", []noderec.DirectoryNode{
+	d := capacity.NewDirectory(nil)
+	d.Update("ollama", []noderec.DirectoryNode{
 		dnode("legacy", nil, nil, 0),
 		dnode("empty", []string{}, nil, 1),
 		dnode("hot", []string{"m"}, map[string]noderec.SlotInfo{"m": {Slots: 3, CtxPerSlot: 4096}}, 1),
@@ -47,55 +48,55 @@ func TestDirectoryResidencyAndProjection(t *testing.T) {
 
 func TestDirectorySuppressionLiftedByNewerObservation(t *testing.T) {
 	now := time.Unix(1000, 0)
-	d := newDirectoryCapacity(nil)
-	p := &Proxy{suppressed: map[inflightKey]time.Time{}, now: func() time.Time { return now }}
-	p.capacity = d
+	d := capacity.NewDirectory(nil)
+	p := &Proxy{local: &localState{suppressed: map[inflightKey]time.Time{}, now: func() time.Time { return now }}}
+	p.local.capacity = d
 	hot := dnode("n", []string{"m"}, nil, now.Add(-time.Second).UnixMilli())
-	p.suppressed[inflightKey{"ollama", "m", "n"}] = now
-	d.update("ollama", []noderec.DirectoryNode{hot}) // delivered late, observed before the refusal
+	p.local.suppressed[inflightKey{"ollama", "m", "n"}] = now
+	d.Update("ollama", []noderec.DirectoryNode{hot}) // delivered late, observed before the refusal
 	if p.eligible("n", "ollama", "m") {
 		t.Fatal("sweep observed before the refusal must not lift suppression")
 	}
 	hot.ModelsObservedAt = now.Add(time.Second).UnixMilli()
-	d.update("ollama", []noderec.DirectoryNode{hot})
+	d.Update("ollama", []noderec.DirectoryNode{hot})
 	if !p.eligible("n", "ollama", "m") {
 		t.Fatal("newer sweep showing Loaded must lift suppression")
 	}
 }
 
 func TestMinContextLength(t *testing.T) {
-	d := newDirectoryCapacity(nil)
+	d := capacity.NewDirectory(nil)
 	info := func(c int) map[string]noderec.SlotInfo {
 		return map[string]noderec.SlotInfo{"m": {Slots: 1, CtxPerSlot: c}}
 	}
-	d.update("ollama", []noderec.DirectoryNode{
+	d.Update("ollama", []noderec.DirectoryNode{
 		dnode("a", []string{"m"}, info(8192), 1),
 		dnode("b", []string{"m"}, info(4096), 1),
 		dnode("nov", []string{"m"}, map[string]noderec.SlotInfo{"m": {Slots: 1}}, 1),
 		dnode("cold", []string{}, nil, 1),
 	})
-	d.update("lmstudio", nil)
-	p := &Proxy{capacity: overrideCapacity{over: settingsCapacity{jit: map[string]bool{"ollama": false}}, base: d}}
+	d.Update("lmstudio", nil)
+	p := &Proxy{local: &localState{capacity: capacity.Override{Over: capacity.Settings{JITBy: map[string]bool{"ollama": false}}, Base: d}}}
 	if n, ok := p.minContextLength("ollama", "m", []string{"a", "b", "cold"}); !ok || n != 4096 {
 		t.Fatalf("min = %d %v (cold, non-JIT node must be ignored)", n, ok)
 	}
 	if _, ok := p.minContextLength("ollama", "m", []string{"a", "nov"}); ok {
 		t.Fatal("eligible node without a value must omit the field")
 	}
-	raw := withContextLength(json.RawMessage(`{"id":"m"}`), 4096)
+	raw := capacity.WithContextLength(json.RawMessage(`{"id":"m"}`), 4096)
 	if string(raw) != `{"context_length":4096,"id":"m"}` {
 		t.Fatalf("raw = %s", raw)
 	}
 }
 
 func TestJITBlockedWhenOtherEngineHoldsModel(t *testing.T) {
-	d := newDirectoryCapacity(nil)
+	d := capacity.NewDirectory(nil)
 	busy := dnode("busy", []string{}, nil, 1)
 	busy.LoadedByEngine["lmstudio"] = []string{"big"}
 	free := dnode("free", []string{}, nil, 1)
 	free.LoadedByEngine["lmstudio"] = []string{}
-	d.update("ollama", []noderec.DirectoryNode{busy, free})
-	p := &Proxy{capacity: d}
+	d.Update("ollama", []noderec.DirectoryNode{busy, free})
+	p := &Proxy{local: &localState{capacity: d}}
 	if p.eligible("busy", "ollama", "m") {
 		t.Fatal("JIT must not add a second model beside another engine's")
 	}
@@ -105,9 +106,9 @@ func TestJITBlockedWhenOtherEngineHoldsModel(t *testing.T) {
 }
 
 func TestJITClaimBlocksOtherModel(t *testing.T) {
-	d := newDirectoryCapacity(nil)
-	d.update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, 1)})
-	p := &Proxy{capacity: d}
+	d := capacity.NewDirectory(nil)
+	d.Update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, 1)})
+	p := &Proxy{local: &localState{capacity: d}}
 	res := p.takeLocked("n", "ollama", "m", false)
 	if !res.jit || p.eligible("n", "ollama", "m2") || !p.eligible("n", "ollama", "m") {
 		t.Fatal("claim must block a different model only")
@@ -120,10 +121,10 @@ func TestJITClaimBlocksOtherModel(t *testing.T) {
 }
 
 func TestReserveRechecksEligibility(t *testing.T) {
-	d := newDirectoryCapacity(nil)
-	d.update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, 1), dnode("o", []string{"m"}, nil, 1)})
+	d := capacity.NewDirectory(nil)
+	d.Update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, 1), dnode("o", []string{"m"}, nil, 1)})
 	p := affinityProxy(t, "n", "o")
-	p.capacity = d
+	p.local.capacity = d
 	f := p.soleFacade()
 	p.takeLocked("n", "ollama", "other", false) // another model claims n
 	round := []candidate{{id: "n"}, {id: "o"}}
@@ -134,9 +135,9 @@ func TestReserveRechecksEligibility(t *testing.T) {
 }
 
 func TestObservedAtAndModelKey(t *testing.T) {
-	d := newDirectoryCapacity(nil)
+	d := capacity.NewDirectory(nil)
 	n := dnode("n", []string{"m:latest"}, map[string]noderec.SlotInfo{"m:latest": {Slots: 2, CtxPerSlot: 99}}, 5000)
-	d.update("ollama", []noderec.DirectoryNode{n})
+	d.Update("ollama", []noderec.DirectoryNode{n})
 	r, at := d.Residency("n", "ollama", "m")
 	if r != ResidencyLoaded || !at.Equal(time.UnixMilli(5000)) {
 		t.Fatalf("residency %v at %v", r, at)
@@ -147,19 +148,19 @@ func TestObservedAtAndModelKey(t *testing.T) {
 }
 
 func TestContextLengthReplacedOrRemoved(t *testing.T) {
-	if got := string(withContextLength(json.RawMessage(`{"id":"m","context_length":999999}`), 4096)); got != `{"context_length":4096,"id":"m"}` {
+	if got := string(capacity.WithContextLength(json.RawMessage(`{"id":"m","context_length":999999}`), 4096)); got != `{"context_length":4096,"id":"m"}` {
 		t.Fatal(got)
 	}
-	if got := string(withContextLength(json.RawMessage(`{"id":"m","context_length":9}`), 0)); got != `{"id":"m"}` {
+	if got := string(capacity.WithContextLength(json.RawMessage(`{"id":"m","context_length":9}`), 0)); got != `{"id":"m"}` {
 		t.Fatal(got)
 	}
 }
 
 func TestJITReleasedClaimPersistsUntilSweepOrCap(t *testing.T) {
 	now := time.Now()
-	d := newDirectoryCapacity(nil)
-	d.update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, now.UnixMilli())})
-	p := &Proxy{capacity: d, now: func() time.Time { return now }}
+	d := capacity.NewDirectory(nil)
+	d.Update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, now.UnixMilli())})
+	p := &Proxy{local: &localState{capacity: d, now: func() time.Time { return now }}}
 	p.dropLocked(p.takeLocked("n", "ollama", "m", false))
 	if p.eligible("n", "ollama", "m2") {
 		t.Fatal("claim must persist after request end")
@@ -169,7 +170,7 @@ func TestJITReleasedClaimPersistsUntilSweepOrCap(t *testing.T) {
 		t.Fatal("claim must expire at the cap")
 	}
 	p.dropLocked(p.takeLocked("n", "ollama", "m", false))
-	d.update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, now.Add(time.Second).UnixMilli())})
+	d.Update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, now.Add(time.Second).UnixMilli())})
 	if !p.eligible("n", "ollama", "m2") {
 		t.Fatal("a newer sweep must clear the claim")
 	}
@@ -177,9 +178,9 @@ func TestJITReleasedClaimPersistsUntilSweepOrCap(t *testing.T) {
 
 func TestSelectedNodeHonoursJITClaim(t *testing.T) {
 	p := affinityProxy(t, "a")
-	d := newDirectoryCapacity(nil)
-	d.update("ollama", []noderec.DirectoryNode{dnode("a", []string{}, nil, 1)})
-	p.capacity = d
+	d := capacity.NewDirectory(nil)
+	d.Update("ollama", []noderec.DirectoryNode{dnode("a", []string{}, nil, 1)})
+	p.local.capacity = d
 	f := p.soleFacade()
 	f.SetSelected("a")
 	engine := f.profile.Name

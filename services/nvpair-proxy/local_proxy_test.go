@@ -19,7 +19,7 @@ func localTieCandidates() []candidate {
 }
 
 func localTieProxy(t *testing.T) *Proxy {
-	p := prProxy(t)
+	p := withLocal(prProxy(t))
 	ids := []string{"a-remote", "z-local"}
 	applySnapshot(p, schedulerwire.Priority{Nodes: ids, Ranks: []schedulerwire.NodeRank{{ID: "a-remote", Rank: 0}, {ID: "z-local", Rank: 1}}})
 	return p
@@ -48,8 +48,8 @@ func TestHandleHTTP_ModelLookupIgnoresResidency(t *testing.T) {
 	a, _ := newCountingServer(t, 200, "")
 	disc := NewDiscovery()
 	disc.AddManual(nodeForModel(t, "a", a, tc.advertisedModel))
-	p := testProxy(tc.profile, disc, tc.profile.FacadePort)
-	p.capacity = &fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty}}
+	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
+	p.local.capacity = &fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty}}
 
 	rec := httptest.NewRecorder()
 	p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/show", strings.NewReader(`{"name":"qwen3"}`)))
@@ -59,4 +59,11 @@ func TestHandleHTTP_ModelLookupIgnoresResidency(t *testing.T) {
 	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
 	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
 	require.NotEmpty(t, rec.Body.String())
+}
+
+// withLocal gives a test proxy fork state with no capacity source (one slot
+// everywhere, nothing known), as NewProxy-built fork tests had before step 5.
+func withLocal(p *Proxy) *Proxy {
+	p.local = &localState{}
+	return p
 }

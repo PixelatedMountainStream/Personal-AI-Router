@@ -1,0 +1,3568 @@
+From 55670f7bd1e75e04c3eb1829d64ef6e7216b0f3c Mon Sep 17 00:00:00 2001
+From: "erik.hauan" <erik.hauan@radiantvs.com>
+Date: Thu, 12 Nov 2026 17:01:42 -0800
+Subject: [PATCH] proxy: slot-aware routing, affinity, JIT, residency behind
+ P1-P9
+
+Behaviour (unchanged from pre-step develop unless noted): residency-filtered
+candidates with 503 for an advertised but not-loaded model and model lookups
+(/api/show) bypassing the filter; slot-aware reservation (free slot, queue per
+slot, GPU pressure plus reservations, local node, scheduler order) with
+durable inflight, per-model pending and snapshot completions; session affinity
+(hit/miss/rebind/yield) with the RequestEvent and log field; JIT claims and
+not-loaded suppression with the one-shot notloaded-retry; per-attempt
+re-scoring on failover; early claim release after the response copy (#17);
+/v1/models context_length; /v1/responses mid-history normalisation after
+bufferBodyAndModel. vLLM gating and served-name residency (step 4) are kept in
+local/capacity.
+
+New: NVIDIA #144's cooldown composes as the outer stable partition over the
+slot-aware order (routing.Better's first key): a cooling node never outranks a
+non-cooling one, even with free slots; all-cooling falls back to slots; a
+cooling affinity-bound node is rebound while a warm candidate exists. The P5
+filter runs after NVIDIA's resolveCandidates (and demoteCooling) and keeps its
+order.
+
+Seams used: P1 main.go (proxy.local = newLocalState(nil)); P2 facade.go
+(observeNodes); P3 Proxy.local; P4 rewriteBody; P5 filterCandidates after both
+resolveCandidates calls, localNotLoadedRejection, candidate.local; P6
+request/localReserve (handleHTTP, takeHeld), reserveCandidate,
+releaseReservation, moveReservation and setPriorityLocked hooks, the embedded
+reservation.localClaim, RequestEvent.Affinity, releaseEarly; P7 pick,
+resetTried, onMove, attempt logs; P8 annotateModel; P9 notLoaded in
+ModifyResponse. Each marked // fork:Pn. Bodies in local_proxy.go,
+local_capacity.go and the packages local/{affinity,capacity,routing,respnorm}
+(routing.Candidate lands here). A nil Proxy.local (NewProxy's default) runs
+NVIDIA's code path unchanged. Fork tests move to local_*_test.go and the
+package tests; their assertions are unchanged, only setup (withLocal) and
+renamed symbols.
+
+Proving tests: TestP1_Nil..TestP9_Nil, TestLocalCoolingIsOuterPartitionOverSlots,
+TestLocalAllCoolingFallsBackToSlots, TestLocalAffinityLeavesCoolingBoundNode,
+TestLocalFilterKeepsCoolingOrder, TestBetterCoolingIsOuterPartition, TestChar*,
+TestHandleHTTP_ModelLookupIgnoresResidency, TestReserveCandidate_IdleTiePrefersLocal,
+TestReserveCandidate_FullLocalYieldsToFreeRemote (nvpair-proxy).
+
+Feature-group commit for catch-up step 5, exported as
+local/patches/007-proxy-seams.patch.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ services/nvpair-proxy/facade.go               |   1 +
+ .../nvpair-proxy/local/affinity/affinity.go   | 114 +++
+ .../local/affinity/affinity_test.go           |  44 +
+ .../nvpair-proxy/local/capacity/capacity.go   | 347 ++++++++
+ .../nvpair-proxy/local/respnorm/respnorm.go   | 125 +++
+ .../local/respnorm/respnorm_test.go           |  30 +
+ .../nvpair-proxy/local/routing/notloaded.go   |  75 ++
+ .../nvpair-proxy/local/routing/routing.go     |  74 ++
+ .../local/routing/routing_test.go             |  38 +
+ services/nvpair-proxy/local_affinity_test.go  | 239 ++++++
+ services/nvpair-proxy/local_capacity.go       | 204 +++++
+ services/nvpair-proxy/local_capacity_test.go  |  41 +
+ services/nvpair-proxy/local_char_test.go      | 146 ++++
+ .../nvpair-proxy/local_dircapacity_test.go    | 197 +++++
+ services/nvpair-proxy/local_jit_test.go       |  89 ++
+ services/nvpair-proxy/local_p_test.go         | 198 +++++
+ services/nvpair-proxy/local_proxy.go          | 780 ++++++++++++++++++
+ services/nvpair-proxy/local_proxy_test.go     |  69 ++
+ services/nvpair-proxy/local_slotscore_test.go | 311 +++++++
+ services/nvpair-proxy/main.go                 |   1 +
+ services/nvpair-proxy/proxy.go                |  47 +-
+ 21 files changed, 3167 insertions(+), 3 deletions(-)
+ create mode 100644 services/nvpair-proxy/local/affinity/affinity.go
+ create mode 100644 services/nvpair-proxy/local/affinity/affinity_test.go
+ create mode 100644 services/nvpair-proxy/local/capacity/capacity.go
+ create mode 100644 services/nvpair-proxy/local/respnorm/respnorm.go
+ create mode 100644 services/nvpair-proxy/local/respnorm/respnorm_test.go
+ create mode 100644 services/nvpair-proxy/local/routing/notloaded.go
+ create mode 100644 services/nvpair-proxy/local/routing/routing.go
+ create mode 100644 services/nvpair-proxy/local/routing/routing_test.go
+ create mode 100644 services/nvpair-proxy/local_affinity_test.go
+ create mode 100644 services/nvpair-proxy/local_capacity.go
+ create mode 100644 services/nvpair-proxy/local_capacity_test.go
+ create mode 100644 services/nvpair-proxy/local_char_test.go
+ create mode 100644 services/nvpair-proxy/local_dircapacity_test.go
+ create mode 100644 services/nvpair-proxy/local_jit_test.go
+ create mode 100644 services/nvpair-proxy/local_p_test.go
+ create mode 100644 services/nvpair-proxy/local_proxy.go
+ create mode 100644 services/nvpair-proxy/local_proxy_test.go
+ create mode 100644 services/nvpair-proxy/local_slotscore_test.go
+
+diff --git a/services/nvpair-proxy/facade.go b/services/nvpair-proxy/facade.go
+index b53cfa3..13431b1 100644
+--- a/services/nvpair-proxy/facade.go
++++ b/services/nvpair-proxy/facade.go
+@@ -327,6 +327,7 @@ func (f *facade) replaceSubscribed(params json.RawMessage) {
+ 		slog.Warn("invalid discovery:nodes snapshot", "err", err)
+ 		return
+ 	}
++	f.host.local.observeNodes(f.profile.Name, res.Nodes) // fork:P2
+ 	nodes := make([]Node, 0, len(res.Nodes))
+ 	present := make(map[string]bool, len(res.Nodes))
+ 	for _, dn := range res.Nodes {
+diff --git a/services/nvpair-proxy/local/affinity/affinity.go b/services/nvpair-proxy/local/affinity/affinity.go
+new file mode 100644
+index 0000000..e72e1ab
+--- /dev/null
++++ b/services/nvpair-proxy/local/affinity/affinity.go
+@@ -0,0 +1,114 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package affinity
++
++import (
++	"encoding/json"
++	"net/http"
++	"strings"
++	"sync"
++	"time"
++)
++
++// Session affinity keeps one conversation's turns on the node that already
++// holds its KV/prompt cache, while distinct conversations still spread by load.
++const (
++	TTL     = 30 * time.Minute
++	MaxKeys = 4096
++)
++
++// Affinity decisions reported in the per-request log.
++const (
++	Hit    = "hit"    // bound node was eligible with a free slot (or not worse than all-full peers)
++	Miss   = "miss"   // key not seen before; bound to the load-picked node
++	Rebind = "rebind" // bound node unusable; fell back and rebound
++	Yield  = "yield"  // bound node full while another was free; moved
++)
++
++type entry struct {
++	nodeID  string
++	expires time.Time
++}
++
++// Table maps an affinity key to a node. The zero value is ready to use.
++type Table struct {
++	mu  sync.Mutex
++	m   map[string]entry
++	Now func() time.Time // test seam; nil means time.Now
++}
++
++func (t *Table) clock() time.Time {
++	if t.Now != nil {
++		return t.Now()
++	}
++	return time.Now()
++}
++
++// lookup returns the live binding for key, refreshing its TTL.
++func (t *Table) Lookup(key string) (string, bool) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	e, ok := t.m[key]
++	if !ok {
++		return "", false
++	}
++	now := t.clock()
++	if !now.Before(e.expires) {
++		delete(t.m, key)
++		return "", false
++	}
++	e.expires = now.Add(TTL)
++	t.m[key] = e
++	return e.nodeID, true
++}
++
++// bind records key -> nodeID, evicting expired entries and then arbitrary
++// ones when the table is full.
++func (t *Table) Bind(key, nodeID string) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.m == nil {
++		t.m = make(map[string]entry)
++	}
++	now := t.clock()
++	if _, exists := t.m[key]; !exists && len(t.m) >= MaxKeys {
++		for k, e := range t.m {
++			if !now.Before(e.expires) {
++				delete(t.m, k)
++			}
++		}
++		for k := range t.m {
++			if len(t.m) < MaxKeys {
++				break
++			}
++			delete(t.m, k)
++		}
++	}
++	t.m[key] = entry{nodeID: nodeID, expires: now.Add(TTL)}
++}
++
++// Len is how many keys are bound (expired ones included until swept).
++func (t *Table) Len() int {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	return len(t.m)
++}
++
++// Key extracts the per-conversation key for an inference request.
++// Codex sends a "thread-id" header that is distinct per thread, including each
++// spawned sub-agent, so it is preferred. The body's prompt_cache_key is a
++// fallback; for codex it is the root session id shared with sub-agents, so on
++// its own it would pin a whole agent tree to one node. Empty means no affinity.
++func Key(r *http.Request, body []byte) string {
++	if v := strings.TrimSpace(r.Header.Get("thread-id")); v != "" {
++		return v
++	}
++	var probe struct {
++		PromptCacheKey string `json:"prompt_cache_key"`
++	}
++	if json.Unmarshal(body, &probe) == nil && probe.PromptCacheKey != "" {
++		return probe.PromptCacheKey
++	}
++	return strings.TrimSpace(r.Header.Get("session-id"))
++}
+diff --git a/services/nvpair-proxy/local/affinity/affinity_test.go b/services/nvpair-proxy/local/affinity/affinity_test.go
+new file mode 100644
+index 0000000..6f0d99e
+--- /dev/null
++++ b/services/nvpair-proxy/local/affinity/affinity_test.go
+@@ -0,0 +1,44 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package affinity
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++)
++
++func TestAffinity_SizeCap(t *testing.T) {
++	var tbl Table
++	for i := 0; i < MaxKeys+10; i++ {
++		tbl.Bind(string(rune('a'+i%26))+time.Duration(i).String(), "n")
++	}
++	if len(tbl.m) > MaxKeys {
++		t.Fatalf("table grew to %d", len(tbl.m))
++	}
++}
++
++func TestAffinityKey(t *testing.T) {
++	req := func(h map[string]string) *http.Request {
++		r := httptest.NewRequest("POST", "/v1/responses", nil)
++		for k, v := range h {
++			r.Header.Set(k, v)
++		}
++		return r
++	}
++	body := []byte(`{"model":"m","prompt_cache_key":"root"}`)
++	if got := Key(req(map[string]string{"thread-id": "t1", "session-id": "root"}), body); got != "t1" {
++		t.Fatalf("thread-id should win, got %q", got)
++	}
++	if got := Key(req(nil), body); got != "root" {
++		t.Fatalf("prompt_cache_key fallback, got %q", got)
++	}
++	if got := Key(req(map[string]string{"session-id": "s"}), []byte(`{"model":"m"}`)); got != "s" {
++		t.Fatalf("session-id fallback, got %q", got)
++	}
++	if got := Key(req(nil), []byte(`{"model":"m"}`)); got != "" {
++		t.Fatalf("expected no key, got %q", got)
++	}
++}
+diff --git a/services/nvpair-proxy/local/capacity/capacity.go b/services/nvpair-proxy/local/capacity/capacity.go
+new file mode 100644
+index 0000000..d031287
+--- /dev/null
++++ b/services/nvpair-proxy/local/capacity/capacity.go
+@@ -0,0 +1,347 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package capacity
++
++// Package capacity is the fork's slot-capacity and residency source for the
++// proxy: node-settings overrides (env), the discovery directory, and their
++// layering. Moved from nvpair-proxy capacity.go/dircapacity.go in catch-up step 5.
++
++import (
++	"encoding/json"
++	"log/slog"
++	"os"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++
++	"nvpair-shared/engines"
++	"nvpair-shared/noderec"
++)
++
++// Residency is what the directory says about a model on a node's engine.
++type Residency int
++
++const (
++	// ResidencyUnknown: the engine reported nothing (legacy node, no sweep
++	// yet). Missing data is Unknown, never KnownEmpty.
++	ResidencyUnknown Residency = iota
++	// ResidencyKnownEmpty: the engine reported its loaded set and the model is
++	// not in it.
++	ResidencyKnownEmpty
++	// ResidencyLoaded: the engine reported the model loaded.
++	ResidencyLoaded
++)
++
++// Provider is where routing learns a node's capacity and residency.
++// Today the node-settings overrides below implement it; the directory-backed
++// implementation replaces them without touching routing.
++type Provider interface {
++	// Slots is how many requests the engine runs at once for the model;
++	// ok is false when unknown (routing then assumes 1).
++	Slots(nodeID, engine, model string) (slots int, ok bool)
++	// CtxPerSlot is the per-slot context window; ok is false when unknown.
++	CtxPerSlot(nodeID, engine, model string) (ctx int, ok bool)
++	// Residency reports whether the model is loaded, and when the directory
++	// observed that (zero time when not known).
++	Residency(nodeID, engine, model string) (r Residency, observedAt time.Time)
++	// JITLoad reports whether the engine loads a missing model on demand.
++	JITLoad(nodeID, engine string) bool
++}
++
++// Env names the environment variable carrying node-settings overrides
++// as one flat JSON object, e.g. {"engine_slots.lmstudio.qwen3.8-27b-mlx": 4}.
++const Env = "NVPAIR_PROXY_CAPACITY"
++
++// Settings serves slot counts from the flat node-settings keys
++// `engine_slots.<engine>.<model>`. The same value applies to every node.
++type Settings struct {
++	SlotsBy map[string]int  // "engine/model" -> slots
++	CtxBy   map[string]int  // "engine/model" -> context per slot
++	JITBy   map[string]bool // engine -> jit_load override
++}
++
++func (c Settings) Slots(_, engine, model string) (int, bool) {
++	n, ok := c.SlotsBy[engine+"/"+model]
++	return n, ok && n > 0
++}
++
++func (c Settings) CtxPerSlot(_, engine, model string) (int, bool) {
++	n, ok := c.CtxBy[engine+"/"+model]
++	return n, ok && n > 0
++}
++
++// Residency is always Unknown here: settings carry no loaded set.
++func (Settings) Residency(_, _, _ string) (Residency, time.Time) {
++	return ResidencyUnknown, time.Time{}
++}
++
++// JITLoad defaults to noderec.DefaultJITLoad (vLLM and LM Studio false).
++func (c Settings) JITLoad(_, engine string) bool {
++	if v, ok := c.JITBy[engine]; ok {
++		return v
++	}
++	return noderec.DefaultJITLoad(engine)
++}
++
++// ParseSettings reads the flat settings object. The model is
++// everything after the engine, so it may itself contain dots.
++func ParseSettings(raw map[string]json.RawMessage) Settings {
++	c := Settings{SlotsBy: map[string]int{}, CtxBy: map[string]int{}, JITBy: map[string]bool{}}
++	for k, v := range raw {
++		val := strings.Trim(string(v), `"`)
++		if engine, ok := strings.CutPrefix(k, "jit_load."); ok {
++			if b, err := strconv.ParseBool(val); err == nil && engine != "" {
++				c.JITBy[engine] = b
++			}
++			continue
++		}
++		dst := c.SlotsBy
++		rest, ok := strings.CutPrefix(k, "engine_slots.")
++		if !ok {
++			if rest, ok = strings.CutPrefix(k, "engine_ctx_per_slot."); !ok {
++				continue
++			}
++			dst = c.CtxBy
++		}
++		engine, model, ok := strings.Cut(rest, ".")
++		if !ok || engine == "" || model == "" {
++			continue
++		}
++		if n, err := strconv.Atoi(val); err == nil && n > 0 {
++			dst[engine+"/"+model] = n
++		}
++	}
++	return c
++}
++
++func FromEnv() Provider {
++	s := os.Getenv(Env)
++	if s == "" {
++		return nil
++	}
++	var raw map[string]json.RawMessage
++	if err := json.Unmarshal([]byte(s), &raw); err != nil {
++		slog.Warn("ignoring malformed capacity overrides", "env", Env, "err", err)
++		return nil
++	}
++	return ParseSettings(raw)
++}
++
++// OtherEngineLoader is the optional capability of a provider that knows what
++// the node's other engines have loaded.
++type OtherEngineLoader interface {
++	OtherEngineLoaded(nodeID, engine string) bool
++}
++
++// WithContextLength sets context_length on a model record to the fleet value,
++// replacing any upstream-supplied one; n <= 0 removes the field instead. A
++// record that is not a JSON object is returned unchanged.
++func WithContextLength(raw json.RawMessage, n int) json.RawMessage {
++	var obj map[string]json.RawMessage
++	if err := json.Unmarshal(raw, &obj); err != nil || obj == nil {
++		return raw
++	}
++	if n > 0 {
++		obj["context_length"] = json.RawMessage(strconv.Itoa(n))
++	} else {
++		delete(obj, "context_length")
++	}
++	out, err := json.Marshal(obj)
++	if err != nil {
++		return raw
++	}
++	return out
++}
++
++// entryRec is what the proxy keeps of one directory node for one engine. The
++// observation time is the node's own modelsObservedAt, which the scanner
++// advances (with a 30 s heartbeat) on every successful sweep.
++type entryRec struct {
++	node noderec.DirectoryNode
++}
++
++// Directory serves Provider from the latest directory
++// snapshot each facade receives. Safe for concurrent use.
++type Directory struct {
++	now func() time.Time
++	mu  sync.RWMutex
++	by  map[string]map[string]entryRec // engine -> nodeID -> entry
++}
++
++func NewDirectory(now func() time.Time) *Directory {
++	if now == nil {
++		now = time.Now
++	}
++	return &Directory{now: now, by: map[string]map[string]entryRec{}}
++}
++
++// update replaces the engine's view with the snapshot (a departed node simply
++// vanishes).
++func (d *Directory) Update(engine string, nodes []noderec.DirectoryNode) {
++	d.mu.Lock()
++	defer d.mu.Unlock()
++	next := make(map[string]entryRec, len(nodes))
++	for _, n := range nodes {
++		next[n.HostUUID] = entryRec{node: n}
++	}
++	d.by[engine] = next
++}
++
++// modelKey is the one place model names are compared for residency, slots and
++// context: Ollama's `m` and `m:latest` are the same model.
++func ModelKey(engine, model string) string {
++	model = strings.TrimSpace(model)
++	if engine != engines.NameOllama || model == "" {
++		return model
++	}
++	if name := model[strings.LastIndex(model, "/")+1:]; !strings.ContainsAny(name, ":@") {
++		return model + ":latest"
++	}
++	return model
++}
++
++func SlotInfoFor(n noderec.DirectoryNode, engine, model string) (noderec.SlotInfo, bool) {
++	want := ModelKey(engine, model)
++	for m, s := range n.SlotsByEngine[engine] {
++		if ModelKey(engine, m) == want {
++			return s, true
++		}
++	}
++	return noderec.SlotInfo{}, false
++}
++
++func (d *Directory) entry(nodeID, engine string) (entryRec, bool) {
++	d.mu.RLock()
++	defer d.mu.RUnlock()
++	e, ok := d.by[engine][nodeID]
++	return e, ok
++}
++
++func (d *Directory) Slots(nodeID, engine, model string) (int, bool) {
++	e, ok := d.entry(nodeID, engine)
++	if !ok {
++		return 0, false
++	}
++	s, ok := SlotInfoFor(e.node, engine, model)
++	return s.Slots, ok && s.Slots > 0
++}
++
++func (d *Directory) CtxPerSlot(nodeID, engine, model string) (int, bool) {
++	e, ok := d.entry(nodeID, engine)
++	if !ok {
++		return 0, false
++	}
++	s, ok := SlotInfoFor(e.node, engine, model)
++	return s.CtxPerSlot, ok && s.CtxPerSlot > 0
++}
++
++// Residency: engine key absent is Unknown; present without the model is
++// KnownEmpty; present with it is Loaded.
++func (d *Directory) Residency(nodeID, engine, model string) (Residency, time.Time) {
++	e, ok := d.entry(nodeID, engine)
++	if !ok {
++		return ResidencyUnknown, time.Time{}
++	}
++	loaded, present := e.node.LoadedByEngine[engine]
++	if !present {
++		return ResidencyUnknown, time.Time{}
++	}
++	loaded = ServedLoaded(e.node, engine, loaded)
++	want := ModelKey(engine, model)
++	var observed time.Time
++	if ms := e.node.ModelsObservedAt; ms > 0 {
++		observed = time.UnixMilli(ms)
++	}
++	for _, m := range loaded {
++		if ModelKey(engine, m) == want {
++			return ResidencyLoaded, observed
++		}
++	}
++	return ResidencyKnownEmpty, observed
++}
++
++func (d *Directory) JITLoad(nodeID, engine string) bool {
++	if e, ok := d.entry(nodeID, engine); ok {
++		if v, ok := e.node.JITLoadByEngine[engine]; ok {
++			return v
++		}
++	}
++	return noderec.DefaultJITLoad(engine)
++}
++
++// Override layers explicit node-settings overrides (env) over a base
++// provider: an override wins where it has a value, residency is always the base's.
++type Override struct {
++	Over Settings
++	Base Provider
++}
++
++func (o Override) Slots(n, e, m string) (int, bool) {
++	if v, ok := o.Over.Slots(n, e, m); ok {
++		return v, true
++	}
++	return o.Base.Slots(n, e, m)
++}
++
++func (o Override) CtxPerSlot(n, e, m string) (int, bool) {
++	if v, ok := o.Over.CtxPerSlot(n, e, m); ok {
++		return v, true
++	}
++	return o.Base.CtxPerSlot(n, e, m)
++}
++
++func (o Override) Residency(n, e, m string) (Residency, time.Time) {
++	return o.Base.Residency(n, e, m)
++}
++
++func (o Override) JITLoad(n, e string) bool {
++	if v, ok := o.Over.JITBy[e]; ok {
++		return v
++	}
++	return o.Base.JITLoad(n, e)
++}
++
++// Layer makes the directory the default and lets the env overrides
++// (nil when unset) win where they carry a value.
++func Layer(env Provider, dir *Directory) Provider {
++	if s, ok := env.(Settings); ok {
++		return Override{Over: s, Base: dir}
++	}
++	return dir
++}
++
++// OtherEngineLoaded reports whether any engine on the node other than engine
++// has a loaded model, per the directory's loadedByEngine.
++func (d *Directory) OtherEngineLoaded(nodeID, engine string) bool {
++	e, ok := d.entry(nodeID, engine)
++	if !ok {
++		return false
++	}
++	for eng, models := range e.node.LoadedByEngine {
++		if eng != engine && len(models) > 0 {
++			return true
++		}
++	}
++	return false
++}
++
++func (o Override) OtherEngineLoaded(n, e string) bool {
++	x, ok := o.Base.(OtherEngineLoader)
++	return ok && x.OtherEngineLoaded(n, e)
++}
++
++// ServedLoaded is the loaded set directory residency compares a request's
++// model with. A loaded-only engine (vLLM by name, or any engine the node gives a
++// downloadedByEngine entry; the name alone covers a failed disk-inventory read,
++// which omits that entry) names its loadedByEngine models by --model root (NVIDIA #181),
++// but a request names the served model, which is what its modelsByEngine
++// advertises; a stopped one advertises nothing, so nothing is loaded. Any
++// other engine keeps loadedByEngine.
++func ServedLoaded(n noderec.DirectoryNode, engine string, loaded []string) []string {
++	if _, loadedOnly := n.DownloadedByEngine[engine]; loadedOnly || engine == engines.NameVLLM {
++		return n.ModelsByEngine[engine]
++	}
++	return loaded
++}
+diff --git a/services/nvpair-proxy/local/respnorm/respnorm.go b/services/nvpair-proxy/local/respnorm/respnorm.go
+new file mode 100644
+index 0000000..59de12d
+--- /dev/null
++++ b/services/nvpair-proxy/local/respnorm/respnorm.go
+@@ -0,0 +1,125 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package respnorm
++
++import (
++	"bytes"
++	"encoding/json"
++)
++
++// Normalize rewrites a /v1/responses body so that developer/system
++// messages appearing after the leading run of system/developer items become
++// user messages prefixed with "[developer]\n". Some backend chat templates
++// (e.g. Qwen's) reject a system message anywhere but the start. Everything
++// else is left byte-identical; on any parse problem or no-op the original
++// bytes are returned.
++func Normalize(body []byte) []byte {
++	var top map[string]json.RawMessage
++	if err := json.Unmarshal(body, &top); err != nil {
++		return body
++	}
++	rawInput, ok := top["input"]
++	if !ok {
++		return body
++	}
++	var items []json.RawMessage
++	if err := json.Unmarshal(rawInput, &items); err != nil {
++		return body // string input, null, or other shape
++	}
++	leading := true
++	changed := false
++	for i, it := range items {
++		var m map[string]json.RawMessage
++		if json.Unmarshal(it, &m) != nil {
++			leading = false
++			continue
++		}
++		var typ, role string
++		_ = json.Unmarshal(m["type"], &typ)
++		_ = json.Unmarshal(m["role"], &role)
++		isMsg := (typ == "message" || (typ == "" && m["role"] != nil)) && m["role"] != nil
++		isSys := isMsg && (role == "developer" || role == "system")
++		if leading && isSys {
++			continue
++		}
++		leading = false
++		if !isSys || typ != "message" {
++			continue
++		}
++		if !rewriteDeveloperItem(m) {
++			continue
++		}
++		out, err := json.Marshal(m)
++		if err != nil {
++			return body
++		}
++		items[i] = out
++		changed = true
++	}
++	if !changed {
++		return body
++	}
++	newInput, err := json.Marshal(items)
++	if err != nil {
++		return body
++	}
++	// Splice the new input value over the old one so other top-level fields
++	// keep their order and bytes.
++	idx := bytes.Index(body, rawInput)
++	if idx < 0 || bytes.Count(body, rawInput) != 1 {
++		top["input"] = newInput
++		out, err := json.Marshal(top)
++		if err != nil {
++			return body
++		}
++		return out
++	}
++	out := make([]byte, 0, len(body)+len(newInput))
++	out = append(out, body[:idx]...)
++	out = append(out, newInput...)
++	out = append(out, body[idx+len(rawInput):]...)
++	return out
++}
++
++const developerPrefix = "[developer]\n"
++
++// rewriteDeveloperItem sets role=user and prefixes the first text part.
++func rewriteDeveloperItem(m map[string]json.RawMessage) bool {
++	m["role"] = json.RawMessage(`"user"`)
++	var s string
++	if json.Unmarshal(m["content"], &s) == nil {
++		b, _ := json.Marshal(developerPrefix + s)
++		m["content"] = b
++		return true
++	}
++	var parts []json.RawMessage
++	if json.Unmarshal(m["content"], &parts) != nil {
++		return false
++	}
++	for i, p := range parts {
++		var pm map[string]json.RawMessage
++		if json.Unmarshal(p, &pm) != nil {
++			continue
++		}
++		var text string
++		if json.Unmarshal(pm["text"], &text) != nil {
++			continue
++		}
++		tb, _ := json.Marshal(developerPrefix + text)
++		pm["text"] = tb
++		pm["type"] = json.RawMessage(`"input_text"`)
++		nb, err := json.Marshal(pm)
++		if err != nil {
++			return false
++		}
++		parts[i] = nb
++		cb, err := json.Marshal(parts)
++		if err != nil {
++			return false
++		}
++		m["content"] = cb
++		return true
++	}
++	return false
++}
+diff --git a/services/nvpair-proxy/local/respnorm/respnorm_test.go b/services/nvpair-proxy/local/respnorm/respnorm_test.go
+new file mode 100644
+index 0000000..d6c7309
+--- /dev/null
++++ b/services/nvpair-proxy/local/respnorm/respnorm_test.go
+@@ -0,0 +1,30 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package respnorm
++
++import "testing"
++
++func TestNormalizeResponsesInput(t *testing.T) {
++	cases := []struct{ name, in, want string }{
++		{"no mid developer", `{"model":"m","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`, ""},
++		{"leading kept", `{"input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"sys"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`, ""},
++		{"mid converted", `{"model":"m","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"a"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"b"}]}]}`,
++			`{"model":"m","input":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"a"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"content":[{"text":"[developer]\nb","type":"input_text"}],"role":"user","type":"message"}]}`},
++		{"unknown fields preserved", `{"z":1,"input":[{"type":"function_call","name":"f","x":[1,2]},{"type":"message","role":"system","content":[{"type":"input_text","text":"b"}]}],"a":{"k":2}}`,
++			`{"z":1,"input":[{"type":"function_call","name":"f","x":[1,2]},{"content":[{"text":"[developer]\nb","type":"input_text"}],"role":"user","type":"message"}],"a":{"k":2}}`},
++		{"string input", `{"input":"hello"}`, ""},
++		{"invalid json", `{"input":[`, ""},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			want := c.want
++			if want == "" {
++				want = c.in
++			}
++			if got := string(Normalize([]byte(c.in))); got != want {
++				t.Fatalf("got  %s\nwant %s", got, want)
++			}
++		})
++	}
++}
+diff --git a/services/nvpair-proxy/local/routing/notloaded.go b/services/nvpair-proxy/local/routing/notloaded.go
+new file mode 100644
+index 0000000..19c2735
+--- /dev/null
++++ b/services/nvpair-proxy/local/routing/notloaded.go
+@@ -0,0 +1,75 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package routing
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net/http"
++	"regexp"
++	"time"
++
++	"nvpair-shared/engines"
++)
++
++// notLoadedMaxBody bounds how much of an error body is read to classify it.
++const notLoadedMaxBody = 4096
++
++// notLoadedPatterns match (Ollama's quotes arrive JSON-escaped) each engine's "that model is not loaded" refusal.
++var notLoadedPatterns = map[string]*regexp.Regexp{
++	engines.NameLMStudio: regexp.MustCompile(`(?i)No models loaded`),
++	engines.NameOllama:   regexp.MustCompile(`model \\?"[^"]*\\?" not found`),
++	engines.NameLlamaCPP: regexp.MustCompile(`(?i)model .* not (found|loaded)`),
++}
++
++// errReader replays a read failure after the bytes already read.
++type errReader struct{ err error }
++
++func (e errReader) Read([]byte) (int, error) { return 0, e.err }
++
++// ClassifyNotLoaded reports whether resp is the engine refusing a model that
++// is not loaded. It reads the body only when it is 4 KB or less, and leaves
++// resp.Body byte-identical to what the upstream sent. The read is abandoned
++// when ctx ends or budget elapses, so a silent upstream cannot hold the
++// request's reservation before commit; the body then carries that error. A
++// read that fails part-way never classifies, and its failure is replayed.
++// timeoutErr is what the body carries when budget elapses.
++func ClassifyNotLoaded(ctx context.Context, engine string, resp *http.Response, budget time.Duration, timeoutErr error) bool {
++	re := notLoadedPatterns[engine]
++	if re == nil || resp.Body == nil {
++		return false
++	}
++	orig := resp.Body
++	type result struct {
++		buf []byte
++		err error
++	}
++	ch := make(chan result, 1) // buffered: the reader can always finish
++	go func() {
++		buf, err := io.ReadAll(io.LimitReader(orig, notLoadedMaxBody+1))
++		ch <- result{buf, err}
++	}()
++	timer := time.NewTimer(budget)
++	defer timer.Stop()
++	var res result
++	select {
++	case res = <-ch:
++	case <-ctx.Done():
++		res.err = ctx.Err()
++	case <-timer.C:
++		res.err = timeoutErr
++	}
++	tail := io.Reader(orig)
++	if res.err != nil {
++		// Closing unblocks a still-pending read; the caller sees the failure.
++		_ = orig.Close()
++		tail = errReader{res.err}
++	}
++	resp.Body = struct {
++		io.Reader
++		io.Closer
++	}{io.MultiReader(bytes.NewReader(res.buf), tail), orig}
++	return res.err == nil && len(res.buf) <= notLoadedMaxBody && re.Match(res.buf)
++}
+diff --git a/services/nvpair-proxy/local/routing/routing.go b/services/nvpair-proxy/local/routing/routing.go
+new file mode 100644
+index 0000000..25b5647
+--- /dev/null
++++ b/services/nvpair-proxy/local/routing/routing.go
+@@ -0,0 +1,74 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++// Package routing is the fork's slot-aware candidate ranking for nvpair-proxy.
++// It knows nothing about the proxy's own types: package main glue
++// (local_proxy.go) converts its candidates to Candidate values and back.
++package routing
++
++// Candidate is one scheduler-listed node as the slot-aware ranking sees it.
++type Candidate struct {
++	ID    string
++	Order int // position in the scheduler's priority list
++	Slots int // concurrent requests the engine serves for the model; >= 1
++	Occ   int // requests occupying those slots now
++	// GPU is the scheduler's GPU pressure plus this proxy's reservations
++	// through any engine's facade (they share the GPU, not the slots).
++	GPU   int
++	Local bool // this host's own node
++	// Cooling is NVIDIA's #144 first-byte cooldown (coolingSet).
++	Cooling bool
++}
++
++// Full reports whether every slot is occupied.
++func (c Candidate) Full() bool { return c.Occ >= c.Slots }
++
++// queue is occupancy per slot, or, when full, the queue a new request would
++// join: (occ-slots+1)/slots.
++func (c Candidate) queue() float64 {
++	slots, occ := float64(c.Slots), float64(c.Occ)
++	if occ >= slots {
++		return (occ - slots + 1) / slots
++	}
++	return occ / slots
++}
++
++// Better reports whether a ranks ahead of b. Keys, outermost first:
++//
++//  1. not cooling: NVIDIA's cooldown demotion is the outer stable partition,
++//     so a cooling node never outranks a non-cooling one, whatever its slots
++//     (the same rule NVIDIA's reserveCandidate applies to load);
++//  2. a free slot;
++//  3. lower queue per slot;
++//  4. lower GPU pressure;
++//  5. the local node;
++//  6. scheduler order.
++func Better(a, b Candidate) bool {
++	if a.Cooling != b.Cooling {
++		return !a.Cooling
++	}
++	if af, bf := a.Full(), b.Full(); af != bf {
++		return !af
++	}
++	if aq, bq := a.queue(), b.queue(); aq != bq {
++		return aq < bq
++	}
++	if a.GPU != b.GPU {
++		return a.GPU < b.GPU
++	}
++	if a.Local != b.Local {
++		return a.Local
++	}
++	return a.Order < b.Order
++}
++
++// Best returns the index of the best candidate, or -1 when cs is empty.
++func Best(cs []Candidate) int {
++	best := -1
++	for i, c := range cs {
++		if best < 0 || Better(c, cs[best]) {
++			best = i
++		}
++	}
++	return best
++}
+diff --git a/services/nvpair-proxy/local/routing/routing_test.go b/services/nvpair-proxy/local/routing/routing_test.go
+new file mode 100644
+index 0000000..cbdf646
+--- /dev/null
++++ b/services/nvpair-proxy/local/routing/routing_test.go
+@@ -0,0 +1,38 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package routing
++
++import "testing"
++
++// NVIDIA's cooldown is the outer partition: a cooling node with a free slot
++// still ranks behind a full, non-cooling one; within a partition the
++// slot-aware keys decide.
++func TestBetterCoolingIsOuterPartition(t *testing.T) {
++	coolFree := Candidate{ID: "cool", Order: 0, Slots: 4, Cooling: true}
++	warmFull := Candidate{ID: "warm", Order: 1, Slots: 1, Occ: 3}
++	if !Better(warmFull, coolFree) || Better(coolFree, warmFull) {
++		t.Fatal("cooling node outranked a non-cooling one")
++	}
++	warmFree := Candidate{ID: "free", Order: 2, Slots: 1}
++	if got := Best([]Candidate{coolFree, warmFull, warmFree}); got != 2 {
++		t.Fatalf("best = %d, want the free non-cooling node", got)
++	}
++	if got := Best([]Candidate{coolFree, {ID: "cool2", Order: 1, Slots: 1, Occ: 1, Cooling: true}}); got != 0 {
++		t.Fatalf("all cooling: best = %d, want the free one", got)
++	}
++	if Best(nil) != -1 {
++		t.Fatal("empty")
++	}
++}
++
++func TestBetterTieBreaks(t *testing.T) {
++	a := Candidate{ID: "a", Order: 0, Slots: 1}
++	local := Candidate{ID: "l", Order: 1, Slots: 1, Local: true}
++	if !Better(local, a) {
++		t.Fatal("local should win an idle tie ahead of scheduler order")
++	}
++	if !Better(Candidate{Order: 1, Slots: 1, GPU: 0}, Candidate{Order: 0, Slots: 1, GPU: 1, Local: true}) {
++		t.Fatal("lower GPU pressure should beat locality")
++	}
++}
+diff --git a/services/nvpair-proxy/local_affinity_test.go b/services/nvpair-proxy/local_affinity_test.go
+new file mode 100644
+index 0000000..ead2db5
+--- /dev/null
++++ b/services/nvpair-proxy/local_affinity_test.go
+@@ -0,0 +1,239 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"context"
++	"log/slog"
++	"net/http/httptest"
++	"nvpair-proxy/local/affinity"
++	"sync"
++	"testing"
++	"time"
++
++	"nvpair-shared/schedulerwire"
++)
++
++func affinityProxy(t *testing.T, ids ...string) *Proxy {
++	t.Helper()
++	p := withLocal(prProxy(t))
++	ranks := make([]schedulerwire.NodeRank, 0, len(ids))
++	for i, id := range ids {
++		ranks = append(ranks, schedulerwire.NodeRank{ID: id, Rank: i})
++	}
++	applySnapshot(p, schedulerwire.Priority{Nodes: ids, Ranks: ranks})
++	return p
++}
++
++// pick reserves for key over ids and returns the chosen node and the decision.
++func pick(p *Proxy, key string, ids ...string) (string, string) {
++	out, _, d := p.reserveCandidateKey(p.soleFacade(), reservationCandidates(ids...), key)
++	return out[0].id, d
++}
++
++// turn is a finished request: reserve, then release, so the slot is free again.
++func turn(p *Proxy, key string, ids ...string) (string, string) {
++	out, res, d := p.reserveCandidateKey(p.soleFacade(), reservationCandidates(ids...), key)
++	p.releaseReservation(res)
++	return out[0].id, d
++}
++
++func TestAffinity_SequentialTurnsAllHit(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	first, _ := turn(p, "conv", "a", "b")
++	for i := 0; i < 5; i++ {
++		if got, d := turn(p, "conv", "a", "b"); got != first || d != affinity.Hit {
++			t.Fatalf("turn %d: %s/%s, want %s/hit", i, got, d, first)
++		}
++	}
++}
++
++func TestAffinity_YieldsToFreeNode(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	first, _ := pick(p, "conv", "a", "b") // slot stays held
++	other := map[string]string{"a": "b", "b": "a"}[first]
++	if got, d := pick(p, "conv", "a", "b"); got != other || d != affinity.Yield {
++		t.Fatalf("got %s/%s, want %s/yield", got, d, other)
++	}
++	if got, d := turn(p, "conv", "a", "b"); got != other || d != affinity.Hit {
++		t.Fatalf("not rebound: %s/%s", got, d)
++	}
++}
++
++func TestAffinity_AllFullTolerance(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	p.local.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1}}
++	bound, _ := pick(p, "conv", "a", "b")
++	other := map[string]string{"a": "b", "b": "a"}[bound]
++	pick(p, "x", "a", "b") // fills the other node
++	// 1 vs 1: within tolerance, stay on the bound node.
++	if got, d := pick(p, "conv", "a", "b"); got != bound || d != affinity.Hit {
++		t.Fatalf("within tolerance: %s/%s", got, d)
++	}
++	// Bound now holds 2 against 1 on the other: 2 <= 1+1 still stays.
++	pick(p, "conv", "a", "b")
++	// 3 against 1 is outside the tolerance: go to the shorter queue.
++	if got, d := pick(p, "conv", "a", "b"); got != other || d != affinity.Rebind {
++		t.Fatalf("outside tolerance: %s/%s, want %s/rebind", got, d, other)
++	}
++}
++
++func TestAffinity_SameKeyStaysOnNode(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	first, d1 := turn(p, "conv-1", "a", "b")
++	second, d2 := turn(p, "conv-1", "a", "b")
++	if first != second || d1 != affinity.Miss || d2 != affinity.Hit {
++		t.Fatalf("got %s/%s then %s/%s", first, d1, second, d2)
++	}
++}
++
++func TestAffinity_DifferentKeysSpread(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	n1, _ := pick(p, "conv-1", "a", "b")
++	n2, _ := pick(p, "conv-2", "a", "b")
++	if n1 == n2 {
++		t.Fatalf("both conversations landed on %s", n1)
++	}
++}
++
++func TestAffinity_FallsBackAndRebinds(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	bound, _ := pick(p, "conv-1", "a", "b")
++	other := map[string]string{"a": "b", "b": "a"}[bound]
++	// Bound node lost the model: absent from the candidate list.
++	got, d := pick(p, "conv-1", other)
++	if got != other || d != affinity.Rebind {
++		t.Fatalf("got %s/%s, want %s/rebind", got, d, other)
++	}
++	// Rebound: the next turn sticks to the new node.
++	if got, d = pick(p, "conv-1", "a", "b"); got != other || d != affinity.Hit {
++		t.Fatalf("after rebind got %s/%s, want %s/hit", got, d, other)
++	}
++	// Bound node no longer reservable (dropped from the scheduler list).
++	p2 := affinityProxy(t, "a", "b")
++	b2, _ := pick(p2, "k", "a", "b")
++	live := map[string]string{"a": "b", "b": "a"}[b2]
++	applySnapshot(p2, schedulerwire.Priority{Nodes: []string{live}, Ranks: []schedulerwire.NodeRank{{ID: live}}})
++	if got, d = pick(p2, "k", "a", "b"); got != live || d != affinity.Rebind {
++		t.Fatalf("unreservable: got %s/%s, want %s/rebind", got, d, live)
++	}
++}
++
++func TestAffinity_NoKeyUnchanged(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	n1, d1 := pick(p, "", "a", "b")
++	n2, d2 := pick(p, "", "a", "b")
++	if n1 == n2 || d1 != "" || d2 != "" {
++		t.Fatalf("keyless requests should spread without a decision: %s/%q %s/%q", n1, d1, n2, d2)
++	}
++	if p.local.affinity.Len() != 0 {
++		t.Fatalf("keyless request created a binding")
++	}
++}
++
++func TestAffinity_TTLExpiryAndRefresh(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	now := time.Unix(1000, 0)
++	p.local.affinity.Now = func() time.Time { return now }
++	turn(p, "k", "a", "b")
++	now = now.Add(affinity.TTL - time.Second)
++	if _, d := turn(p, "k", "a", "b"); d != affinity.Hit {
++		t.Fatalf("within TTL: %s", d)
++	}
++	now = now.Add(affinity.TTL - time.Second) // refreshed by the hit above
++	if _, d := turn(p, "k", "a", "b"); d != affinity.Hit {
++		t.Fatalf("TTL not refreshed on use: %s", d)
++	}
++	now = now.Add(affinity.TTL + time.Second)
++	if _, d := pick(p, "k", "a", "b"); d != affinity.Miss {
++		t.Fatalf("after TTL: %s", d)
++	}
++}
++
++// reportGate is a slog handler that parks the first "proxy request complete"
++// record (the first statement of the handler's reporting defer, before any
++// codec write) so a test can act while that request is still in reporting. It
++// also records the node and affinity decision of every completion.
++type reportGate struct {
++	blocked chan struct{}
++	release chan struct{}
++	mu      sync.Mutex
++	done    [][2]string // node_id, affinity
++}
++
++func (g *reportGate) Enabled(context.Context, slog.Level) bool { return true }
++func (g *reportGate) WithAttrs([]slog.Attr) slog.Handler       { return g }
++func (g *reportGate) WithGroup(string) slog.Handler            { return g }
++func (g *reportGate) Handle(_ context.Context, r slog.Record) error {
++	if r.Message != "proxy request complete" {
++		return nil
++	}
++	var rec [2]string
++	r.Attrs(func(a slog.Attr) bool {
++		switch a.Key {
++		case "node_id":
++			rec[0] = a.Value.String()
++		case "affinity":
++			rec[1] = a.Value.String()
++		}
++		return true
++	})
++	g.mu.Lock()
++	g.done = append(g.done, rec)
++	first := len(g.done) == 1
++	g.mu.Unlock()
++	if first {
++		close(g.blocked)
++		<-g.release
++	}
++	return nil
++}
++
++// #17: the slot claim must be released once the response is copied, not after
++// reporting, or the next turn of the conversation yields off its bound node.
++func TestAffinity_SlotReleasedBeforeReporting(t *testing.T) {
++	tc := anyCase(t)
++	g := &reportGate{blocked: make(chan struct{}), release: make(chan struct{})}
++	prev := slog.Default()
++	slog.SetDefault(slog.New(g))
++	t.Cleanup(func() { slog.SetDefault(prev) })
++	disc := NewDiscovery()
++	for _, id := range []string{"a", "b"} {
++		srv, _ := newCountingServer(t, 200, "ok")
++		disc.AddManual(nodeForModel(t, id, srv, tc.advertisedModel))
++	}
++	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
++	p.local.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1}}
++	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b"}, Ranks: []schedulerwire.NodeRank{{ID: "a"}, {ID: "b", Rank: 1}}})
++	f := p.soleFacade()
++	send := func() {
++		req := tc.inferenceRequest()
++		req.Header.Set("thread-id", "conv")
++		f.handleHTTP(httptest.NewRecorder(), req)
++	}
++	var unblock sync.Once
++	open := func() { unblock.Do(func() { close(g.release) }) }
++	t.Cleanup(open) // a regression must fail fast, not leave a handler parked
++	wait := func(ch <-chan struct{}, what string) {
++		t.Helper()
++		select {
++		case <-ch:
++		case <-time.After(5 * time.Second):
++			t.Fatalf("timed out waiting for %s", what)
++		}
++	}
++	run := func() <-chan struct{} {
++		c := make(chan struct{})
++		go func() { defer close(c); send() }()
++		return c
++	}
++	first := run()
++	wait(g.blocked, "first request to reach reporting") // response copied; parked in reporting
++	wait(run(), "second request to complete")
++	open()
++	wait(first, "first request to complete")
++	if len(g.done) != 2 || g.done[1][1] != affinity.Hit || g.done[1][0] != g.done[0][0] {
++		t.Fatalf("second turn was not an affinity hit on the same node: %v", g.done)
++	}
++}
+diff --git a/services/nvpair-proxy/local_capacity.go b/services/nvpair-proxy/local_capacity.go
+new file mode 100644
+index 0000000..44ed350
+--- /dev/null
++++ b/services/nvpair-proxy/local_capacity.go
+@@ -0,0 +1,204 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++// Fork glue (catch-up step 5): residency eligibility, JIT claims and
++// not-loaded suppression on localState. Capacity sources live in
++// local/capacity; this file only reads them.
++
++import (
++	"time"
++
++	"nvpair-proxy/local/capacity"
++)
++
++// nodeSlots is the slot count routing uses: the provider's answer, else 1.
++func (s *localState) nodeSlots(nodeID, engine, model string) int {
++	if s.capacity != nil {
++		if n, ok := s.capacity.Slots(nodeID, engine, model); ok && n > 0 {
++			return n
++		}
++	}
++	return 1
++}
++
++// eligible reports whether a node may be sent a request for the model: it has
++// it loaded, nothing is known (legacy node), or it is known empty but loads on
++// demand. A node that just refused the model as not loaded is skipped for
++// suppressTTL unless a newer directory sweep shows it loaded.
++func (s *localState) eligible(nodeID, engine, model string) bool {
++	r, seen := ResidencyUnknown, time.Time{}
++	if s.capacity != nil {
++		r, seen = s.capacity.Residency(nodeID, engine, model)
++	}
++	if at, ok := s.suppressedAt(inflightKey{engine, model, nodeID}); ok {
++		if r != ResidencyLoaded || !seen.After(at) {
++			return false
++		}
++	}
++	if s.capacity == nil {
++		return true
++	}
++	if r != ResidencyKnownEmpty {
++		return true
++	}
++	// A JIT load would put a second large model on a node whose other engine
++	// already holds one; the proxy has no sizes, so any loaded model counts.
++	if o, ok := s.capacity.(capacity.OtherEngineLoader); ok && o.OtherEngineLoaded(nodeID, engine) {
++		return false
++	}
++	if !s.capacity.JITLoad(nodeID, engine) {
++		return false
++	}
++	// A JIT load already dispatched here for another engine or model would
++	// make this a second one. The claim is in-process only: concurrent cold
++	// requests through other proxies are out of scope (runbook covers them).
++	return !s.jitClaimedByOther(nodeID, engine, model)
++}
++
++type jitClaim struct{ engine, model string }
++
++// jitReleaseCap bounds how long a released claim stays effective, so a dead
++// scanner cannot wedge a node.
++const jitReleaseCap = 2 * time.Minute
++
++// jitClaimedByOther reports whether a live JIT claim on the node is for a
++// different engine or model. A claim whose request ended stays live until the
++// directory reports a sweep newer than the release (so the load shows as
++// Loaded) or jitReleaseCap passes.
++func (s *localState) jitClaimedByOther(nodeID, engine, model string) bool {
++	s.claimMu.Lock()
++	defer s.claimMu.Unlock()
++	other := func(c jitClaim) bool {
++		return c.engine != engine || capacity.ModelKey(c.engine, c.model) != capacity.ModelKey(engine, model)
++	}
++	for c, n := range s.jitClaims[nodeID] {
++		if n > 0 && other(c) {
++			return true
++		}
++	}
++	now := s.clock()
++	for c, t := range s.jitReleased[nodeID] {
++		expired := now.Sub(t) >= jitReleaseCap
++		if !expired && s.capacity != nil {
++			if _, seen := s.capacity.Residency(nodeID, c.engine, c.model); seen.After(t) {
++				expired = true
++			}
++		}
++		if expired {
++			delete(s.jitReleased[nodeID], c) // lazy cleanup
++			continue
++		}
++		if other(c) {
++			return true
++		}
++	}
++	if len(s.jitReleased[nodeID]) == 0 {
++		delete(s.jitReleased, nodeID)
++	}
++	return false
++}
++
++// LIMITATIONS (documented, not fixed): the JIT claim is in-process, so an
++// engine-manager pinned load and a proxy JIT load on the same node are not
++// coordinated across processes. Clearing an uncertain load elsewhere is a
++// bounded heuristic, not a guarantee.
++
++// claimJIT records a dispatch to a KnownEmpty+JIT node and reports whether it
++// did, so the matching release is exact. Released when the request ends.
++func (s *localState) claimJIT(nodeID, engine, model string) bool {
++	if s.capacity == nil {
++		return false
++	}
++	if r, _ := s.capacity.Residency(nodeID, engine, model); r != ResidencyKnownEmpty || !s.capacity.JITLoad(nodeID, engine) {
++		return false
++	}
++	s.claimMu.Lock()
++	defer s.claimMu.Unlock()
++	if s.jitClaims == nil {
++		s.jitClaims = map[string]map[jitClaim]int{}
++	}
++	if s.jitClaims[nodeID] == nil {
++		s.jitClaims[nodeID] = map[jitClaim]int{}
++	}
++	s.jitClaims[nodeID][jitClaim{engine, model}]++
++	return true
++}
++
++func (s *localState) releaseJIT(nodeID, engine, model string) {
++	s.claimMu.Lock()
++	defer s.claimMu.Unlock()
++	c := jitClaim{engine, model}
++	if s.jitClaims[nodeID][c] <= 1 {
++		delete(s.jitClaims[nodeID], c)
++		if s.jitReleased == nil {
++			s.jitReleased = map[string]map[jitClaim]time.Time{}
++		}
++		if s.jitReleased[nodeID] == nil {
++			s.jitReleased[nodeID] = map[jitClaim]time.Time{}
++		}
++		s.jitReleased[nodeID][c] = s.clock()
++		if len(s.jitClaims[nodeID]) == 0 {
++			delete(s.jitClaims, nodeID)
++		}
++	} else {
++		s.jitClaims[nodeID][c]--
++	}
++}
++
++// suppressTTL is how long a not-loaded refusal keeps a node out of routing.
++const suppressTTL = 60 * time.Second
++
++func (s *localState) clock() time.Time {
++	if s.now != nil {
++		return s.now()
++	}
++	return time.Now()
++}
++
++// suppress records that node refused model as not loaded.
++func (s *localState) suppress(k inflightKey) {
++	s.suppressMu.Lock()
++	defer s.suppressMu.Unlock()
++	if s.suppressed == nil {
++		s.suppressed = make(map[inflightKey]time.Time)
++	}
++	s.suppressed[k] = s.clock()
++}
++
++// suppressedAt returns when a live suppression began.
++func (s *localState) suppressedAt(k inflightKey) (time.Time, bool) {
++	s.suppressMu.Lock()
++	defer s.suppressMu.Unlock()
++	at, ok := s.suppressed[k]
++	if ok && s.clock().Sub(at) >= suppressTTL {
++		delete(s.suppressed, k)
++		return time.Time{}, false
++	}
++	return at, ok
++}
++
++// minContextLength is the smallest per-slot context over every node that
++// listed the model and is eligible for it (Loaded, Unknown or JIT). It is
++// false when no node qualifies or when any eligible node has no value: a
++// client that needs a safe window must not be handed an optimistic one.
++func (s *localState) minContextLength(engine, model string, nodeIDs []string) (int, bool) {
++	if s.capacity == nil {
++		return 0, false
++	}
++	min, any := 0, false
++	for _, id := range nodeIDs {
++		if !s.eligible(id, engine, model) {
++			continue
++		}
++		n, ok := s.capacity.CtxPerSlot(id, engine, model)
++		if !ok || n <= 0 {
++			return 0, false
++		}
++		if !any || n < min {
++			min, any = n, true
++		}
++	}
++	return min, any
++}
+diff --git a/services/nvpair-proxy/local_capacity_test.go b/services/nvpair-proxy/local_capacity_test.go
+new file mode 100644
+index 0000000..628d701
+--- /dev/null
++++ b/services/nvpair-proxy/local_capacity_test.go
+@@ -0,0 +1,41 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"encoding/json"
++	"nvpair-proxy/local/capacity"
++	"testing"
++	"time"
++)
++
++// fakeCap is a CapacityProvider keyed by node id.
++type fakeCap struct {
++	slots map[string]int
++	res   map[string]Residency
++	jit   map[string]bool
++	seen  time.Time
++}
++
++func (f *fakeCap) Slots(id, _, _ string) (int, bool)             { n, ok := f.slots[id]; return n, ok }
++func (f *fakeCap) CtxPerSlot(string, string, string) (int, bool) { return 0, false }
++func (f *fakeCap) Residency(id, _, _ string) (Residency, time.Time) {
++	return f.res[id], f.seen
++}
++func (f *fakeCap) JITLoad(id, _ string) bool { return f.jit[id] }
++
++func TestParseCapacitySettings(t *testing.T) {
++	var raw map[string]json.RawMessage
++	_ = json.Unmarshal([]byte(`{"engine_slots.lmstudio.qwen3.8-27b-mlx":4,"engine_ctx_per_slot.lmstudio.m":"8192","jit_load.ollama":false}`), &raw)
++	c := capacity.ParseSettings(raw)
++	if n, ok := c.Slots("n", "lmstudio", "qwen3.8-27b-mlx"); !ok || n != 4 {
++		t.Fatalf("slots = %d %v", n, ok)
++	}
++	if n, ok := c.CtxPerSlot("n", "lmstudio", "m"); !ok || n != 8192 {
++		t.Fatalf("ctx = %d %v", n, ok)
++	}
++	if c.JITLoad("n", "ollama") || c.JITLoad("n", "lmstudio") || !c.JITLoad("n", "llamacpp") {
++		t.Fatal("jit defaults/override wrong")
++	}
++}
+diff --git a/services/nvpair-proxy/local_char_test.go b/services/nvpair-proxy/local_char_test.go
+new file mode 100644
+index 0000000..d1bfe90
+--- /dev/null
++++ b/services/nvpair-proxy/local_char_test.go
+@@ -0,0 +1,146 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++// Step-5 characterization tests for the fork's proxy.go behaviour, written
++// against pre-step develop. Only the char* helpers below may change when the
++// fork state moves behind seams; the test bodies and assertions may not.
++
++import (
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"nvpair-proxy/local/capacity"
++	"nvpair-shared/noderec"
++	"nvpair-shared/schedulerwire"
++)
++
++// charLocal turns on the fork's routing state with capacity c (nil: none).
++func charLocal(p *Proxy, c CapacityProvider) *Proxy {
++	p.local = &localState{capacity: c}
++	return p
++}
++
++func charDirectory(engine string, nodes ...noderec.DirectoryNode) CapacityProvider {
++	d := capacity.NewDirectory(nil)
++	d.Update(engine, nodes)
++	return d
++}
++
++func charEligible(p *Proxy, id, engine, model string) bool { return p.eligible(id, engine, model) }
++
++// charReserve reserves a node for model and returns its id (the claim is kept).
++func charReserve(p *Proxy, f *facade, cands []candidate, model string) string {
++	out, res, _ := p.reserveCandidateFor(f, append([]candidate(nil), cands...), "", model)
++	if !res.held || len(out) == 0 {
++		return ""
++	}
++	return out[0].id
++}
++
++func charRanked(t *testing.T, tc engineCase, ids ...string) (*Proxy, *facade) {
++	t.Helper()
++	disc := NewDiscovery()
++	p := testProxy(tc.profile, disc, tc.profile.FacadePort)
++	ranks := make([]schedulerwire.NodeRank, len(ids))
++	for i, id := range ids {
++		ranks[i] = schedulerwire.NodeRank{ID: id, Rank: i}
++	}
++	applySnapshot(p, schedulerwire.Priority{Nodes: ids, Ranks: ranks})
++	return p, p.soleFacade()
++}
++
++// LM Studio slots: lowest occupancy per slot wins, scheduler order breaks
++// ties, and a full node is passed over while another has a free slot.
++func TestCharLMStudioSlotsBalanceThenAvoidFull(t *testing.T) {
++	tc := lmstudioCase(t)
++	p, f := charRanked(t, tc, "a", "b")
++	charLocal(p, &fakeCap{slots: map[string]int{"a": 3, "b": 1}})
++	cands := []candidate{{id: "a"}, {id: "b"}}
++	got := []string{
++		charReserve(p, f, cands, tc.requestedModel),
++		charReserve(p, f, cands, tc.requestedModel),
++		charReserve(p, f, cands, tc.requestedModel),
++		charReserve(p, f, cands, tc.requestedModel),
++	}
++	assert.Equal(t, []string{"a", "b", "a", "a"}, got)
++}
++
++// LM Studio does not JIT-load by default: a node that reports nothing loaded
++// is ineligible unless it opts in with jit_load.
++func TestCharLMStudioJITOffByDefault(t *testing.T) {
++	p := testProxy(lmstudioCase(t).profile, NewDiscovery(), 0)
++	empty := map[string][]string{"lmstudio": {}}
++	charLocal(p, charDirectory("lmstudio",
++		noderec.DirectoryNode{HostUUID: "off", LoadedByEngine: empty},
++		noderec.DirectoryNode{HostUUID: "on", LoadedByEngine: empty, LocalNodeExt: noderec.LocalNodeExt{JITLoadByEngine: map[string]bool{"lmstudio": true}}},
++	))
++	assert.False(t, charEligible(p, "off", "lmstudio", "qwen3-8b"), "jit off by default")
++	assert.True(t, charEligible(p, "on", "lmstudio", "qwen3-8b"), "jit_load opt-in")
++}
++
++// An LM Studio loaded instance makes its node eligible without JIT; another
++// model on the same node is not.
++func TestCharLMStudioLoadedInstanceEligible(t *testing.T) {
++	p := testProxy(lmstudioCase(t).profile, NewDiscovery(), 0)
++	charLocal(p, charDirectory("lmstudio",
++		noderec.DirectoryNode{HostUUID: "n", LoadedByEngine: map[string][]string{"lmstudio": {"qwen3-8b"}}},
++	))
++	assert.True(t, charEligible(p, "n", "lmstudio", "qwen3-8b"))
++	assert.False(t, charEligible(p, "n", "lmstudio", "other-model"))
++}
++
++// Inference for an advertised model nobody has loaded is a 503; for a model
++// nobody advertises it stays the upstream 502.
++func TestCharLMStudioNotLoaded503NoOwner502(t *testing.T) {
++	tc := lmstudioCase(t)
++	a, hits := newCountingServer(t, 200, "{}")
++	disc := NewDiscovery()
++	disc.AddManual(nodeForModel(t, "a", a, tc.advertisedModel))
++	p := charLocal(testProxy(tc.profile, disc, tc.profile.FacadePort), &fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty}})
++
++	rec := httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
++	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
++
++	rec = httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, tc.inferencePath, strings.NewReader(`{"model":"nobody-has-it"}`)))
++	assert.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
++	assert.Equal(t, 0, hits())
++}
++
++// /v1/responses mid-history developer items reach the engine rewritten, with
++// a matching Content-Length.
++func TestCharResponsesInputNormalisedBeforeForward(t *testing.T) {
++	tc := lmstudioCase(t)
++	var mu sync.Mutex
++	var gotBody string
++	var gotLen int64
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		b, _ := io.ReadAll(r.Body)
++		mu.Lock()
++		gotBody, gotLen = string(b), r.ContentLength
++		mu.Unlock()
++		_, _ = io.WriteString(w, "{}")
++	}))
++	t.Cleanup(srv.Close)
++	disc := NewDiscovery()
++	disc.AddManual(nodeForModel(t, "a", srv.URL, tc.advertisedModel))
++	p := charLocal(testProxy(tc.profile, disc, tc.profile.FacadePort), nil)
++	body := `{"model":"qwen3-8b","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"type":"message","role":"developer","content":[{"type":"input_text","text":"b"}]}]}`
++	rec := httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
++	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
++	mu.Lock()
++	defer mu.Unlock()
++	assert.Contains(t, gotBody, `"[developer]\nb"`)
++	assert.Equal(t, int64(len(gotBody)), gotLen)
++}
+diff --git a/services/nvpair-proxy/local_dircapacity_test.go b/services/nvpair-proxy/local_dircapacity_test.go
+new file mode 100644
+index 0000000..5e62bca
+--- /dev/null
++++ b/services/nvpair-proxy/local_dircapacity_test.go
+@@ -0,0 +1,197 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"encoding/json"
++	"nvpair-proxy/local/capacity"
++	"testing"
++	"time"
++
++	"nvpair-shared/noderec"
++)
++
++func dnode(id string, loaded []string, slots map[string]noderec.SlotInfo, obs int64) noderec.DirectoryNode {
++	n := noderec.DirectoryNode{HostUUID: id, LocalNodeExt: noderec.LocalNodeExt{ModelsObservedAt: obs}}
++	if loaded != nil {
++		n.LoadedByEngine = map[string][]string{"ollama": loaded}
++	}
++	if slots != nil {
++		n.SlotsByEngine = map[string]map[string]noderec.SlotInfo{"ollama": slots}
++	}
++	return n
++}
++
++func TestDirectoryResidencyAndProjection(t *testing.T) {
++	d := capacity.NewDirectory(nil)
++	d.Update("ollama", []noderec.DirectoryNode{
++		dnode("legacy", nil, nil, 0),
++		dnode("empty", []string{}, nil, 1),
++		dnode("hot", []string{"m"}, map[string]noderec.SlotInfo{"m": {Slots: 3, CtxPerSlot: 4096}}, 1),
++	})
++	for id, want := range map[string]Residency{"legacy": ResidencyUnknown, "empty": ResidencyKnownEmpty, "hot": ResidencyLoaded, "gone": ResidencyUnknown} {
++		if got, _ := d.Residency(id, "ollama", "m"); got != want {
++			t.Errorf("%s residency = %v, want %v", id, got, want)
++		}
++	}
++	if n, ok := d.Slots("hot", "ollama", "m"); !ok || n != 3 {
++		t.Errorf("slots = %d %v", n, ok)
++	}
++	if n, ok := d.CtxPerSlot("hot", "ollama", "m"); !ok || n != 4096 {
++		t.Errorf("ctx = %d %v", n, ok)
++	}
++	if _, ok := d.Slots("empty", "ollama", "m"); ok {
++		t.Error("slots for non-loaded model")
++	}
++}
++
++func TestDirectorySuppressionLiftedByNewerObservation(t *testing.T) {
++	now := time.Unix(1000, 0)
++	d := capacity.NewDirectory(nil)
++	p := &Proxy{local: &localState{suppressed: map[inflightKey]time.Time{}, now: func() time.Time { return now }}}
++	p.local.capacity = d
++	hot := dnode("n", []string{"m"}, nil, now.Add(-time.Second).UnixMilli())
++	p.local.suppressed[inflightKey{"ollama", "m", "n"}] = now
++	d.Update("ollama", []noderec.DirectoryNode{hot}) // delivered late, observed before the refusal
++	if p.eligible("n", "ollama", "m") {
++		t.Fatal("sweep observed before the refusal must not lift suppression")
++	}
++	hot.ModelsObservedAt = now.Add(time.Second).UnixMilli()
++	d.Update("ollama", []noderec.DirectoryNode{hot})
++	if !p.eligible("n", "ollama", "m") {
++		t.Fatal("newer sweep showing Loaded must lift suppression")
++	}
++}
++
++func TestMinContextLength(t *testing.T) {
++	d := capacity.NewDirectory(nil)
++	info := func(c int) map[string]noderec.SlotInfo {
++		return map[string]noderec.SlotInfo{"m": {Slots: 1, CtxPerSlot: c}}
++	}
++	d.Update("ollama", []noderec.DirectoryNode{
++		dnode("a", []string{"m"}, info(8192), 1),
++		dnode("b", []string{"m"}, info(4096), 1),
++		dnode("nov", []string{"m"}, map[string]noderec.SlotInfo{"m": {Slots: 1}}, 1),
++		dnode("cold", []string{}, nil, 1),
++	})
++	d.Update("lmstudio", nil)
++	p := &Proxy{local: &localState{capacity: capacity.Override{Over: capacity.Settings{JITBy: map[string]bool{"ollama": false}}, Base: d}}}
++	if n, ok := p.minContextLength("ollama", "m", []string{"a", "b", "cold"}); !ok || n != 4096 {
++		t.Fatalf("min = %d %v (cold, non-JIT node must be ignored)", n, ok)
++	}
++	if _, ok := p.minContextLength("ollama", "m", []string{"a", "nov"}); ok {
++		t.Fatal("eligible node without a value must omit the field")
++	}
++	raw := capacity.WithContextLength(json.RawMessage(`{"id":"m"}`), 4096)
++	if string(raw) != `{"context_length":4096,"id":"m"}` {
++		t.Fatalf("raw = %s", raw)
++	}
++}
++
++func TestJITBlockedWhenOtherEngineHoldsModel(t *testing.T) {
++	d := capacity.NewDirectory(nil)
++	busy := dnode("busy", []string{}, nil, 1)
++	busy.LoadedByEngine["lmstudio"] = []string{"big"}
++	free := dnode("free", []string{}, nil, 1)
++	free.LoadedByEngine["lmstudio"] = []string{}
++	d.Update("ollama", []noderec.DirectoryNode{busy, free})
++	p := &Proxy{local: &localState{capacity: d}}
++	if p.eligible("busy", "ollama", "m") {
++		t.Fatal("JIT must not add a second model beside another engine's")
++	}
++	if !p.eligible("free", "ollama", "m") {
++		t.Fatal("JIT is fine when no other engine has a model loaded")
++	}
++}
++
++func TestJITClaimBlocksOtherModel(t *testing.T) {
++	d := capacity.NewDirectory(nil)
++	d.Update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, 1)})
++	p := &Proxy{local: &localState{capacity: d}}
++	res := p.takeLocked("n", "ollama", "m", false)
++	if !res.jit || p.eligible("n", "ollama", "m2") || !p.eligible("n", "ollama", "m") {
++		t.Fatal("claim must block a different model only")
++	}
++	p.dropLocked(res)
++	if p.eligible("n", "ollama", "m2") {
++		t.Fatal("released claim must persist until a newer sweep")
++	}
++
++}
++
++func TestReserveRechecksEligibility(t *testing.T) {
++	d := capacity.NewDirectory(nil)
++	d.Update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, 1), dnode("o", []string{"m"}, nil, 1)})
++	p := affinityProxy(t, "n", "o")
++	p.local.capacity = d
++	f := p.soleFacade()
++	p.takeLocked("n", "ollama", "other", false) // another model claims n
++	round := []candidate{{id: "n"}, {id: "o"}}
++	cand, ok := p.rescoreReserve(f, round, map[string]bool{}, &reservation{}, "m")
++	if !ok || cand.id != "o" {
++		t.Fatalf("got %v %v, want o", cand.id, ok)
++	}
++}
++
++func TestObservedAtAndModelKey(t *testing.T) {
++	d := capacity.NewDirectory(nil)
++	n := dnode("n", []string{"m:latest"}, map[string]noderec.SlotInfo{"m:latest": {Slots: 2, CtxPerSlot: 99}}, 5000)
++	d.Update("ollama", []noderec.DirectoryNode{n})
++	r, at := d.Residency("n", "ollama", "m")
++	if r != ResidencyLoaded || !at.Equal(time.UnixMilli(5000)) {
++		t.Fatalf("residency %v at %v", r, at)
++	}
++	if s, ok := d.Slots("n", "ollama", "m"); !ok || s != 2 {
++		t.Fatal("slots must match m vs m:latest")
++	}
++}
++
++func TestContextLengthReplacedOrRemoved(t *testing.T) {
++	if got := string(capacity.WithContextLength(json.RawMessage(`{"id":"m","context_length":999999}`), 4096)); got != `{"context_length":4096,"id":"m"}` {
++		t.Fatal(got)
++	}
++	if got := string(capacity.WithContextLength(json.RawMessage(`{"id":"m","context_length":9}`), 0)); got != `{"id":"m"}` {
++		t.Fatal(got)
++	}
++}
++
++func TestJITReleasedClaimPersistsUntilSweepOrCap(t *testing.T) {
++	now := time.Now()
++	d := capacity.NewDirectory(nil)
++	d.Update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, now.UnixMilli())})
++	p := &Proxy{local: &localState{capacity: d, now: func() time.Time { return now }}}
++	p.dropLocked(p.takeLocked("n", "ollama", "m", false))
++	if p.eligible("n", "ollama", "m2") {
++		t.Fatal("claim must persist after request end")
++	}
++	now = now.Add(jitReleaseCap)
++	if !p.eligible("n", "ollama", "m2") {
++		t.Fatal("claim must expire at the cap")
++	}
++	p.dropLocked(p.takeLocked("n", "ollama", "m", false))
++	d.Update("ollama", []noderec.DirectoryNode{dnode("n", []string{}, nil, now.Add(time.Second).UnixMilli())})
++	if !p.eligible("n", "ollama", "m2") {
++		t.Fatal("a newer sweep must clear the claim")
++	}
++}
++
++func TestSelectedNodeHonoursJITClaim(t *testing.T) {
++	p := affinityProxy(t, "a")
++	d := capacity.NewDirectory(nil)
++	d.Update("ollama", []noderec.DirectoryNode{dnode("a", []string{}, nil, 1)})
++	p.local.capacity = d
++	f := p.soleFacade()
++	f.SetSelected("a")
++	engine := f.profile.Name
++	res := p.takeLocked("a", engine, "m", false)
++	if !res.jit {
++		t.Skip("engine is not JIT on this fixture")
++	}
++	if out, _, _ := p.reserveCandidateFor(f, reservationCandidates("a"), "", "m2"); len(out) != 0 {
++		t.Fatal("selected node must honour a JIT claim for another model")
++	}
++	if out, _, _ := p.reserveCandidateFor(f, reservationCandidates("a"), "", "m"); len(out) != 1 {
++		t.Fatal("same model stays allowed")
++	}
++}
+diff --git a/services/nvpair-proxy/local_jit_test.go b/services/nvpair-proxy/local_jit_test.go
+new file mode 100644
+index 0000000..07ec4bc
+--- /dev/null
++++ b/services/nvpair-proxy/local_jit_test.go
+@@ -0,0 +1,89 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"nvpair-proxy/local/capacity"
++	"testing"
++	"time"
++
++	"nvpair-shared/noderec"
++)
++
++// TestLocalJITFallbackLMStudioParity (step-4 characterization): with no
++// jit_load key, LM Studio never loads on demand and Ollama and llama.cpp do,
++// in both the env settings and the directory capacity providers.
++func TestLocalJITFallbackLMStudioParity(t *testing.T) {
++	d := capacity.NewDirectory(nil)
++	for _, e := range []string{"lmstudio", "ollama", "llamacpp"} {
++		d.Update(e, []noderec.DirectoryNode{{HostUUID: "n"}})
++	}
++	for e, want := range map[string]bool{"lmstudio": false, "ollama": true, "llamacpp": true} {
++		if got := (capacity.Settings{}).JITLoad("n", e); got != want {
++			t.Errorf("settings JITLoad(%s) = %v, want %v", e, got, want)
++		}
++		if got := d.JITLoad("n", e); got != want {
++			t.Errorf("directory JITLoad(%s) = %v, want %v", e, got, want)
++		}
++	}
++}
++
++// TestLocalVLLMDownloadedOnlyNeverEligible: NVIDIA owns vLLM's model switch,
++// so a model a vLLM node has only downloaded (downloadedByEngine, not served)
++// is never eligible, whether the node said jit_load false or nothing; the
++// served name (modelsByEngine) is eligible as Loaded although loadedByEngine
++// names the --model root; a stopped vLLM serves nothing.
++func TestLocalVLLMDownloadedOnlyNeverEligible(t *testing.T) {
++	if (capacity.Settings{}).JITLoad("n", "vllm") {
++		t.Fatal("settings fallback must not JIT vLLM")
++	}
++	vllm := func(id string, served, loaded []string, jit map[string]bool) noderec.DirectoryNode {
++		n := noderec.DirectoryNode{HostUUID: id,
++			LoadedByEngine:     map[string][]string{"vllm": loaded},
++			DownloadedByEngine: map[string][]string{"vllm": {"org/m", "org/other"}},
++			LocalNodeExt:       noderec.LocalNodeExt{JITLoadByEngine: jit}}
++		if served != nil {
++			n.ModelsByEngine = map[string][]string{"vllm": served}
++		}
++		return n
++	}
++	d := capacity.NewDirectory(nil)
++	d.Update("vllm", []noderec.DirectoryNode{
++		vllm("quiet", []string{"qwen-api"}, []string{"org/m"}, nil),
++		vllm("said", []string{"qwen-api"}, []string{"org/m"}, map[string]bool{"vllm": false}),
++		vllm("stopped", nil, []string{}, map[string]bool{"vllm": false}),
++	})
++	p := &Proxy{local: &localState{suppressed: map[inflightKey]time.Time{}, now: time.Now}}
++	p.local.capacity = d
++	for _, id := range []string{"quiet", "said", "stopped"} {
++		for _, m := range []string{"org/other", "org/m"} {
++			if p.eligible(id, "vllm", m) {
++				t.Errorf("%s: downloaded-only %s must never be eligible", id, m)
++			}
++		}
++	}
++	for _, id := range []string{"quiet", "said"} {
++		if r, _ := d.Residency(id, "vllm", "qwen-api"); r != ResidencyLoaded || !p.eligible(id, "vllm", "qwen-api") {
++			t.Errorf("%s: served name residency %v", id, r)
++		}
++	}
++}
++
++// TestLocalVLLMServedAliasWithoutDownloadedInventory: a failed HF-cache read
++// omits downloadedByEngine.vllm, but the served alias is still Loaded (not
++// compared with the --model root) and eligible.
++func TestLocalVLLMServedAliasWithoutDownloadedInventory(t *testing.T) {
++	d := capacity.NewDirectory(nil)
++	d.Update("vllm", []noderec.DirectoryNode{{HostUUID: "n",
++		ModelsByEngine: map[string][]string{"vllm": {"qwen-api"}},
++		LoadedByEngine: map[string][]string{"vllm": {"org/model"}}}})
++	p := &Proxy{local: &localState{suppressed: map[inflightKey]time.Time{}, now: time.Now}}
++	p.local.capacity = d
++	if r, _ := d.Residency("n", "vllm", "qwen-api"); r != ResidencyLoaded || !p.eligible("n", "vllm", "qwen-api") {
++		t.Fatalf("served alias residency %v", r)
++	}
++	if p.eligible("n", "vllm", "org/other") {
++		t.Fatal("unserved model must not be eligible")
++	}
++}
+diff --git a/services/nvpair-proxy/local_p_test.go b/services/nvpair-proxy/local_p_test.go
+new file mode 100644
+index 0000000..c151d1e
+--- /dev/null
++++ b/services/nvpair-proxy/local_p_test.go
+@@ -0,0 +1,198 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++// Nil-state tests for hooks P1-P9: with no fork state proxy.go runs NVIDIA's
++// code path unchanged. Plus the step-5 cooling-vs-slot composition.
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	"nvpair-shared/schedulerwire"
++)
++
++func TestP1_Nil(t *testing.T) {
++	assert.Nil(t, NewProxy(NewCodec(rwNop{})).local, "NewProxy must leave fork state off")
++	s := newLocalState(nil)
++	require.NotNil(t, s.directory)
++	assert.NotNil(t, s.capacity)
++}
++
++func TestP2_Nil(t *testing.T) {
++	var s *localState
++	s.observeNodes("ollama", nil) // must not panic
++}
++
++func TestP3_Nil(t *testing.T) {
++	p := prProxy(t, "a")
++	assert.Nil(t, p.local)
++	assert.Equal(t, 1, p.nodeSlots("a", "ollama", "m"))
++	assert.True(t, p.eligible("a", "ollama", "m"))
++}
++
++func TestP4_Nil(t *testing.T) {
++	var s *localState
++	body := []byte(`{"input":[{"type":"message","role":"user","content":"hi"},{"type":"message","role":"developer","content":"x"}]}`)
++	r := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
++	assert.Equal(t, string(body), string(s.rewriteBody(r, body)))
++}
++
++func TestP5_Nil(t *testing.T) {
++	var s *localState
++	in := []candidate{{id: "a"}, {id: "b"}}
++	out, n := s.filterCandidates(nil, "m", in, true)
++	assert.Equal(t, in, out)
++	assert.Zero(t, n)
++	b, e, st := localNotLoadedRejection(0, false, "m", "body", "err", http.StatusBadGateway)
++	assert.Equal(t, []any{"body", "err", http.StatusBadGateway}, []any{b, e, st})
++}
++
++func TestP6_Nil(t *testing.T) {
++	p := prProxy(t, "a", "b")
++	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b"}, Ranks: []schedulerwire.NodeRank{{ID: "a"}, {ID: "b", Rank: 1}}})
++	lr := p.local.request(p, p.soleFacade(), httptest.NewRequest(http.MethodPost, "/", nil), nil, "m", true)
++	require.Nil(t, lr)
++	out, held := p.localReserve(lr, p.soleFacade(), reservationCandidates("a", "b"))
++	assert.Equal(t, "a", out[0].id)
++	assert.Equal(t, localClaim{}, held.localClaim, "upstream reservation carries no fork claim")
++	assert.Empty(t, lr.affinityDecision())
++	var mu sync.Mutex
++	lr.releaseEarly(&mu, &held)
++	assert.True(t, held.held, "releaseEarly is a no-op without fork state")
++	p.priorityMu.Lock()
++	assert.False(t, p.localDropLocked(held))
++	_, moved := p.localMoveLocked(held, "b")
++	p.priorityMu.Unlock()
++	assert.False(t, moved)
++	p.local.applySnapshot(schedulerwire.Priority{})
++	p.releaseReservation(held)
++}
++
++func TestP7_Nil(t *testing.T) {
++	var lr *localReq
++	var mu sync.Mutex
++	var held reservation
++	c, skip := lr.pick([]candidate{{id: "a"}, {id: "b"}}, 1, candidate{id: "b"}, &mu, &held)
++	assert.Equal(t, "b", c.id)
++	assert.False(t, skip)
++	lr.onMove("a", held)
++	lr.resetTried()
++	lr.attemptStart("1", 1, "a", 2, &mu, &held)
++	lr.attemptEnd("1", 1, "a", time.Now(), false)
++}
++
++func TestP8_Nil(t *testing.T) {
++	var s *localState
++	raw := json.RawMessage(`{"id":"m","context_length":4096}`)
++	assert.Equal(t, string(raw), string(s.annotateModel(nil, true, nil, "m", raw)))
++}
++
++func TestP9_Nil(t *testing.T) {
++	var lr *localReq
++	resp := &http.Response{StatusCode: http.StatusNotFound, Body: http.NoBody}
++	assert.False(t, lr.notLoaded(t.Context(), resp, "a", false, time.Now()))
++}
++
++// The fork's slot-aware reservation keeps NVIDIA's #144 cooldown as the outer
++// partition: a cooling node with free slots loses to a full non-cooling one.
++func TestLocalCoolingIsOuterPartitionOverSlots(t *testing.T) {
++	tc := lmstudioCase(t)
++	p, f := charRanked(t, tc, "a", "b")
++	charLocal(p, &fakeCap{slots: map[string]int{"a": 4, "b": 1}})
++	cands := []candidate{{id: "a"}, {id: "b"}}
++	require.Equal(t, "a", charReserve(p, f, cands, tc.requestedModel), "warm: a has the free slots")
++	p.noteNoFirstByte("a", time.Now())
++	assert.Equal(t, "b", charReserve(p, f, cands, tc.requestedModel), "a cooling: b first while free")
++	assert.Equal(t, "b", charReserve(p, f, cands, tc.requestedModel), "a cooling: b queued ahead of a's free slots")
++	p.noteFirstByte("a")
++	assert.Equal(t, "a", charReserve(p, f, cands, tc.requestedModel), "cooldown cleared: slots decide again")
++}
++
++// When every candidate is cooling, demotion is not exclusion: slots decide.
++func TestLocalAllCoolingFallsBackToSlots(t *testing.T) {
++	tc := lmstudioCase(t)
++	p, f := charRanked(t, tc, "a", "b")
++	charLocal(p, &fakeCap{slots: map[string]int{"a": 1, "b": 2}})
++	p.noteNoFirstByte("a", time.Now())
++	p.noteNoFirstByte("b", time.Now())
++	cands := []candidate{{id: "a"}, {id: "b"}}
++	got := []string{charReserve(p, f, cands, tc.requestedModel), charReserve(p, f, cands, tc.requestedModel)}
++	assert.Equal(t, []string{"a", "b"}, got)
++}
++
++// An affinity-bound node that starts cooling is left for a warm one (rebind).
++func TestLocalAffinityLeavesCoolingBoundNode(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	first, _ := turn(p, "conv", "a", "b")
++	p.noteNoFirstByte(first, time.Now())
++	got, d := turn(p, "conv", "a", "b")
++	assert.NotEqual(t, first, got)
++	assert.Equal(t, "rebind", d)
++}
++
++// Inference through the handler: the residency filter runs after NVIDIA's
++// cooling demotion and keeps its order.
++func TestLocalFilterKeepsCoolingOrder(t *testing.T) {
++	tc := lmstudioCase(t)
++	disc := NewDiscovery()
++	for _, id := range []string{"a", "b", "c"} {
++		srv, _ := newCountingServer(t, 200, "{}")
++		disc.AddManual(nodeForModel(t, id, srv, tc.advertisedModel))
++	}
++	p := charLocal(testProxy(tc.profile, disc, tc.profile.FacadePort), &fakeCap{res: map[string]Residency{"b": ResidencyKnownEmpty}})
++	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b", "c"}, Ranks: []schedulerwire.NodeRank{{ID: "a"}, {ID: "b", Rank: 1}, {ID: "c", Rank: 2}}})
++	p.noteNoFirstByte("a", time.Now())
++	cands, n := p.soleFacade().resolveCandidatesN(tc.advertisedModel)
++	ids := []string{}
++	for _, c := range cands {
++		ids = append(ids, c.id)
++	}
++	assert.Equal(t, []string{"c", "a"}, ids)
++	assert.Equal(t, 1, n)
++	rec := httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, tc.inferencePath, strings.NewReader(tc.inferenceBody())))
++	assert.Equal(t, http.StatusOK, rec.Code)
++}
++
++// Codex P1: two IDs on one host advertise the model; the first is known empty
++// with JIT off, the second has it loaded. The loaded one must be served.
++func TestLocalSameHostLoadedIDSurvivesDedup(t *testing.T) {
++	tc := lmstudioCase(t)
++	srv, hits := newCountingServer(t, 200, "{}")
++	disc := NewDiscovery()
++	disc.AddManual(nodeForModel(t, "a", srv, tc.advertisedModel))
++	disc.AddManual(nodeForModel(t, "b", srv, tc.advertisedModel))
++	p := charLocal(testProxy(tc.profile, disc, tc.profile.FacadePort),
++		&fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty, "b": ResidencyLoaded}})
++	rec := httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
++	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
++	assert.Equal(t, 1, hits())
++	// A lookup still sends one candidate per host.
++	cands := p.soleFacade().resolveCandidates(tc.advertisedModel)
++	out, _ := p.local.filterCandidates(p.soleFacade(), tc.advertisedModel, cands, false)
++	assert.Len(t, out, 1)
++}
++
++// Codex P2: bound warm node full, other node idle but cooling: the request
++// stays (queues) on the bound node rather than yielding to the cooling one.
++func TestLocalAffinityDoesNotYieldToCoolingNode(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	f := p.soleFacade()
++	_, held, _ := p.reserveCandidateKey(f, reservationCandidates("a", "b"), "conv")
++	require.Equal(t, "a", held.nodeID)
++	p.noteNoFirstByte("b", time.Now())
++	out, _, d := p.reserveCandidateKey(f, reservationCandidates("a", "b"), "conv")
++	assert.Equal(t, "a", out[0].id)
++	assert.Equal(t, "hit", d)
++}
+diff --git a/services/nvpair-proxy/local_proxy.go b/services/nvpair-proxy/local_proxy.go
+new file mode 100644
+index 0000000..d6783ae
+--- /dev/null
++++ b/services/nvpair-proxy/local_proxy.go
+@@ -0,0 +1,780 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++// Fork glue for proxy.go (catch-up step 5, hooks P1-P9). proxy.go is NVIDIA's;
++// every fork behaviour it has is a marked one-line-ish call into this file.
++// A nil *localState (NewProxy's default) runs NVIDIA's code path unchanged;
++// main.go sets it (P1).
++//
++// Composition with NVIDIA #144 (first-byte cooldown): resolveCandidates
++// demotes cooling nodes, then P5 filters by residency (order kept), then the
++// slot-aware reservation ranks with routing.Better, whose outermost key is
++// "not cooling". So the cooldown is the outer stable partition over the
++// fork's slot-aware order: a cooling node never outranks a non-cooling one,
++// even when it has a free slot and the other is full; among nodes in the same
++// partition the fork's slot-aware order decides. An affinity-bound node that
++// is cooling is not kept while a non-cooling candidate exists (rebind).
++
++import (
++	"context"
++	"encoding/json"
++	"log/slog"
++	"net/http"
++	"strconv"
++	"sync"
++	"time"
++
++	"nvpair-proxy/local/affinity"
++	"nvpair-proxy/local/capacity"
++	"nvpair-proxy/local/respnorm"
++	"nvpair-proxy/local/routing"
++	"nvpair-shared/noderec"
++	"nvpair-shared/schedulerwire"
++)
++
++// Aliases keep the fork's names inside package main.
++type (
++	Residency        = capacity.Residency
++	CapacityProvider = capacity.Provider
++)
++
++const (
++	ResidencyUnknown    = capacity.ResidencyUnknown
++	ResidencyKnownEmpty = capacity.ResidencyKnownEmpty
++	ResidencyLoaded     = capacity.ResidencyLoaded
++)
++
++type inflightKey struct{ engine, model, node string }
++
++// completion is a local finish the scheduler may not have seen. It discounts
++// a snapshot's pending only when the claim began before that snapshot was
++// computed and ended after it, and, for an optimistic claim released within
++// its own generation (reservedBy already dropped it), only once a later
++// snapshot has been applied.
++type completion struct {
++	taken, done int64
++	gen         uint64
++	deferred    bool
++}
++
++// localClaim is the fork part of a reservation (embedded, P6).
++type localClaim struct {
++	// takenAt is when the claim began, Unix ms.
++	takenAt int64
++	engine  string
++	model   string
++	// reason is why routing chose this node, for the attempt log.
++	reason string
++	// optimistic is whether this also counted in priorityReservations; a
++	// pinned request is counted in inflight only.
++	optimistic bool
++	// jit is whether this dispatch holds a JIT claim on the node.
++	jit bool
++}
++
++// localState is the fork's process-wide proxy state (P3).
++type localState struct {
++	now func() time.Time // test seam; nil means time.Now
++
++	// affinity pins a conversation's affinity key to a node.
++	affinity affinity.Table
++	// capacity supplies per-node slot counts and residency; nil means one
++	// slot everywhere and nothing known.
++	capacity CapacityProvider
++	// directory is fed by every facade's discovery snapshot (P2).
++	directory *capacity.Directory
++
++	// Guarded by Proxy.priorityMu. inflight is the durable count of requests
++	// this proxy dispatched and not finished, never reset by a snapshot;
++	// reservedBy the optimistic ones since the last snapshot; completions
++	// local finishes the scheduler may not have seen yet; pendingBy and
++	// computedAt come from the snapshot.
++	inflight    map[inflightKey]int
++	reservedBy  map[inflightKey]int
++	completions map[inflightKey][]completion
++	pendingBy   map[string]map[string]int
++	computedAt  map[string]int64
++
++	claimMu     sync.Mutex
++	jitClaims   map[string]map[jitClaim]int       // node -> live JIT claims
++	jitReleased map[string]map[jitClaim]time.Time // node -> claims released at T, held until a newer sweep
++
++	// suppressed holds not-loaded refusals (see eligible).
++	suppressMu sync.Mutex
++	suppressed map[inflightKey]time.Time
++}
++
++// newLocalState builds the production fork state (P1): directory capacity fed
++// by discovery, layered under the NVPAIR_PROXY_CAPACITY overrides.
++func newLocalState(now func() time.Time) *localState {
++	s := &localState{now: now}
++	s.directory = capacity.NewDirectory(s.clock)
++	s.capacity = capacity.Layer(capacity.FromEnv(), s.directory)
++	return s
++}
++
++// observeNodes feeds a facade's discovery snapshot to the directory (P2).
++func (s *localState) observeNodes(engine string, nodes []noderec.DirectoryNode) {
++	if s == nil || s.directory == nil {
++		return
++	}
++	s.directory.Update(engine, nodes)
++}
++
++// rewriteBody normalises /v1/responses mid-history developer items and fixes
++// Content-Length (P4). Runs after bufferBodyAndModel.
++func (s *localState) rewriteBody(r *http.Request, body []byte) []byte {
++	if s == nil || r.URL.Path != "/v1/responses" || len(body) == 0 {
++		return body
++	}
++	nb := respnorm.Normalize(body)
++	if string(nb) == string(body) {
++		return body
++	}
++	r.ContentLength = int64(len(nb))
++	r.Header.Set("Content-Length", strconv.Itoa(len(nb)))
++	return nb
++}
++
++// filterCandidates drops owners of model that no live node has loaded (unless
++// they can JIT-load it), keeping resolveCandidates' order, and marks the
++// candidate served from this host's loopback engine (P5). It returns how many
++// were dropped. requireEligible false (model lookups, /api/show) keeps every
++// advertised owner: a lookup reads the model from disk and loads nothing.
++func (s *localState) filterCandidates(f *facade, model string, cands []candidate, requireEligible bool) ([]candidate, int) {
++	if s == nil {
++		return cands, 0
++	}
++	if lb, ok := f.localBackendTarget(); ok {
++		for i := range cands {
++			if cands[i].url != nil && cands[i].url.Host == lb.Host && cands[i].url.Scheme == lb.Scheme {
++				cands[i].local = true
++			}
++		}
++	}
++	if model == "" || !requireEligible {
++		// claimsHost may have let a second ID through on one host; a lookup
++		// keeps NVIDIA's first-per-host.
++		seen, out := map[string]bool{}, cands[:0:0]
++		for _, c := range cands {
++			if c.url != nil && seen[c.url.Host] {
++				continue
++			}
++			if c.url != nil {
++				seen[c.url.Host] = true
++			}
++			out = append(out, c)
++		}
++		return out, 0
++	}
++	out, dropped := cands[:0:0], 0
++	for _, c := range cands {
++		if s.eligible(c.id, f.profile.Name, model) {
++			out = append(out, c)
++		} else {
++			dropped++
++		}
++	}
++	return out, dropped
++}
++
++// claimsHost reports whether a resolved node claims its host in NVIDIA's
++// per-host de-duplication (P5). A node that is not eligible for model does
++// not, so a later eligible ID on the same host is still resolved, as the
++// pre-step fork (which filtered before de-dup) did; filterCandidates then
++// drops the ineligible one, or de-dups by host for lookups.
++func (s *localState) claimsHost(f *facade, model, nodeID string) bool {
++	return s == nil || model == "" || s.eligible(nodeID, f.profile.Name, model)
++}
++
++// localNotLoadedRejection turns an inference rejection into a 503 when owners
++// exist but none has the model loaded (P5). notLoaded is 0 with a nil state.
++func localNotLoadedRejection(notLoaded int, lookup bool, model, body, errText string, status int) (string, string, int) {
++	if notLoaded == 0 || lookup || model == "" {
++		return body, errText, status
++	}
++	msg, _ := json.Marshal("no live node has model " + model + " loaded")
++	return `{"error":` + string(msg) + `}`, "no live node has model loaded", http.StatusServiceUnavailable
++}
++
++// annotateModel sets an OpenAI /v1/models entry's context_length to the
++// smallest per-slot context among the routable owners that can serve it, or
++// removes it when that is unknown (P8). Owners are every advertised routable
++// candidate, not only those whose list call succeeded.
++func (s *localState) annotateModel(f *facade, openAI bool, cands []candidate, key string, raw json.RawMessage) json.RawMessage {
++	if s == nil || !openAI || s.capacity == nil {
++		return raw
++	}
++	nodeByID := map[string]Node{}
++	for _, n := range f.discovery.Nodes() {
++		nodeByID[n.ID] = n
++	}
++	var owners []string
++	for _, c := range cands {
++		if n, ok := nodeByID[c.id]; ok && nodeAdvertisesModel(f.profile, n, key) {
++			owners = append(owners, c.id)
++		}
++	}
++	n, _ := s.minContextLength(f.profile.Name, key, owners)
++	return capacity.WithContextLength(raw, n) // n==0 removes
++}
++
++// applySnapshot records the snapshot's per-model pending and computed-at, and
++// prunes completions it now covers (P6). Caller holds priorityMu.
++func (s *localState) applySnapshot(priority schedulerwire.Priority) {
++	if s == nil {
++		return
++	}
++	applied := s.clock().UnixMilli()
++	pendingBy := make(map[string]map[string]int, len(priority.Ranks))
++	computedAt := make(map[string]int64, len(priority.Ranks))
++	for _, rank := range priority.Ranks {
++		if rank.ID == "" {
++			continue
++		}
++		if rank.PendingBy != nil {
++			pendingBy[rank.ID] = rank.PendingBy
++		}
++		computedAt[rank.ID] = rank.ComputedAt
++		if rank.ComputedAt == 0 {
++			computedAt[rank.ID] = applied
++		}
++	}
++	s.pendingBy, s.computedAt, s.reservedBy = pendingBy, computedAt, nil
++	for k, ts := range s.completions {
++		kept := ts[:0]
++		for _, c := range ts {
++			if c.done > computedAt[k.node] {
++				kept = append(kept, c)
++			}
++		}
++		if len(kept) == 0 {
++			delete(s.completions, k)
++		} else {
++			s.completions[k] = kept
++		}
++	}
++}
++
++// Proxy-level wrappers kept for the fork's tests and glue.
++
++func (p *Proxy) nodeSlots(nodeID, engine, model string) int {
++	if p.local == nil {
++		return 1
++	}
++	return p.local.nodeSlots(nodeID, engine, model)
++}
++
++func (p *Proxy) eligible(nodeID, engine, model string) bool {
++	return p.local == nil || p.local.eligible(nodeID, engine, model)
++}
++
++func (p *Proxy) suppress(k inflightKey) {
++	if p.local != nil {
++		p.local.suppress(k)
++	}
++}
++
++func (p *Proxy) minContextLength(engine, model string, nodeIDs []string) (int, bool) {
++	if p.local == nil {
++		return 0, false
++	}
++	return p.local.minContextLength(engine, model, nodeIDs)
++}
++
++// classifyNotLoaded is routing.ClassifyNotLoaded with the proxy's first-byte
++// timeout error.
++func classifyNotLoaded(ctx context.Context, engine string, resp *http.Response, budget time.Duration) bool {
++	return routing.ClassifyNotLoaded(ctx, engine, resp, budget, errFirstBodyTimeout)
++}
++
++// localReserveHook is reserveCandidate's fork path (P6): with fork state the
++// reservation is slot-aware, with no affinity key and no model.
++func (p *Proxy) localReserveHook(f *facade, candidates []candidate) ([]candidate, reservation, bool) {
++	if p.local == nil {
++		return candidates, reservation{}, false
++	}
++	out, res, _ := p.reserveCandidateKey(f, candidates, "")
++	return out, res, true
++}
++
++// reserveCandidateKey is reserveCandidate with session affinity and no model,
++// so slot occupancy is counted under an empty model.
++func (p *Proxy) reserveCandidateKey(f *facade, candidates []candidate, key string) ([]candidate, reservation, string) {
++	return p.reserveCandidateFor(f, candidates, key, "")
++}
++
++// reserveCandidateFor picks the node for a request for model and takes its
++// reservation. With a non-empty key a bound node is kept while it has a free
++// slot (hit), abandoned for any other free node (yield), and when every node is
++// full kept only while its queue per slot is within one of the best. A bound
++// node in NVIDIA's cooldown is not kept while a non-cooling candidate exists.
++// The returned string is the affinity decision, empty when no key was given or
++// no choice was made.
++func (p *Proxy) reserveCandidateFor(f *facade, candidates []candidate, key, model string) ([]candidate, reservation, string) {
++	if len(candidates) == 0 {
++		return candidates, reservation{}, ""
++	}
++	s := p.local
++	engine := f.profile.Name
++	// Read before taking priorityMu: the cooldown has its own lock and nothing
++	// else nests the two (NVIDIA #144).
++	cooling := p.coolingSet(time.Now())
++	p.priorityMu.Lock()
++	defer p.priorityMu.Unlock()
++
++	// A pinned request is not a choice, but it still occupies a slot.
++	if selectedID := f.SelectedID(); selectedID != "" {
++		for _, cand := range candidates {
++			if cand.id == selectedID {
++				// Same eligibility (incl. JIT claim) as the auto path; a
++				// selected node with the model Loaded stays allowed.
++				if model != "" && !s.eligible(selectedID, engine, model) {
++					return nil, reservation{}, ""
++				}
++				res := p.takeLocked(selectedID, engine, model, false)
++				res.reason = "pin"
++				return candidates, res, ""
++			}
++		}
++	}
++	// Eligibility is re-checked here, under the lock the claim is taken under,
++	// so two requests cannot both pass a stale check and both JIT-load.
++	kept := candidates[:0:0]
++	for _, c := range candidates {
++		if model == "" || s.eligible(c.id, engine, model) {
++			kept = append(kept, c)
++		}
++	}
++	if candidates = kept; len(candidates) == 0 {
++		return candidates, reservation{}, ""
++	}
++	if len(p.priority) == 0 {
++		return candidates, p.takeLocked(candidates[0].id, engine, model, false), ""
++	}
++
++	candidateIndex := make(map[string]int, len(candidates))
++	anyWarm := false
++	for i, cand := range candidates {
++		candidateIndex[cand.id] = i
++		if !cooling[cand.id] {
++			anyWarm = true
++		}
++	}
++	occ := func(id string) int { return p.occLocked(inflightKey{engine, model, id}) }
++	free := func(id string) bool { return occ(id) < s.nodeSlots(id, engine, model) }
++	queue := func(id string) float64 { return float64(occ(id)) / float64(s.nodeSlots(id, engine, model)) }
++	best := func(ok func(string) bool) int {
++		return p.bestLocked(engine, model, candidates, nil, cooling, ok)
++	}
++
++	bestIndex := -1
++	decision, reason := "", ""
++	if key != "" {
++		decision = affinity.Miss
++		if bound, ok := s.affinity.Lookup(key); ok {
++			decision = affinity.Rebind
++			index, listed := candidateIndex[bound]
++			if listed && containsID(p.priority, bound) && !(cooling[bound] && anyWarm) {
++				// The hit test reads our own durable count, not scheduler
++				// pending, which can be stale enough to break sequential hits.
++				if s.inflight[inflightKey{engine, model, bound}] < s.nodeSlots(bound, engine, model) {
++					bestIndex, decision, reason = index, affinity.Hit, "affinity-hit"
++				} else if other := best(func(id string) bool { return free(id) && (!cooling[id] || cooling[bound]) }); other >= 0 {
++					bestIndex, decision, reason = other, affinity.Yield, "affinity-yield"
++				} else if lowest := best(nil); lowest >= 0 {
++					// Every node is full: stay unless another is clearly shorter.
++					if queue(bound) <= queue(candidates[lowest].id)+1 {
++						bestIndex, decision, reason = index, affinity.Hit, "affinity-hit"
++					} else {
++						bestIndex = lowest
++					}
++				}
++			}
++		}
++	}
++	if bestIndex < 0 {
++		bestIndex = best(nil)
++	}
++	if bestIndex < 0 {
++		return candidates, p.takeLocked(candidates[0].id, engine, model, false), ""
++	}
++	if reason == "" {
++		reason = "least-queued"
++		if free(candidates[bestIndex].id) {
++			reason = "free-slot"
++		}
++	}
++
++	chosen := candidates[bestIndex]
++	if key != "" {
++		s.affinity.Bind(key, chosen.id)
++	}
++	res := p.takeLocked(chosen.id, engine, model, true)
++	res.reason = reason
++	if bestIndex > 0 {
++		copy(candidates[1:bestIndex+1], candidates[:bestIndex])
++		candidates[0] = chosen
++	}
++	return candidates, res, decision
++}
++
++// takeLocked counts one request on a node: always in the durable inflight, and
++// in the snapshot-scoped reservations when optimistic. Caller holds priorityMu.
++func (p *Proxy) takeLocked(nodeID, engine, model string, optimistic bool) reservation {
++	s := p.local
++	if s.inflight == nil {
++		s.inflight = make(map[inflightKey]int)
++	}
++	s.inflight[inflightKey{engine, model, nodeID}]++
++	if optimistic {
++		if p.priorityReservations == nil {
++			p.priorityReservations = make(map[string]int)
++		}
++		if s.reservedBy == nil {
++			s.reservedBy = make(map[inflightKey]int)
++		}
++		p.priorityReservations[nodeID]++
++		s.reservedBy[inflightKey{engine, model, nodeID}]++
++	}
++	return reservation{
++		nodeID: nodeID, generation: p.appliedPriorityGeneration, held: true,
++		localClaim: localClaim{
++			engine: engine, model: model, optimistic: optimistic,
++			takenAt: s.clock().UnixMilli(), jit: s.claimJIT(nodeID, engine, model),
++		},
++	}
++}
++
++// dropLocked is takeLocked's inverse. The durable count is always decremented,
++// whatever snapshot has arrived since; only the optimistic one is guarded by
++// the generation, because a snapshot already folded that one in.
++func (p *Proxy) dropLocked(r reservation) {
++	s := p.local
++	if r.jit {
++		s.releaseJIT(r.nodeID, r.engine, r.model)
++	}
++	k := inflightKey{r.engine, r.model, r.nodeID}
++	if s.inflight[k] <= 1 {
++		delete(s.inflight, k)
++	} else {
++		s.inflight[k]--
++	}
++	same := r.optimistic && r.generation == p.appliedPriorityGeneration
++	// Remembered either way: a snapshot computed while this ran but applied
++	// after it finished would otherwise resurrect its occupancy.
++	if s.completions == nil {
++		s.completions = make(map[inflightKey][]completion)
++	}
++	c := completion{taken: r.takenAt, done: s.clock().UnixMilli(), gen: p.appliedPriorityGeneration, deferred: same}
++	if ts := append(s.completions[k], c); len(ts) <= 1024 {
++		s.completions[k] = ts
++	} else {
++		s.completions[k] = ts[len(ts)-1024:]
++	}
++	if !same {
++		return
++	}
++	if s.reservedBy[k] <= 1 {
++		delete(s.reservedBy, k)
++	} else {
++		s.reservedBy[k]--
++	}
++	if p.priorityReservations[r.nodeID] <= 1 {
++		delete(p.priorityReservations, r.nodeID)
++		return
++	}
++	p.priorityReservations[r.nodeID]--
++}
++
++// localDropLocked is releaseReservation's fork path (P6). Caller holds
++// priorityMu and has checked r.held.
++func (p *Proxy) localDropLocked(r reservation) bool {
++	if p.local == nil {
++		return false
++	}
++	p.dropLocked(r)
++	return true
++}
++
++// localMoveLocked is moveReservation's fork path (P6): the optimistic part is
++// retaken under the current snapshot. Caller holds priorityMu.
++func (p *Proxy) localMoveLocked(r reservation, nodeID string) (reservation, bool) {
++	if p.local == nil {
++		return r, false
++	}
++	p.dropLocked(r)
++	res := p.takeLocked(nodeID, r.engine, r.model, r.optimistic)
++	res.reason = r.reason
++	return res, true
++}
++
++// occLocked is how many requests occupy a node's slots for an engine/model:
++// the larger of our own durable count and the scheduler's pending plus what we
++// reserved since its snapshot, less local finishes it had not yet seen. A
++// scheduler without a per-model split contributes its node-wide pending.
++func (p *Proxy) occLocked(k inflightKey) int {
++	s := p.local
++	base := p.priorityPending[k.node]
++	if by, ok := s.pendingBy[k.node]; ok {
++		base = by[schedulerwire.PendingKey(k.engine, k.model)]
++	}
++	done := 0
++	at := s.computedAt[k.node]
++	for _, c := range s.completions[k] {
++		if c.deferred && c.gen >= p.appliedPriorityGeneration {
++			continue // reservedBy already dropped it
++		}
++		if c.taken <= at && c.done > at {
++			done++
++		}
++	}
++	return max(s.inflight[k], base+s.reservedBy[k]-done)
++}
++
++// bestLocked returns the index in cands of the best scheduler-listed candidate
++// not in tried and accepted by ok, ranked by routing.Better (cooling last,
++// then free slot, queue per slot, GPU pressure plus reservations, local node,
++// scheduler order). Caller holds priorityMu.
++func (p *Proxy) bestLocked(engine, model string, cands []candidate, tried, cooling map[string]bool, ok func(string) bool) int {
++	index := make(map[string]int, len(cands))
++	for i, c := range cands {
++		index[c.id] = i
++	}
++	rc := make([]routing.Candidate, 0, len(cands))
++	at := make([]int, 0, len(cands))
++	for order, id := range p.priority {
++		i, listed := index[id]
++		if !listed || tried[id] || (ok != nil && !ok(id)) {
++			continue
++		}
++		rc = append(rc, routing.Candidate{
++			ID: id, Order: order,
++			Slots: p.local.nodeSlots(id, engine, model),
++			Occ:   p.occLocked(inflightKey{engine, model, id}),
++			// Reservations through any engine's facade count as pressure:
++			// they share the GPU even though they do not share slots.
++			GPU:     p.priorityGPUPressure[id] + p.priorityReservations[id],
++			Local:   cands[i].local,
++			Cooling: cooling[id],
++		})
++		at = append(at, i)
++	}
++	if b := routing.Best(rc); b >= 0 {
++		return at[b]
++	}
++	return -1
++}
++
++// rescoreReserve picks the best untried candidate right now and moves the
++// request's held claim onto it in one critical section, so failover sees the
++// load as it is rather than as it was when the round was formed. Candidates
++// the scheduler does not list follow in round order.
++func (p *Proxy) rescoreReserve(f *facade, round []candidate, tried map[string]bool, held *reservation, model string) (candidate, bool) {
++	engine := f.profile.Name
++	cooling := p.coolingSet(time.Now())
++	p.priorityMu.Lock()
++	defer p.priorityMu.Unlock()
++	// Eligibility is re-checked under the reservation lock: another request or
++	// engine may have loaded a model, or claimed the node, since the round was
++	// built.
++	skip := make(map[string]bool, len(round))
++	for _, c := range round {
++		skip[c.id] = tried[c.id] || !p.local.eligible(c.id, engine, model)
++	}
++	i := p.bestLocked(engine, model, round, skip, cooling, nil)
++	if i < 0 {
++		for j, c := range round {
++			if !skip[c.id] {
++				i = j
++				break
++			}
++		}
++	}
++	if i < 0 {
++		return candidate{}, false
++	}
++	cand := round[i]
++	if !held.held {
++		return cand, true
++	}
++	// The claim is published at each step so a panic below can never leave the
++	// caller holding one that was already dropped, or lose the new one.
++	old := *held
++	*held = reservation{}
++	p.dropLocked(old)
++	*held = p.takeLocked(cand.id, engine, model, old.optimistic)
++	held.reason = "free-slot"
++	if p.occLocked(inflightKey{engine, model, cand.id}) > p.local.nodeSlots(cand.id, engine, model) {
++		held.reason = "least-queued"
++	}
++	return cand, true
++}
++
++func containsID(ids []string, id string) bool {
++	for _, v := range ids {
++		if v == id {
++			return true
++		}
++	}
++	return false
++}
++
++// localReq is one request's fork routing state; nil when the proxy has no
++// fork state, which makes every method below a no-op.
++type localReq struct {
++	p        *Proxy
++	f        *facade
++	model    string // set only for inference with a model
++	post     bool
++	key      string
++	decision string
++	tried    map[string]bool
++	// notLoadedRetry marks the next attempt as the P9 retry, for its log.
++	notLoadedRetry bool
++	status         int
++	ttfb           int64
++}
++
++// request starts a request's fork state (P6).
++func (s *localState) request(p *Proxy, f *facade, r *http.Request, body []byte, model string, isInf bool) *localReq {
++	if s == nil {
++		return nil
++	}
++	lr := &localReq{p: p, f: f, post: r.Method == http.MethodPost, tried: map[string]bool{}}
++	if isInf && model != "" {
++		lr.model = model
++		lr.key = affinity.Key(r, body)
++	}
++	return lr
++}
++
++// localReserve takes the request's reservation (P6): NVIDIA's reserveCandidate
++// without fork state, else the slot-aware, affinity-aware one.
++func (p *Proxy) localReserve(lr *localReq, f *facade, cands []candidate) ([]candidate, reservation) {
++	if lr == nil {
++		return p.reserveCandidate(f, cands)
++	}
++	out, held, d := p.reserveCandidateFor(f, cands, lr.key, lr.model)
++	if d != "" {
++		lr.decision = d
++	}
++	return out, held
++}
++
++// affinityDecision is the RequestEvent's affinity field (P6).
++func (lr *localReq) affinityDecision() string {
++	if lr == nil {
++		return ""
++	}
++	return lr.decision
++}
++
++// onMove follows a failover that landed elsewhere with the affinity binding
++// (P7). Caller holds the request's resMu.
++func (lr *localReq) onMove(nodeID string, held reservation) {
++	if lr == nil || lr.key == "" || !held.held {
++		return
++	}
++	lr.p.local.affinity.Bind(lr.key, nodeID)
++}
++
++// resetTried starts a fresh round (P7).
++func (lr *localReq) resetTried() {
++	if lr != nil {
++		lr.tried = map[string]bool{}
++	}
++}
++
++// pick re-scores the untried candidates of the round before every attempt
++// after its first, moving the held claim onto the winner (P7). skip reports
++// that none is still eligible, which ends the round.
++func (lr *localReq) pick(round []candidate, next int, cand candidate, resMu *sync.Mutex, held *reservation) (candidate, bool) {
++	if lr == nil {
++		return cand, false
++	}
++	if next > 0 && lr.model != "" {
++		ok := true
++		func() {
++			resMu.Lock()
++			defer resMu.Unlock()
++			cand, ok = lr.p.rescoreReserve(lr.f, round, lr.tried, held, lr.model)
++		}()
++		if !ok {
++			return cand, true
++		}
++	}
++	lr.tried[cand.id] = true
++	return cand, false
++}
++
++// attemptStart logs why this node was chosen (P7).
++func (lr *localReq) attemptStart(reqID string, attempt int, nodeID string, ncands int, resMu *sync.Mutex, held *reservation) {
++	if lr == nil || lr.model == "" {
++		return
++	}
++	lr.status, lr.ttfb = 0, 0
++	resMu.Lock()
++	reason := held.reason
++	resMu.Unlock()
++	if lr.notLoadedRetry {
++		reason, lr.notLoadedRetry = "notloaded-retry", false
++	}
++	slog.Info("attempt_start", "req", reqID, "attempt", attempt,
++		"engine", lr.f.profile.Name, "model", lr.model, "node", nodeID,
++		"reason", reason, "cands", ncands)
++}
++
++// notLoaded records the attempt's status and, when the engine refused the
++// model as not loaded, suppresses the node for it and reports whether to
++// retry on another (P9).
++func (lr *localReq) notLoaded(ctx context.Context, resp *http.Response, nodeID string, last bool, attemptStart time.Time) bool {
++	if lr == nil {
++		return false
++	}
++	lr.status = resp.StatusCode
++	lr.ttfb = time.Since(attemptStart).Milliseconds()
++	if lr.model == "" || !lr.post ||
++		(resp.StatusCode != http.StatusBadRequest && resp.StatusCode != http.StatusNotFound) ||
++		!classifyNotLoaded(ctx, lr.f.profile.Name, resp, firstBodyTimeout) {
++		return false
++	}
++	lr.p.suppress(inflightKey{lr.f.profile.Name, lr.model, nodeID})
++	if last {
++		return false
++	}
++	lr.notLoadedRetry = true
++	return true
++}
++
++// attemptEnd logs the attempt's outcome (P7).
++func (lr *localReq) attemptEnd(reqID string, attempt int, nodeID string, attemptStart time.Time, retried bool) {
++	if lr == nil || lr.model == "" {
++		return
++	}
++	slog.Info("attempt_end", "req", reqID, "attempt", attempt, "node", nodeID,
++		"status", lr.status, "ttfb_ms", lr.ttfb,
++		"dur_ms", time.Since(attemptStart).Milliseconds(), "retried", retried)
++}
++
++// releaseEarly drops the claim as soon as the response has been copied (P6,
++// fork #17): a follow-up turn of the same conversation arriving before the
++// reporting defer would otherwise see the bound node as full and yield off
++// it. NVIDIA's deferred release then sees a zero reservation and is a no-op.
++func (lr *localReq) releaseEarly(resMu *sync.Mutex, held *reservation) {
++	if lr == nil {
++		return
++	}
++	resMu.Lock()
++	defer resMu.Unlock()
++	lr.p.releaseReservation(*held)
++	*held = reservation{}
++}
++
++// resolveCandidatesN is NVIDIA's resolveCandidates followed by the P5
++// residency filter, returning how many owners were dropped as not loaded.
++func (f *facade) resolveCandidatesN(model string) ([]candidate, int) {
++	return f.host.local.filterCandidates(f, model, f.resolveCandidates(model), true)
++}
+diff --git a/services/nvpair-proxy/local_proxy_test.go b/services/nvpair-proxy/local_proxy_test.go
+new file mode 100644
+index 0000000..25362c9
+--- /dev/null
++++ b/services/nvpair-proxy/local_proxy_test.go
+@@ -0,0 +1,69 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"nvpair-shared/schedulerwire"
++)
++
++func localTieCandidates() []candidate {
++	return []candidate{{id: "a-remote"}, {id: "z-local", local: true}}
++}
++
++func localTieProxy(t *testing.T) *Proxy {
++	p := withLocal(prProxy(t))
++	ids := []string{"a-remote", "z-local"}
++	applySnapshot(p, schedulerwire.Priority{Nodes: ids, Ranks: []schedulerwire.NodeRank{{ID: "a-remote", Rank: 0}, {ID: "z-local", Rank: 1}}})
++	return p
++}
++
++func TestReserveCandidate_IdleTiePrefersLocal(t *testing.T) {
++	p := localTieProxy(t)
++	assert.Equal(t, "z-local", reservedID(p, localTieCandidates()), "want local node")
++}
++
++func TestReserveCandidate_FullLocalYieldsToFreeRemote(t *testing.T) {
++	p := localTieProxy(t)
++	f := p.soleFacade()
++	p.priorityMu.Lock()
++	for range p.nodeSlots("z-local", f.profile.Name, "") {
++		p.takeLocked("z-local", f.profile.Name, "", false)
++	}
++	p.priorityMu.Unlock()
++	require.Equal(t, "a-remote", reservedID(p, localTieCandidates()), "want remote with free slot")
++}
++
++// Model lookups (/api/show) only need an owner with the model installed, not a
++// loaded slot; inference for the same model still requires residency.
++func TestHandleHTTP_ModelLookupIgnoresResidency(t *testing.T) {
++	tc := ollamaCase(t)
++	a, _ := newCountingServer(t, 200, "")
++	disc := NewDiscovery()
++	disc.AddManual(nodeForModel(t, "a", a, tc.advertisedModel))
++	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
++	p.local.capacity = &fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty}}
++
++	rec := httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/show", strings.NewReader(`{"name":"qwen3"}`)))
++	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
++
++	rec = httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
++	assert.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
++	require.NotEmpty(t, rec.Body.String())
++}
++
++// withLocal gives a test proxy fork state with no capacity source (one slot
++// everywhere, nothing known), as NewProxy-built fork tests had before step 5.
++func withLocal(p *Proxy) *Proxy {
++	p.local = &localState{}
++	return p
++}
+diff --git a/services/nvpair-proxy/local_slotscore_test.go b/services/nvpair-proxy/local_slotscore_test.go
+new file mode 100644
+index 0000000..88cb28f
+--- /dev/null
++++ b/services/nvpair-proxy/local_slotscore_test.go
+@@ -0,0 +1,311 @@
++// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++// SPDX-License-Identifier: Apache-2.0
++
++package main
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"nvpair-proxy/local/affinity"
++	"strings"
++	"testing"
++	"time"
++
++	"nvpair-shared/schedulerwire"
++)
++
++func inflightTotal(p *Proxy) int {
++	p.priorityMu.Lock()
++	defer p.priorityMu.Unlock()
++	n := 0
++	for _, v := range p.local.inflight {
++		n += v
++	}
++	return n
++}
++
++// reserveN reserves n requests for model m without releasing any.
++func reserveN(p *Proxy, n int, ids ...string) map[string]int {
++	got := map[string]int{}
++	for range n {
++		out, _, _ := p.reserveCandidateFor(p.soleFacade(), reservationCandidates(ids...), "", "m")
++		got[out[0].id]++
++	}
++	return got
++}
++
++func TestSlotScore_TwoByTwoSplitsEvenly(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	p.local.capacity = &fakeCap{slots: map[string]int{"a": 2, "b": 2}}
++	if got := reserveN(p, 4, "a", "b"); got["a"] != 2 || got["b"] != 2 {
++		t.Fatalf("split = %v, want 2/2", got)
++	}
++}
++
++func TestSlotScore_FullNodeNotChosenWhileAnotherFree(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	p.local.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 3}}
++	if got := reserveN(p, 4, "a", "b"); got["a"] != 1 || got["b"] != 3 {
++		t.Fatalf("split = %v, want a=1 b=3", got)
++	}
++}
++
++func TestSlotScore_SnapshotKeepsInflightAndMoveCancelLeavesZero(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	f := p.soleFacade()
++	_, r1, _ := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "", "m")
++	_, r2, _ := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "", "m")
++	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b"}, Ranks: []schedulerwire.NodeRank{{ID: "a"}, {ID: "b"}}})
++	if n := inflightTotal(p); n != 2 {
++		t.Fatalf("inflight after snapshot = %d, want 2", n)
++	}
++	moved := p.moveReservation(r1, map[string]string{"a": "b", "b": "a"}[r1.nodeID])
++	p.releaseReservation(moved)
++	p.releaseReservation(r2)
++	p.priorityMu.Lock()
++	defer p.priorityMu.Unlock()
++	if len(p.local.inflight) != 0 || len(p.local.reservedBy) != 0 {
++		t.Fatalf("leaked: inflight=%v reservedBy=%v", p.local.inflight, p.local.reservedBy)
++	}
++}
++
++func TestSlotScore_OtherModelDoesNotFillSlot(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	f := p.soleFacade()
++	p.reserveCandidateFor(f, reservationCandidates("a"), "", "other")
++	p.priorityMu.Lock()
++	defer p.priorityMu.Unlock()
++	if got := p.occLocked(inflightKey{f.profile.Name, "m", "a"}); got != 0 {
++		t.Fatalf("occupancy of m on a = %d, want 0", got)
++	}
++}
++
++func TestSlotScore_OccupancyUsesPendingByAndDiscountsCompletions(t *testing.T) {
++	p := affinityProxy(t, "a")
++	f := p.soleFacade()
++	now := time.UnixMilli(10_000)
++	p.local.now = func() time.Time { return now }
++	key := schedulerwire.PendingKey(f.profile.Name, "m")
++	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a"}, Ranks: []schedulerwire.NodeRank{
++		{ID: "a", Pending: 9, LocalRankExt: schedulerwire.LocalRankExt{PendingBy: map[string]int{key: 2}, ComputedAt: 9_000}}}})
++	k := inflightKey{f.profile.Name, "m", "a"}
++	p.priorityMu.Lock()
++	if got := p.occLocked(k); got != 2 {
++		t.Fatalf("occ = %d, want PendingBy 2 (not node-wide 9)", got)
++	}
++	p.priorityMu.Unlock()
++	// A pinned request finishes after the scheduler computed: it is discounted.
++	p.local.now = func() time.Time { return time.UnixMilli(8_000) }
++	p.priorityMu.Lock()
++	r := p.takeLocked("a", f.profile.Name, "m", false) // began before the snapshot was computed
++	p.priorityMu.Unlock()
++	p.local.now = func() time.Time { return now }
++	p.releaseReservation(r)
++	p.priorityMu.Lock()
++	defer p.priorityMu.Unlock()
++	if got := p.occLocked(k); got != 1 {
++		t.Fatalf("occ after local completion = %d, want 1", got)
++	}
++}
++
++func TestSlotScore_FailoverPicksFreeOverFull(t *testing.T) {
++	p := affinityProxy(t, "a", "b", "c")
++	f := p.soleFacade()
++	p.local.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1, "c": 1}}
++	p.reserveCandidateFor(f, reservationCandidates("b"), "", "m") // b is full
++	_, held, _ := p.reserveCandidateFor(f, reservationCandidates("a"), "", "m")
++	round := reservationCandidates("a", "b", "c")
++	cand, _ := p.rescoreReserve(f, round, map[string]bool{"a": true}, &held, "m")
++	res := held
++	if cand.id != "c" || res.nodeID != "c" {
++		t.Fatalf("failover chose %s, want free node c", cand.id)
++	}
++	if n := inflightTotal(p); n != 2 {
++		t.Fatalf("inflight = %d, want 2 (claim moved, not added)", n)
++	}
++}
++
++func TestSlotScore_EligibilityKnownEmptyJITAndUnknown(t *testing.T) {
++	tc := anyCase(t)
++	a, _ := newCountingServer(t, 200, "")
++	b, _ := newCountingServer(t, 200, "")
++	disc := NewDiscovery()
++	disc.AddManual(nodeForModel(t, "a", a, tc.advertisedModel))
++	disc.AddManual(nodeForModel(t, "b", b, tc.advertisedModel))
++	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
++	p.local.capacity = &fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty}} // b Unknown
++	f := p.soleFacade()
++	if cands, n := f.resolveCandidatesN(tc.advertisedModel); len(cands) != 1 || cands[0].id != "b" || n != 1 {
++		t.Fatalf("cands=%v skipped=%d, want only b and 1 skipped", cands, n)
++	}
++	p.local.capacity.(*fakeCap).jit = map[string]bool{"a": true}
++	if cands, _ := f.resolveCandidatesN(tc.advertisedModel); len(cands) != 2 {
++		t.Fatalf("JIT node should be eligible, got %d", len(cands))
++	}
++	p.local.capacity.(*fakeCap).res["b"] = ResidencyKnownEmpty
++	p.local.capacity.(*fakeCap).jit = nil
++	rec := httptest.NewRecorder()
++	f.handleHTTP(rec, tc.inferenceRequest())
++	if rec.Code != 503 || !strings.Contains(rec.Body.String(), "no live node has model") {
++		t.Fatalf("got %d %q, want 503 no live node has model", rec.Code, rec.Body.String())
++	}
++}
++
++// notLoadedServer answers 400 with the Ollama not-loaded refusal.
++func notLoadedServer(t *testing.T, status int, body string) (string, func() int) {
++	return newCountingServer(t, status, body)
++}
++
++func TestSlotScore_NotLoaded400FailsOverAndSuppresses(t *testing.T) {
++	tc := anyCase(t)
++	bad, badHits := notLoadedServer(t, 400, `{"error":"model \"qwen3:latest\" not found"}`)
++	good, goodHits := newCountingServer(t, 200, `{"done":true}`)
++	disc := NewDiscovery()
++	disc.AddManual(nodeForModel(t, "bad", bad, tc.advertisedModel))
++	disc.AddManual(nodeForModel(t, "good", good, tc.advertisedModel))
++	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
++	p.local.capacity = &fakeCap{}
++	p.soleFacade().SetSelected("bad")
++	rec := httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
++	if rec.Code != 200 || badHits() != 1 || goodHits() != 1 {
++		t.Fatalf("code=%d bad=%d good=%d, want 200 after one try each", rec.Code, badHits(), goodHits())
++	}
++	if p.eligible("bad", tc.profile.Name, tc.requestedModel) {
++		t.Fatal("bad node should be suppressed")
++	}
++	// A directory sweep newer than the suppression showing it loaded lifts it.
++	p.local.capacity = &fakeCap{res: map[string]Residency{"bad": ResidencyLoaded}, seen: time.Now().Add(time.Second)}
++	if !p.eligible("bad", tc.profile.Name, tc.requestedModel) {
++		t.Fatal("a newer Loaded sweep should lift the suppression")
++	}
++}
++
++func TestSlotScore_NonMatchingAndLongBodiesPassThrough(t *testing.T) {
++	tc := anyCase(t)
++	long := `model "qwen3:latest" not found ` + strings.Repeat("x", 5000)
++	for name, body := range map[string]string{"nonmatching": `{"error":"bad request"}`, "over4k": long} {
++		srv, hits := notLoadedServer(t, 400, body)
++		other, otherHits := newCountingServer(t, 200, "")
++		disc := NewDiscovery()
++		disc.AddManual(nodeForModel(t, "bad", srv, tc.advertisedModel))
++		disc.AddManual(nodeForModel(t, "other", other, tc.advertisedModel))
++		p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
++		p.soleFacade().SetSelected("bad")
++		rec := httptest.NewRecorder()
++		p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
++		if rec.Code != 400 || rec.Body.String() != body || hits() != 1 || otherHits() != 0 {
++			t.Fatalf("%s: code=%d len=%d hits=%d/%d, want the 400 untouched with no retry",
++				name, rec.Code, rec.Body.Len(), hits(), otherHits())
++		}
++	}
++}
++
++func TestSlotScore_TruncatedCommittedStreamNotReplayed(t *testing.T) {
++	tc := anyCase(t)
++	cut := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		io.WriteString(w, "data: {\"partial\":true}\n\n")
++		w.(http.Flusher).Flush()
++		panic(http.ErrAbortHandler)
++	}))
++	t.Cleanup(cut.Close)
++	other, otherHits := newCountingServer(t, 200, "")
++	disc := NewDiscovery()
++	disc.AddManual(nodeForModel(t, "cut", cut.URL, tc.advertisedModel))
++	disc.AddManual(nodeForModel(t, "other", other, tc.advertisedModel))
++	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
++	p.soleFacade().SetSelected("cut")
++	func() {
++		defer func() { _ = recover() }() // the copy error aborts the handler
++		p.soleFacade().handleHTTP(httptest.NewRecorder(), tc.inferenceRequest())
++	}()
++	if otherHits() != 0 {
++		t.Fatalf("a stream cut after its first bytes was replayed on another node (%d hits)", otherHits())
++	}
++	if n := inflightTotal(p); n != 0 {
++		t.Fatalf("inflight after stream abort = %d, want 0", n)
++	}
++}
++
++func TestSlotScore_AffinityHitUsesLocalInflight(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	f := p.soleFacade()
++	p.local.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1}}
++	_, r, _ := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "k", "m")
++	p.releaseReservation(r)
++	// Stale scheduler pending says a is full; our own inflight says it is free.
++	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b"}, Ranks: []schedulerwire.NodeRank{
++		{ID: "a", Pending: 5, LocalRankExt: schedulerwire.LocalRankExt{ComputedAt: time.Now().UnixMilli() + 1000}}, {ID: "b"}}})
++	_, _, d := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "k", "m")
++	if d != affinity.Hit {
++		t.Fatalf("decision = %q, want hit", d)
++	}
++}
++
++func TestSlotScore_SuppressionAppliesWithoutProvider(t *testing.T) {
++	p := affinityProxy(t, "a")
++	p.local.capacity = nil
++	p.suppress(inflightKey{"e", "m", "a"})
++	if p.eligible("a", "e", "m") {
++		t.Fatal("suppressed node eligible with no capacity provider")
++	}
++	p.local.capacity = &fakeCap{}
++	if p.eligible("a", "e", "m") {
++		t.Fatal("suppressed node eligible with Unknown residency")
++	}
++}
++
++func notLoadedResp(r io.Reader) *http.Response {
++	return &http.Response{StatusCode: 400, Body: io.NopCloser(r)}
++}
++
++type stallReader struct{ done chan struct{} }
++
++func (s stallReader) Read([]byte) (int, error) { <-s.done; return 0, io.EOF }
++
++func TestNotLoaded_ReadIsCancellable(t *testing.T) {
++	done := make(chan struct{})
++	defer close(done)
++	resp := &http.Response{Body: struct {
++		io.Reader
++		io.Closer
++	}{stallReader{done}, io.NopCloser(nil)}}
++	start := time.Now()
++	if classifyNotLoaded(context.Background(), "ollama", resp, 20*time.Millisecond) {
++		t.Fatal("classified a stalled body")
++	}
++	if time.Since(start) > time.Second {
++		t.Fatal("classification did not honour its deadline")
++	}
++	if _, err := io.ReadAll(resp.Body); err == nil {
++		t.Fatal("stalled body should surface the failure")
++	}
++}
++
++type failAfter struct {
++	data string
++	sent bool
++}
++
++func (f *failAfter) Read(b []byte) (int, error) {
++	if f.sent {
++		return 0, io.ErrUnexpectedEOF
++	}
++	f.sent = true
++	return copy(b, f.data), nil
++}
++
++func TestNotLoaded_ReadErrorPassesThrough(t *testing.T) {
++	prefix := `{"error":"model \"x\" not found"}`
++	resp := notLoadedResp(&failAfter{data: prefix})
++	if classifyNotLoaded(context.Background(), "ollama", resp, time.Second) {
++		t.Fatal("truncated body must not classify")
++	}
++	got, err := io.ReadAll(resp.Body)
++	if string(got) != prefix || err != io.ErrUnexpectedEOF {
++		t.Fatalf("got %q, %v; want prefix then ErrUnexpectedEOF", got, err)
++	}
++}
+diff --git a/services/nvpair-proxy/main.go b/services/nvpair-proxy/main.go
+index ebfa902..b4a1624 100644
+--- a/services/nvpair-proxy/main.go
++++ b/services/nvpair-proxy/main.go
+@@ -71,6 +71,7 @@ func main() {
+ 
+ 	codec := NewCodec(transport)
+ 	proxy := NewProxy(codec)
++	proxy.local = newLocalState(nil) // fork:P1
+ 	// Open a live view of this node's cluster mTLS trust fabric. While unclustered
+ 	// the proxy serves only the loopback plaintext personality; once this node is
+ 	// a member the same listener also serves the pin-gated LAN mTLS ingress, and
+diff --git a/services/nvpair-proxy/proxy.go b/services/nvpair-proxy/proxy.go
+index 3448b8e..849531f 100644
+--- a/services/nvpair-proxy/proxy.go
++++ b/services/nvpair-proxy/proxy.go
+@@ -144,6 +144,8 @@ type RequestEvent struct {
+ 	Duration int64  `json:"duration_ms"`
+ 	TTFB     int64  `json:"ttfb_ms,omitempty"`
+ 	Error    string `json:"error,omitempty"`
++	// fork:P6
++	Affinity string `json:"affinity,omitempty"` // session-affinity decision (hit, miss, rebind, yield)
+ }
+ 
+ // Workload lifecycle method names (workload-manager spec 7). The proxy is
+@@ -405,6 +407,9 @@ type Proxy struct {
+ 	coolMu    sync.Mutex
+ 	coolUntil map[string]time.Time
+ 
++	// fork:P3
++	local *localState
++
+ 	// transportMu guards the long-lived HTTP transports reused across forwards
+ 	// and model-list fetches. Allocating a new http.Transport per request
+ 	// defeats connection pooling and leaks idle sockets until GC.
+@@ -843,6 +848,8 @@ type candidate struct {
+ 	id       string
+ 	url      *url.URL
+ 	peerUUID string
++	// fork:P5
++	local bool
+ }
+ 
+ // candidateTransport returns the reverse-proxy / model-list transport for a
+@@ -1148,7 +1155,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
+ 				continue
+ 			}
+ 			seen[item.key] = item
+-			models = append(models, item.raw)
++			models = append(models, p.local.annotateModel(f, openAI, candidates, item.key, item.raw)) // fork:P8
+ 		}
+ 	}
+ 	if !success {
+@@ -1197,11 +1204,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 	role, routed := f.profile.roleFor(r.Method, r.URL.Path)
+ 	lookup := routed && role == roleModelLookupPOST
+ 	bodyBytes, model := bufferBodyAndModel(r, lookup)
++	bodyBytes = p.local.rewriteBody(r, bodyBytes) // fork:P4
+ 	routingModel := ""
+ 	if isInf || lookup {
+ 		routingModel = model
+ 	}
+ 	candidates := f.resolveCandidates(routingModel)
++	candidates, notLoaded := p.local.filterCandidates(f, routingModel, candidates, !lookup) // fork:P5
++	lr := p.local.request(p, f, r, bodyBytes, model, isInf)                                 // fork:P6
+ 	if cors.IsPreflight(r) {
+ 		targets := make([]cors.Target, 0, len(candidates))
+ 		for _, cand := range candidates {
+@@ -1220,7 +1230,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 		held  reservation
+ 	)
+ 	if isInf && model != "" {
+-		candidates, held = p.reserveCandidate(f, candidates)
++		candidates, held = p.localReserve(lr, f, candidates) // fork:P6
+ 	}
+ 	// Released exactly once, whichever way the request ends: normal unwind,
+ 	// client disconnect, or an early return below. Without this a node stays
+@@ -1235,6 +1245,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 		resMu.Lock()
+ 		defer resMu.Unlock()
+ 		held = p.moveReservation(held, nodeID)
++		lr.onMove(nodeID, held) // fork:P7
+ 	}
+ 	defer func() {
+ 		resMu.Lock()
+@@ -1272,6 +1283,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 				rejectionStatus = http.StatusNotFound
+ 			}
+ 		}
++		rejectionBody, rejectionError, rejectionStatus = localNotLoadedRejection(notLoaded, lookup, routingModel, rejectionBody, rejectionError, rejectionStatus) // fork:P5
+ 		slog.Warn("proxy request rejected",
+ 			"id", reqID, "method", r.Method, "path", r.URL.Path,
+ 			"remote", r.RemoteAddr, "reason", rejectionError)
+@@ -1462,6 +1474,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 			"duration_ms", time.Since(start).Milliseconds(),
+ 			"ttfb_ms", ttfbMs,
+ 			"err", reportErr,
++			"affinity", lr.affinityDecision(), // fork:P6
+ 		)
+ 
+ 		_ = f.notify("proxy/request", RequestEvent{
+@@ -1474,6 +1487,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 			Duration: time.Since(start).Milliseconds(),
+ 			TTFB:     ttfbMs,
+ 			Error:    reportErr,
++			Affinity: lr.affinityDecision(), // fork:P6
+ 		})
+ 
+ 		// Terminal workload transition pairs with the workload:started emitted
+@@ -1565,7 +1579,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 		defer resMu.Unlock()
+ 		p.releaseReservation(held)
+ 		var out []candidate
+-		out, held = p.reserveCandidate(f, cands)
++		out, held = p.localReserve(lr, f, cands) // fork:P6
+ 		return out
+ 	}
+ 
+@@ -1636,10 +1650,12 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 				break
+ 			}
+ 			round = f.resolveCandidates(routingModel)
++			round, _ = p.local.filterCandidates(f, routingModel, round, true) // fork:P5
+ 			if isInf && model != "" {
+ 				round = takeHeld(round)
+ 			}
+ 			next = 0
++			lr.resetTried() // fork:P7
+ 			if len(round) == 0 {
+ 				// Every owner went away mid-flight. Not a rejection: keep
+ 				// waiting for one to come back. This consumes no attempt, which
+@@ -1648,6 +1664,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 			}
+ 		}
+ 		cand := round[next]
++		cand, skipRound := lr.pick(round, next, cand, &resMu, &held) // fork:P7
++		if skipRound {                                               // fork:P7
++			next = len(round)
++			continue
++		}
+ 		next++
+ 		dispatches++
+ 		// lastPermitted means no further dispatch can happen, so this attempt's
+@@ -1662,6 +1683,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 		// a node for the whole first-content budget, and for that time it is
+ 		// the node under load. A same-node move is a no-op.
+ 		moveHeld(cand.id)
++		lr.attemptStart(reqID, dispatches, cand.id, len(round), &resMu, &held) // fork:P7
+ 
+ 		// Each attempt runs on its own context, a child of the request's, so we
+ 		// can abandon this dispatch without touching the request itself. The
+@@ -1737,6 +1759,10 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 			// have arrived but before the body streams. That's both the retry
+ 			// decision point and, on commit, the time-to-first-byte boundary.
+ 			ModifyResponse: func(resp *http.Response) error {
++				if lr.notLoaded(attemptCtx, resp, cand.id, last, attemptStart) { // fork:P9
++					retry = true
++					return retrySignal{}
++				}
+ 				if !last && shouldRetry(resp.StatusCode) {
+ 					// Abort before streaming: ReverseProxy closes resp.Body and
+ 					// calls ErrorHandler with our sentinel, then we try next.
+@@ -1909,6 +1935,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 
+ 		proxy.ServeHTTP(sc, attemptReq)
+ 		cancelAttempt()
++		lr.attemptEnd(reqID, dispatches, cand.id, attemptStart, retry) // fork:P7
+ 		// Record how this candidate behaved for the next request's ordering.
+ 		// Measured, not classified from the error: a dial failure is bounded by
+ 		// the much shorter dial timeout and a status-based retry commits a
+@@ -1937,6 +1964,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 			finalStatus = sc.status
+ 			committedSC = sc
+ 			committed = true
++			lr.releaseEarly(&resMu, &held) // fork:P6
+ 		}
+ 	}
+ 
+@@ -2098,6 +2126,7 @@ func (f *facade) resolveCandidates(model string) []candidate {
+ 			return
+ 		}
+ 		seenHost[u.Host] = true
++		seenHost[u.Host] = p.local.claimsHost(f, model, n.ID) // fork:P5
+ 		out = append(out, candidate{
+ 			id:       n.ID,
+ 			url:      u,
+@@ -2148,6 +2177,8 @@ type reservation struct {
+ 	// held distinguishes "no reservation was taken" from "a reservation on the
+ 	// zero-value node", so release on the paths that never reserved is a no-op.
+ 	held bool
++	// fork:P6
++	localClaim
+ }
+ 
+ // reserveCandidate atomically moves the least estimated loaded scheduler-listed
+@@ -2168,6 +2199,9 @@ type reservation struct {
+ // Process-wide is the point: two facades bursting at once are competing for the
+ // same GPU, so a dispatch through either has to be visible to the other.
+ func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate, reservation) {
++	if out, res, ok := p.localReserveHook(f, candidates); ok { // fork:P6
++		return out, res
++	}
+ 	if len(candidates) == 0 {
+ 		return candidates, reservation{}
+ 	}
+@@ -2339,6 +2373,9 @@ func (p *Proxy) releaseReservation(r reservation) {
+ 	}
+ 	p.priorityMu.Lock()
+ 	defer p.priorityMu.Unlock()
++	if p.localDropLocked(r) { // fork:P6
++		return
++	}
+ 	if r.generation != p.appliedPriorityGeneration {
+ 		return
+ 	}
+@@ -2365,6 +2402,9 @@ func (p *Proxy) moveReservation(r reservation, nodeID string) reservation {
+ 	}
+ 	p.priorityMu.Lock()
+ 	defer p.priorityMu.Unlock()
++	if res, ok := p.localMoveLocked(r, nodeID); ok { // fork:P6
++		return res
++	}
+ 	if r.generation == p.appliedPriorityGeneration {
+ 		if p.priorityReservations[r.nodeID] <= 1 {
+ 			delete(p.priorityReservations, r.nodeID)
+@@ -2673,6 +2713,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
+ 	p.priorityPending = pending
+ 	p.priorityGPUPressure = gpuPressure
+ 	p.priorityReservations = make(map[string]int)
++	p.local.applySnapshot(priority) // fork:P6
+ 	return len(cleaned)
+ }
+ 
+-- 
+2.53.0
+

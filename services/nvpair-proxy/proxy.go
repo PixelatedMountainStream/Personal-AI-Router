@@ -144,9 +144,8 @@ type RequestEvent struct {
 	Duration int64  `json:"duration_ms"`
 	TTFB     int64  `json:"ttfb_ms,omitempty"`
 	Error    string `json:"error,omitempty"`
-	// Affinity is the session-affinity decision (hit, miss, rebind); empty
-	// when the request carried no affinity key.
-	Affinity string `json:"affinity,omitempty"`
+	// fork:P6
+	Affinity string `json:"affinity,omitempty"` // session-affinity decision (hit, miss, rebind, yield)
 }
 
 // Workload lifecycle method names (workload-manager spec 7). The proxy is
@@ -388,40 +387,28 @@ type Proxy struct {
 	priorityGPUPressure  map[string]int
 	priorityReservations map[string]int
 
-	// affinity pins a conversation's affinity key to a node (see affinity.go).
-	affinity affinityTable
-
-	// capacity supplies per-node slot counts (see capacity.go); nil means one
-	// slot everywhere. inflight is the durable count of requests this proxy has
-	// dispatched and not finished, per engine/model/node. Guarded by
-	// priorityMu. Unlike priorityReservations it is never reset by a snapshot.
-	capacity CapacityProvider
-	// directory is fed by every facade's discovery snapshot; nil in tests that
-	// inject capacity directly.
-	directory *directoryCapacity
-	inflight  map[inflightKey]int
-
-	// reservedBy is the optimistic reservations since the last snapshot, per
-	// engine/model/node; completions are local finishes the scheduler may not
-	// have seen yet (Unix ms). priorityPendingBy and priorityComputedAt come
-	// from the snapshot. All guarded by priorityMu.
-	reservedBy         map[inflightKey]int
-	claimMu            sync.Mutex
-	jitClaims          map[string]map[jitClaim]int       // node -> live JIT claims
-	jitReleased        map[string]map[jitClaim]time.Time // node -> claims released at T, held until a newer sweep
-	completions        map[inflightKey][]completion
-	priorityPendingBy  map[string]map[string]int
-	priorityComputedAt map[string]int64
-
-	// suppressed holds not-loaded refusals (see eligible); now is a test seam.
-	suppressMu sync.Mutex
-	suppressed map[inflightKey]time.Time
-	now        func() time.Time
-
 	// appliedPriorityGeneration is the newest snapshot generation applied, so a
 	// redelivered or superseded one cannot clear reservations twice. See
 	// SetPrioritySnapshot.
 	appliedPriorityGeneration uint64
+
+	// coolMu guards coolUntil, the per-node first-byte cooldown: a candidate
+	// that just spent a whole first-byte deadline without producing content is
+	// ordered behind its peers until its stamp expires.
+	//
+	// Process-local and in-memory on purpose. The stamp records what this proxy
+	// measured on its own path to that node, which is the only thing it can
+	// honestly claim; nothing is shared between processes and nothing is
+	// persisted. Two proxies are therefore free to disagree about a peer, each
+	// reflecting its own experience, and a restart starts from no opinion.
+	//
+	// Shared across facades, like the reservations above: a stalled node is
+	// stalled for every engine this process fronts.
+	coolMu    sync.Mutex
+	coolUntil map[string]time.Time
+
+	// fork:P3
+	local *localState
 
 	// transportMu guards the long-lived HTTP transports reused across forwards
 	// and model-list fetches. Allocating a new http.Transport per request
@@ -802,6 +789,19 @@ var idleClientWriteTimeout = 30 * time.Second
 // reassigns it.
 var firstBodyTimeout = proxyResponseTimeout
 
+// candidateCooldown is how long a node that spent a full first-byte deadline
+// without producing content is ordered behind its peers.
+//
+// One deadline, deliberately not a number of its own. The trigger is an attempt
+// that cost exactly that much, so waiting the same span before preferring the
+// node again states only what was measured, and it moves with whatever an
+// operator has set the deadline to instead of adding a knob nobody knows how to
+// tune.
+//
+// It is a var (not a const) only so a test can shorten it; production never
+// reassigns it.
+var candidateCooldown = proxyResponseTimeout
+
 var modelListClient = &http.Client{
 	Transport: &http.Transport{
 		DialContext: (&net.Dialer{
@@ -848,8 +848,7 @@ type candidate struct {
 	id       string
 	url      *url.URL
 	peerUUID string
-	// local marks this host's own node (served from the loopback engine); it
-	// wins load ties ahead of scheduler order.
+	// fork:P5
 	local bool
 }
 
@@ -1139,7 +1138,6 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 	success := false
 	models := make([]json.RawMessage, 0)
 	seen := make(map[string]modelListItem)
-	var keys []string // model key of models[i]
 	for i, result := range results {
 		if !result.ok {
 			slog.Debug("model list candidate unavailable",
@@ -1157,29 +1155,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 				continue
 			}
 			seen[item.key] = item
-			models = append(models, item.raw)
-			keys = append(keys, item.key)
-		}
-	}
-	if openAI {
-		// Only after every candidate is merged is the holder set complete.
-		// Every routable advertised owner counts, not only the nodes whose
-		// list call succeeded: inference can still route to the others.
-		nodeByID := map[string]Node{}
-		for _, n := range f.discovery.Nodes() {
-			nodeByID[n.ID] = n
-		}
-		if p.capacity != nil {
-			for i, key := range keys {
-				var owners []string
-				for _, c := range candidates {
-					if n, ok := nodeByID[c.id]; ok && nodeAdvertisesModel(f.profile, n, key) {
-						owners = append(owners, c.id)
-					}
-				}
-				n, _ := p.minContextLength(f.profile.Name, key, owners)
-				models[i] = withContextLength(models[i], n) // n==0 removes
-			}
+			models = append(models, p.local.annotateModel(f, openAI, candidates, item.key, item.raw)) // fork:P8
 		}
 	}
 	if !success {
@@ -1228,20 +1204,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	role, routed := f.profile.roleFor(r.Method, r.URL.Path)
 	lookup := routed && role == roleModelLookupPOST
 	bodyBytes, model := bufferBodyAndModel(r, lookup)
-	if r.URL.Path == "/v1/responses" && len(bodyBytes) > 0 {
-		if nb := normalizeResponsesInput(bodyBytes); len(nb) != len(bodyBytes) || !bytes.Equal(nb, bodyBytes) {
-			bodyBytes = nb
-			r.ContentLength = int64(len(nb))
-			r.Header.Set("Content-Length", strconv.Itoa(len(nb)))
-		}
-	}
+	bodyBytes = p.local.rewriteBody(r, bodyBytes) // fork:P4
 	routingModel := ""
 	if isInf || lookup {
 		routingModel = model
 	}
-	// A lookup reads the model from disk and loads nothing, so it needs an
-	// owner (advertised inventory), not a loaded slot: skip the residency filter.
-	candidates, notLoaded := f.resolveCandidatesFor(routingModel, !lookup)
+	candidates := f.resolveCandidates(routingModel)
+	candidates, notLoaded := p.local.filterCandidates(f, routingModel, candidates, !lookup) // fork:P5
+	lr := p.local.request(p, f, r, bodyBytes, model, isInf)                                 // fork:P6
 	if cors.IsPreflight(r) {
 		targets := make([]cors.Target, 0, len(candidates))
 		for _, cand := range candidates {
@@ -1259,10 +1229,8 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		resMu sync.Mutex
 		held  reservation
 	)
-	affKey, affDecision := "", ""
 	if isInf && model != "" {
-		affKey = affinityKey(r, bodyBytes)
-		candidates, held, affDecision = p.reserveCandidateFor(f, candidates, affKey, model)
+		candidates, held = p.localReserve(lr, f, candidates) // fork:P6
 	}
 	// Released exactly once, whichever way the request ends: normal unwind,
 	// client disconnect, or an early return below. Without this a node stays
@@ -1277,20 +1245,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		resMu.Lock()
 		defer resMu.Unlock()
 		held = p.moveReservation(held, nodeID)
-		if affKey != "" && held.held {
-			p.affinity.bind(affKey, nodeID) // failover landed elsewhere: follow it
-		}
+		lr.onMove(nodeID, held) // fork:P7
 	}
-	// releaseClaim is idempotent: held is zeroed under resMu, so the deferred
-	// backstop (every early return, error, cancellation and panic) and the
-	// explicit early call once the response has been copied cannot double-drop.
-	releaseClaim := func() {
+	defer func() {
 		resMu.Lock()
 		defer resMu.Unlock()
 		p.releaseReservation(held)
 		held = reservation{}
-	}
-	defer releaseClaim()
+	}()
 	if matchedRoute, ok := f.profile.routeFor(r.Method, r.URL.Path); ok && matchedRoute.Role.isModelList() {
 		if len(candidates) > 0 {
 			_ = f.notify("proxy/request-started", RequestStartedEvent{
@@ -1319,13 +1281,9 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				// A model lookup for a model nobody has is a not-found, as
 				// Ollama itself answers it, not a gateway failure.
 				rejectionStatus = http.StatusNotFound
-			} else if notLoaded > 0 {
-				msg, _ := json.Marshal("no live node has model " + model + " loaded")
-				rejectionBody = `{"error":` + string(msg) + `}`
-				rejectionError = "no live node has model loaded"
-				rejectionStatus = http.StatusServiceUnavailable
 			}
 		}
+		rejectionBody, rejectionError, rejectionStatus = localNotLoadedRejection(notLoaded, lookup, routingModel, rejectionBody, rejectionError, rejectionStatus) // fork:P5
 		slog.Warn("proxy request rejected",
 			"id", reqID, "method", r.Method, "path", r.URL.Path,
 			"remote", r.RemoteAddr, "reason", rejectionError)
@@ -1489,9 +1447,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// reporter at all.
 	//
 	// Registered after the reservation release above, so on unwind this runs
-	// first. The claim is normally already released by then (right after the
-	// response copy); on a panic or early return it is still held while we
-	// report, and the backstop defer drops it afterwards.
+	// first and the node is still counted as loaded while we report.
 	defer func() {
 		aborted := recover()
 		// An aborted copy is operational detail, not a verdict on the job. A
@@ -1518,7 +1474,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			"duration_ms", time.Since(start).Milliseconds(),
 			"ttfb_ms", ttfbMs,
 			"err", reportErr,
-			"affinity", affDecision,
+			"affinity", lr.affinityDecision(), // fork:P6
 		)
 
 		_ = f.notify("proxy/request", RequestEvent{
@@ -1531,7 +1487,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			Duration: time.Since(start).Milliseconds(),
 			TTFB:     ttfbMs,
 			Error:    reportErr,
-			Affinity: affDecision,
+			Affinity: lr.affinityDecision(), // fork:P6
 		})
 
 		// Terminal workload transition pairs with the workload:started emitted
@@ -1623,11 +1579,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		defer resMu.Unlock()
 		p.releaseReservation(held)
 		var out []candidate
-		var d string
-		out, held, d = p.reserveCandidateFor(f, cands, affKey, model)
-		if d != "" {
-			affDecision = d
-		}
+		out, held = p.localReserve(lr, f, cands) // fork:P6
 		return out
 	}
 
@@ -1668,8 +1620,6 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	respondedWithError := false
 	round := candidates
 	next := 0
-	tried := map[string]bool{}
-	notLoadedRetry := false
 
 	for !committed {
 		if dispatches >= maxDispatches {
@@ -1700,11 +1650,12 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			round = f.resolveCandidates(routingModel)
+			round, _ = p.local.filterCandidates(f, routingModel, round, true) // fork:P5
 			if isInf && model != "" {
 				round = takeHeld(round)
 			}
 			next = 0
-			tried = map[string]bool{}
+			lr.resetTried() // fork:P7
 			if len(round) == 0 {
 				// Every owner went away mid-flight. Not a rejection: keep
 				// waiting for one to come back. This consumes no attempt, which
@@ -1713,20 +1664,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		cand := round[next]
-		if next > 0 && isInf && model != "" {
-			// Re-score the untried candidates now; the round's order is stale.
-			ok := true
-			func() {
-				resMu.Lock()
-				defer resMu.Unlock()
-				cand, ok = p.rescoreReserve(f, round, tried, &held, model)
-			}()
-			if !ok {
-				next = len(round) // none still eligible: end the round
-				continue
-			}
+		cand, skipRound := lr.pick(round, next, cand, &resMu, &held) // fork:P7
+		if skipRound {                                               // fork:P7
+			next = len(round)
+			continue
 		}
-		tried[cand.id] = true
 		next++
 		dispatches++
 		// lastPermitted means no further dispatch can happen, so this attempt's
@@ -1741,27 +1683,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// a node for the whole first-content budget, and for that time it is
 		// the node under load. A same-node move is a no-op.
 		moveHeld(cand.id)
-		attemptStart := time.Now()
-		attemptStatus, attemptTTFB := 0, int64(0)
-		if isInf && model != "" {
-			reason := func() string {
-				resMu.Lock()
-				defer resMu.Unlock()
-				return held.reason
-			}()
-			if notLoadedRetry {
-				reason, notLoadedRetry = "notloaded-retry", false
-			}
-			slog.Info("attempt_start", "req", reqID, "attempt", dispatches,
-				"engine", f.profile.Name, "model", model, "node", cand.id,
-				"reason", reason, "cands", len(round))
-		}
+		lr.attemptStart(reqID, dispatches, cand.id, len(round), &resMu, &held) // fork:P7
 
 		// Each attempt runs on its own context, a child of the request's, so we
 		// can abandon this dispatch without touching the request itself. The
 		// distinction is load-bearing: the disconnect watcher and the terminal
 		// classification both read r.Context(), the parent, so cancelling a
 		// child cannot be mistaken for the client going away.
+		attemptStart := time.Now()
 		attemptCtx, cancelAttempt := context.WithCancel(r.Context())
 		// claim decides, once, whether this attempt commits or is abandoned;
 		// see attemptClaim for why a pair of channels could not.
@@ -1830,16 +1759,9 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			// have arrived but before the body streams. That's both the retry
 			// decision point and, on commit, the time-to-first-byte boundary.
 			ModifyResponse: func(resp *http.Response) error {
-				attemptStatus = resp.StatusCode
-				attemptTTFB = time.Since(attemptStart).Milliseconds()
-				if isInf && r.Method == http.MethodPost && model != "" &&
-					(resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusNotFound) &&
-					classifyNotLoaded(attemptCtx, f.profile.Name, resp, firstBodyTimeout) {
-					p.suppress(inflightKey{f.profile.Name, model, cand.id})
-					if !last {
-						retry, notLoadedRetry = true, true
-						return retrySignal{}
-					}
+				if lr.notLoaded(attemptCtx, resp, cand.id, last, attemptStart) { // fork:P9
+					retry = true
+					return retrySignal{}
 				}
 				if !last && shouldRetry(resp.StatusCode) {
 					// Abort before streaming: ReverseProxy closes resp.Body and
@@ -2013,10 +1935,25 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 		proxy.ServeHTTP(sc, attemptReq)
 		cancelAttempt()
-		if isInf && model != "" {
-			slog.Info("attempt_end", "req", reqID, "attempt", dispatches, "node", cand.id,
-				"status", attemptStatus, "ttfb_ms", attemptTTFB,
-				"dur_ms", time.Since(attemptStart).Milliseconds(), "retried", retry)
+		lr.attemptEnd(reqID, dispatches, cand.id, attemptStart, retry) // fork:P7
+		// Record how this candidate behaved for the next request's ordering.
+		// Measured, not classified from the error: a dial failure is bounded by
+		// the much shorter dial timeout and a status-based retry commits a
+		// response, so only an attempt that produced no content at all can reach
+		// the first-byte budget. That covers both shapes of silence — no headers
+		// and headers with no body — without naming either.
+		//
+		// A no-content attempt that did not reach the budget leaves the stamp
+		// untouched on purpose. It cost too little to be evidence of a stall, so
+		// stamping would overstate it; and a fast failure is no evidence the node
+		// is serving either, so clearing an existing stamp would understate it.
+		// Only a byte clears, and only a full budget stamps.
+		if noContent := retry || respondedWithError; noContent {
+			if time.Since(attemptStart) >= firstBodyTimeout {
+				p.noteNoFirstByte(cand.id, time.Now())
+			}
+		} else {
+			p.noteFirstByte(cand.id)
 		}
 		if claim.abandoned() {
 			// Name the real reason rather than the bare "context canceled" the
@@ -2027,12 +1964,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			finalStatus = sc.status
 			committedSC = sc
 			committed = true
-			// The upstream response has been copied to the ResponseWriter, so the
-			// node's slot is free (net/http may still flush afterward; releasing
-			// engine capacity is safe regardless). Release now rather than after the reporting defer
-			// below: a follow-up turn of the same conversation arriving in that
-			// window would see the bound node as full and yield off it (#17).
-			releaseClaim()
+			lr.releaseEarly(&resMu, &held) // fork:P6
 		}
 	}
 
@@ -2095,21 +2027,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 // Returns an empty slice when no forwarding target is available; the caller
 // treats that as the rejection path.
 func (f *facade) resolveCandidates(model string) []candidate {
-	out, _ := f.resolveCandidatesN(model)
-	return out
-}
-
-// resolveCandidatesN is resolveCandidates that also returns how many owners of
-// the model were dropped because no live node has it loaded.
-func (f *facade) resolveCandidatesN(model string) ([]candidate, int) {
-	return f.resolveCandidatesFor(model, true)
-}
-
-// resolveCandidatesFor is resolveCandidatesN with the residency filter
-// optional: with requireEligible false, every advertised owner is a candidate.
-func (f *facade) resolveCandidatesFor(model string, requireEligible bool) ([]candidate, int) {
 	p := f.host
-	notLoaded := 0
 	id := f.SelectedID()
 
 	priority := p.PriorityList()
@@ -2127,14 +2045,9 @@ func (f *facade) resolveCandidatesFor(model string, requireEligible bool) ([]can
 	if model != "" {
 		owners := make([]Node, 0, len(nodes))
 		for _, node := range nodes {
-			if !nodeAdvertisesModel(f.profile, node, model) {
-				continue
+			if nodeAdvertisesModel(f.profile, node, model) {
+				owners = append(owners, node)
 			}
-			if requireEligible && !p.eligible(node.ID, f.profile.Name, model) {
-				notLoaded++
-				continue
-			}
-			owners = append(owners, node)
 		}
 		nodes = owners
 	}
@@ -2168,7 +2081,6 @@ func (f *facade) resolveCandidatesFor(model string, requireEligible bool) ([]can
 			return
 		}
 		peerUUID := ""
-		isLocal := false
 		switch {
 		case isSelfTarget(u, selfPort) || isAnyAliasSelfTarget(u, aliasBoundAddresses):
 			// Our own advertised endpoint (ol now points at this proxy). Serve
@@ -2181,7 +2093,6 @@ func (f *facade) resolveCandidatesFor(model string, requireEligible bool) ([]can
 				return
 			}
 			u = lb
-			isLocal = true
 		case p.mesh.HasPin(n.ClusterUUID):
 			// A pinned cluster peer: reach it only over mTLS to its promoted
 			// proxy (the ol port now advertises the proxy, not the engine).
@@ -2215,11 +2126,11 @@ func (f *facade) resolveCandidatesFor(model string, requireEligible bool) ([]can
 			return
 		}
 		seenHost[u.Host] = true
+		seenHost[u.Host] = p.local.claimsHost(f, model, n.ID) // fork:P5
 		out = append(out, candidate{
 			id:       n.ID,
 			url:      u,
 			peerUUID: peerUUID,
-			local:    isLocal,
 		})
 	}
 
@@ -2241,10 +2152,14 @@ func (f *facade) resolveCandidatesFor(model string, requireEligible bool) ([]can
 		}
 	}
 
+	// Last, so it holds over all three passes above: a candidate that just cost a
+	// full first-byte deadline is ordered behind the rest.
+	out = demoteCooling(out, p.coolingSet(time.Now()))
+
 	slog.Debug("resolveCandidates resolved",
 		"selected", id, "priority", len(priority), "candidates", len(out),
 		"eligible", len(nodes), "known", known)
-	return out, notLoaded
+	return out
 }
 
 // reservation is one in-flight dispatch this proxy has made since the last
@@ -2256,36 +2171,14 @@ func (f *facade) resolveCandidatesFor(model string, requireEligible bool) ([]can
 // dropped. Without that check a long request finishing after a snapshot would
 // decrement a counter that had already been reset, pushing a node's estimated
 // load below zero and making it look permanently idle.
-type inflightKey struct{ engine, model, node string }
-
-// completion is a local finish the scheduler may not have seen. It discounts
-// a snapshot's pending only when the claim began before that snapshot was
-// computed and ended after it, and, for an optimistic claim released within
-// its own generation (reservedBy already dropped it), only once a later
-// snapshot has been applied.
-type completion struct {
-	taken, done int64
-	gen         uint64
-	deferred    bool
-}
-
 type reservation struct {
-	// takenAt is when the claim began, Unix ms.
-	takenAt    int64
 	nodeID     string
-	engine     string
-	model      string
 	generation uint64
-	// reason is why routing chose this node, for the attempt log.
-	reason string
-	// optimistic is whether this also counted in priorityReservations; a
-	// pinned request is counted in inflight only.
-	optimistic bool
 	// held distinguishes "no reservation was taken" from "a reservation on the
 	// zero-value node", so release on the paths that never reserved is a no-op.
 	held bool
-	// jit is whether this dispatch holds a JIT claim on the node.
-	jit bool
+	// fork:P6
+	localClaim
 }
 
 // reserveCandidate atomically moves the least estimated loaded scheduler-listed
@@ -2306,177 +2199,185 @@ type reservation struct {
 // Process-wide is the point: two facades bursting at once are competing for the
 // same GPU, so a dispatch through either has to be visible to the other.
 func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate, reservation) {
-	out, res, _ := p.reserveCandidateKey(f, candidates, "")
-	return out, res
-}
-
-// reserveCandidateKey is reserveCandidate with session affinity and no model,
-// so slot occupancy is counted under an empty model.
-func (p *Proxy) reserveCandidateKey(f *facade, candidates []candidate, key string) ([]candidate, reservation, string) {
-	return p.reserveCandidateFor(f, candidates, key, "")
-}
-
-// reserveCandidateFor picks the node for a request for model and takes its
-// reservation. With a non-empty key a bound node is kept while it has a free
-// slot (hit), abandoned for any other free node (yield), and when every node is
-// full kept only while its queue per slot is within one of the best. The
-// returned string is the affinity decision, empty when no key was given or no
-// choice was made.
-func (p *Proxy) reserveCandidateFor(f *facade, candidates []candidate, key, model string) ([]candidate, reservation, string) {
-	if len(candidates) == 0 {
-		return candidates, reservation{}, ""
+	if out, res, ok := p.localReserveHook(f, candidates); ok { // fork:P6
+		return out, res
 	}
-	engine := f.profile.Name
-	p.priorityMu.Lock()
-	defer p.priorityMu.Unlock()
-
-	// A pinned request is not a choice, but it still occupies a slot.
+	if len(candidates) == 0 {
+		return candidates, reservation{}
+	}
 	if selectedID := f.SelectedID(); selectedID != "" {
 		for _, cand := range candidates {
 			if cand.id == selectedID {
-				// Same eligibility (incl. JIT claim) as the auto path; a
-				// selected node with the model Loaded stays allowed.
-				if model != "" && !p.eligible(selectedID, engine, model) {
-					return nil, reservation{}, ""
-				}
-				res := p.takeLocked(selectedID, engine, model, false)
-				res.reason = "pin"
-				return candidates, res, ""
+				return candidates, reservation{}
 			}
 		}
-	}
-	// Eligibility is re-checked here, under the lock the claim is taken under,
-	// so two requests cannot both pass a stale check and both JIT-load.
-	kept := candidates[:0:0]
-	for _, c := range candidates {
-		if model == "" || p.eligible(c.id, engine, model) {
-			kept = append(kept, c)
-		}
-	}
-	if candidates = kept; len(candidates) == 0 {
-		return candidates, reservation{}, ""
-	}
-	if len(p.priority) == 0 {
-		return candidates, p.takeLocked(candidates[0].id, engine, model, false), ""
 	}
 
 	candidateIndex := make(map[string]int, len(candidates))
 	for i, cand := range candidates {
 		candidateIndex[cand.id] = i
 	}
-	occ := func(id string) int { return p.occLocked(inflightKey{engine, model, id}) }
-	free := func(id string) bool { return occ(id) < p.nodeSlots(id, engine, model) }
-	queue := func(id string) float64 { return float64(occ(id)) / float64(p.nodeSlots(id, engine, model)) }
-	best := func(ok func(string) bool) int {
-		return p.bestLocked(engine, model, candidates, nil, ok)
+
+	// Read before taking priorityMu: the cooldown has its own lock and nothing
+	// else nests the two.
+	cooling := p.coolingSet(time.Now())
+
+	p.priorityMu.Lock()
+	defer p.priorityMu.Unlock()
+	if len(p.priority) == 0 {
+		return candidates, reservation{}
+	}
+	if p.priorityReservations == nil {
+		p.priorityReservations = make(map[string]int)
 	}
 
-	bestIndex := -1
-	decision, reason := "", ""
-	if key != "" {
-		decision = affinityMiss
-		if bound, ok := p.affinity.lookup(key); ok {
-			decision = affinityRebind
-			if index, ok := candidateIndex[bound]; ok && containsID(p.priority, bound) {
-				// The hit test reads our own durable count, not scheduler
-				// pending, which can be stale enough to break sequential hits.
-				if p.inflight[inflightKey{engine, model, bound}] < p.nodeSlots(bound, engine, model) {
-					bestIndex, decision, reason = index, affinityHit, "affinity-hit"
-				} else if other := best(free); other >= 0 {
-					bestIndex, decision, reason = other, affinityYield, "affinity-yield"
-				} else if lowest := best(nil); lowest >= 0 {
-					// Every node is full: stay unless another is clearly shorter.
-					if queue(bound) <= queue(candidates[lowest].id)+1 {
-						bestIndex, decision, reason = index, affinityHit, "affinity-hit"
-					} else {
-						bestIndex = lowest
-					}
-				}
+	// The reserved head is picked by load, not by list position, so the ordering
+	// in resolveCandidates does not reach it: a cooling node would be chosen
+	// straight back to the front. Skipping it here is what makes the demotion hold
+	// for scheduler-ranked nodes.
+	//
+	// One pass, two bests tracked: the least-loaded node that is not cooling, and
+	// the least-loaded one that is. The second is kept rather than recomputed
+	// because demotion must not become exclusion — when every listed candidate is
+	// cooling there is nothing to prefer, and leaving the round unreserved would be
+	// worse than dispatching to one of them.
+	bestIndex, bestOrder := -1, len(p.priority)
+	coolIndex, coolOrder := -1, len(p.priority)
+	var bestLoad, coolLoad uint64
+	for order, id := range p.priority {
+		index, ok := candidateIndex[id]
+		if !ok {
+			continue
+		}
+		load := uint64(p.priorityPending[id]) +
+			uint64(p.priorityGPUPressure[id]) +
+			uint64(p.priorityReservations[id])
+		if cooling[id] {
+			if coolIndex < 0 || load < coolLoad || (load == coolLoad && order < coolOrder) {
+				coolIndex, coolOrder, coolLoad = index, order, load
 			}
+		} else if bestIndex < 0 || load < bestLoad || (load == bestLoad && order < bestOrder) {
+			bestIndex, bestOrder, bestLoad = index, order, load
 		}
 	}
 	if bestIndex < 0 {
-		bestIndex = best(nil)
+		bestIndex = coolIndex
 	}
 	if bestIndex < 0 {
-		return candidates, p.takeLocked(candidates[0].id, engine, model, false), ""
-	}
-	if reason == "" {
-		reason = "least-queued"
-		if free(candidates[bestIndex].id) {
-			reason = "free-slot"
-		}
+		return candidates, reservation{}
 	}
 
 	chosen := candidates[bestIndex]
-	if key != "" {
-		p.affinity.bind(key, chosen.id)
-	}
-	res := p.takeLocked(chosen.id, engine, model, true)
-	res.reason = reason
+	p.priorityReservations[chosen.id]++
 	if bestIndex > 0 {
 		copy(candidates[1:bestIndex+1], candidates[:bestIndex])
 		candidates[0] = chosen
 	}
-	return candidates, res, decision
-}
-
-// takeLocked counts one request on a node: always in the durable inflight, and
-// in the snapshot-scoped reservations when optimistic. Caller holds priorityMu.
-func (p *Proxy) takeLocked(nodeID, engine, model string, optimistic bool) reservation {
-	if p.inflight == nil {
-		p.inflight = make(map[inflightKey]int)
-	}
-	p.inflight[inflightKey{engine, model, nodeID}]++
-	if optimistic {
-		if p.priorityReservations == nil {
-			p.priorityReservations = make(map[string]int)
-		}
-		if p.reservedBy == nil {
-			p.reservedBy = make(map[inflightKey]int)
-		}
-		p.priorityReservations[nodeID]++
-		p.reservedBy[inflightKey{engine, model, nodeID}]++
-	}
-	return reservation{
-		nodeID: nodeID, engine: engine, model: model,
-		generation: p.appliedPriorityGeneration, held: true, optimistic: optimistic,
-		takenAt: p.clock().UnixMilli(), jit: p.claimJIT(nodeID, engine, model),
+	return candidates, reservation{
+		nodeID:     chosen.id,
+		generation: p.appliedPriorityGeneration,
+		held:       true,
 	}
 }
 
-// dropLocked is takeLocked's inverse. The durable count is always decremented,
-// whatever snapshot has arrived since; only the optimistic one is guarded by
-// the generation, because a snapshot already folded that one in.
-func (p *Proxy) dropLocked(r reservation) {
-	if r.jit {
-		p.releaseJIT(r.nodeID, r.engine, r.model)
-	}
-	k := inflightKey{r.engine, r.model, r.nodeID}
-	if p.inflight[k] <= 1 {
-		delete(p.inflight, k)
-	} else {
-		p.inflight[k]--
-	}
-	same := r.optimistic && r.generation == p.appliedPriorityGeneration
-	// Remembered either way: a snapshot computed while this ran but applied
-	// after it finished would otherwise resurrect its occupancy.
-	if p.completions == nil {
-		p.completions = make(map[inflightKey][]completion)
-	}
-	c := completion{taken: r.takenAt, done: p.clock().UnixMilli(), gen: p.appliedPriorityGeneration, deferred: same}
-	if ts := append(p.completions[k], c); len(ts) <= 1024 {
-		p.completions[k] = ts
-	} else {
-		p.completions[k] = ts[len(ts)-1024:]
-	}
-	if !same {
+// noteNoFirstByte records that a candidate consumed its whole first-byte budget
+// and produced nothing, so the ordering passes put it behind its peers for one
+// cooldown. Demotion, never exclusion: see demoteCooling.
+func (p *Proxy) noteNoFirstByte(id string, now time.Time) {
+	if id == "" {
 		return
 	}
-	if p.reservedBy[k] <= 1 {
-		delete(p.reservedBy, k)
-	} else {
-		p.reservedBy[k]--
+	p.coolMu.Lock()
+	defer p.coolMu.Unlock()
+	if p.coolUntil == nil {
+		p.coolUntil = make(map[string]time.Time)
+	}
+	p.coolUntil[id] = now.Add(candidateCooldown)
+}
+
+// noteFirstByte clears a candidate's cooldown on evidence that it is serving
+// again, rather than holding it down for the rest of the window. A node coming
+// back from its own silence is direct evidence about itself, and needs no
+// inference about anybody else.
+func (p *Proxy) noteFirstByte(id string) {
+	if id == "" {
+		return
+	}
+	p.coolMu.Lock()
+	defer p.coolMu.Unlock()
+	if len(p.coolUntil) == 0 {
+		return
+	}
+	delete(p.coolUntil, id)
+}
+
+// coolingSet returns the node ids still inside their cooldown, and nil when no
+// node has a stamp at all. That nil is the ordinary case, and both callers branch
+// on the length, so a process that has never met a stalled node does exactly what
+// it did before this existed.
+//
+// Expired stamps are dropped here rather than on a timer: the map is only read
+// on the routing path, so that is the only place a sweep is worth doing.
+func (p *Proxy) coolingSet(now time.Time) map[string]bool {
+	p.coolMu.Lock()
+	defer p.coolMu.Unlock()
+	if len(p.coolUntil) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(p.coolUntil))
+	for id, until := range p.coolUntil {
+		if now.Before(until) {
+			out[id] = true
+		} else {
+			delete(p.coolUntil, id)
+		}
+	}
+	return out
+}
+
+// demoteCooling moves cooling candidates to the back, keeping the relative order
+// of both groups so the scheduler's ranking still decides within each.
+//
+// Demotion, not exclusion. With a single candidate the back is also the front,
+// so a one-node cluster is unaffected, and a cooling node is still tried once the
+// others are exhausted.
+func demoteCooling(cands []candidate, cooling map[string]bool) []candidate {
+	if len(cooling) == 0 || len(cands) < 2 {
+		return cands
+	}
+	hot := make([]candidate, 0, len(cands))
+	cold := make([]candidate, 0, len(cands))
+	for _, c := range cands {
+		if cooling[c.id] {
+			cold = append(cold, c)
+		} else {
+			hot = append(hot, c)
+		}
+	}
+	if len(cold) == 0 {
+		return cands
+	}
+	return append(hot, cold...)
+}
+
+// releaseReservation drops an in-flight dispatch's reservation once its request
+// has ended, so the node stops counting as loaded before the next snapshot
+// arrives. Safe to call on a request that never reserved.
+//
+// A release from before the current snapshot is ignored: that snapshot already
+// accounts for the work, and decrementing here would double-count the
+// completion and leave the node looking idle.
+func (p *Proxy) releaseReservation(r reservation) {
+	if !r.held {
+		return
+	}
+	p.priorityMu.Lock()
+	defer p.priorityMu.Unlock()
+	if p.localDropLocked(r) { // fork:P6
+		return
+	}
+	if r.generation != p.appliedPriorityGeneration {
+		return
 	}
 	if p.priorityReservations[r.nodeID] <= 1 {
 		// Deleted rather than left at zero so the map does not accumulate an
@@ -2487,145 +2388,39 @@ func (p *Proxy) dropLocked(r reservation) {
 	p.priorityReservations[r.nodeID]--
 }
 
-// occLocked is how many requests occupy a node's slots for an engine/model:
-// the larger of our own durable count and the scheduler's pending plus what we
-// reserved since its snapshot, less local finishes it had not yet seen. A
-// scheduler without a per-model split contributes its node-wide pending.
-func (p *Proxy) occLocked(k inflightKey) int {
-	base := p.priorityPending[k.node]
-	if by, ok := p.priorityPendingBy[k.node]; ok {
-		base = by[schedulerwire.PendingKey(k.engine, k.model)]
-	}
-	done := 0
-	at := p.priorityComputedAt[k.node]
-	for _, c := range p.completions[k] {
-		if c.deferred && c.gen >= p.appliedPriorityGeneration {
-			continue // reservedBy already dropped it
-		}
-		if c.taken <= at && c.done > at {
-			done++
-		}
-	}
-	return max(p.inflight[k], base+p.reservedBy[k]-done)
-}
-
-// bestLocked returns the index of the best listed candidate not in tried and
-// accepted by ok: a node with a free slot, then lower occupancy per slot, then
-// lower GPU pressure (plus other engines' reservations), then the local node,
-// then scheduler order. When every node is full the key is
-// the queue the request would join, (occ-slots+1)/slots.
-func (p *Proxy) bestLocked(engine, model string, cands []candidate, tried map[string]bool, ok func(string) bool) int {
-	index := make(map[string]int, len(cands))
-	for i, c := range cands {
-		index[c.id] = i
-	}
-	best, bestOrder, bestFull, bestGPU, bestLocal := -1, 0, false, 0, false
-	var bestQ float64
-	for order, id := range p.priority {
-		i, listed := index[id]
-		if !listed || tried[id] || (ok != nil && !ok(id)) {
-			continue
-		}
-		slots := float64(p.nodeSlots(id, engine, model))
-		occ := float64(p.occLocked(inflightKey{engine, model, id}))
-		full := occ >= slots
-		q := occ / slots
-		if full {
-			q = (occ - slots + 1) / slots
-		}
-		// Reservations through any engine's facade count as pressure: they
-		// share the GPU even though they do not share slots.
-		gpu := p.priorityGPUPressure[id] + p.priorityReservations[id]
-		local := cands[i].local
-		better := best < 0 || full != bestFull && !full || full == bestFull &&
-			(q < bestQ || q == bestQ && (gpu < bestGPU || gpu == bestGPU &&
-				(local && !bestLocal || local == bestLocal && order < bestOrder)))
-		if better {
-			best, bestOrder, bestFull, bestGPU, bestQ, bestLocal = i, order, full, gpu, q, local
-		}
-	}
-	return best
-}
-
-// rescoreReserve picks the best untried candidate right now and moves the
-// request's held claim onto it in one critical section, so failover sees the
-// load as it is rather than as it was when the round was formed. Candidates
-// the scheduler does not list follow in round order.
-func (p *Proxy) rescoreReserve(f *facade, round []candidate, tried map[string]bool, held *reservation, model string) (candidate, bool) {
-	engine := f.profile.Name
-	p.priorityMu.Lock()
-	defer p.priorityMu.Unlock()
-	// Eligibility is re-checked under the reservation lock: another request or
-	// engine may have loaded a model, or claimed the node, since the round was
-	// built.
-	skip := make(map[string]bool, len(round))
-	for _, c := range round {
-		skip[c.id] = tried[c.id] || !p.eligible(c.id, engine, model)
-	}
-	i := p.bestLocked(engine, model, round, skip, nil)
-	if i < 0 {
-		for j, c := range round {
-			if !skip[c.id] {
-				i = j
-				break
-			}
-		}
-	}
-	if i < 0 {
-		return candidate{}, false
-	}
-	cand := round[i]
-	if !held.held {
-		return cand, true
-	}
-	// The claim is published at each step so a panic below can never leave the
-	// caller holding one that was already dropped, or lose the new one.
-	old := *held
-	*held = reservation{}
-	p.dropLocked(old)
-	*held = p.takeLocked(cand.id, engine, model, old.optimistic)
-	held.reason = "free-slot"
-	if p.occLocked(inflightKey{engine, model, cand.id}) > p.nodeSlots(cand.id, engine, model) {
-		held.reason = "least-queued"
-	}
-	return cand, true
-}
-
-func containsID(ids []string, id string) bool {
-	for _, v := range ids {
-		if v == id {
-			return true
-		}
-	}
-	return false
-}
-
-// releaseReservation drops an in-flight dispatch's claim once its request has
-// ended. Safe to call on a request that never reserved.
-func (p *Proxy) releaseReservation(r reservation) {
-	if !r.held {
-		return
-	}
-	p.priorityMu.Lock()
-	defer p.priorityMu.Unlock()
-	p.dropLocked(r)
-}
-
 // moveReservation transfers a reservation to the node failover actually landed
 // on, so the node that refused the request stops carrying its load and the one
-// now serving it starts. It returns the new reservation; the old one must not
-// be released separately. The optimistic part is retaken under the current
-// snapshot, since a snapshot already superseded the old one.
+// now serving it starts.
+//
+// It returns the new reservation; the old one must not be released separately.
+// A move across a snapshot boundary takes a fresh reservation rather than
+// carrying the stale one forward, because the new snapshot has already
+// superseded it.
 func (p *Proxy) moveReservation(r reservation, nodeID string) reservation {
 	if !r.held || r.nodeID == nodeID {
 		return r
 	}
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
-	p.dropLocked(r)
-	res := p.takeLocked(nodeID, r.engine, r.model, r.optimistic)
-	res.reason = r.reason
-	return res
+	if res, ok := p.localMoveLocked(r, nodeID); ok { // fork:P6
+		return res
+	}
+	if r.generation == p.appliedPriorityGeneration {
+		if p.priorityReservations[r.nodeID] <= 1 {
+			delete(p.priorityReservations, r.nodeID)
+		} else {
+			p.priorityReservations[r.nodeID]--
+		}
+	}
+	if p.priorityReservations == nil {
+		p.priorityReservations = make(map[string]int)
+	}
+	p.priorityReservations[nodeID]++
+	return reservation{
+		nodeID:     nodeID,
+		generation: p.appliedPriorityGeneration,
+		held:       true,
+	}
 }
 
 // nodeAdvertisesModel reports whether a node's advertised inventory contains
@@ -2885,9 +2680,6 @@ func (p *Proxy) SetPrioritySnapshot(priority schedulerwire.Priority) int {
 func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 	cleaned := append([]string(nil), priority.Nodes...)
 	pending := make(map[string]int, len(priority.Ranks))
-	pendingBy := make(map[string]map[string]int, len(priority.Ranks))
-	computedAt := make(map[string]int64, len(priority.Ranks))
-	applied := p.clock().UnixMilli()
 	gpuPressure := make(map[string]int, len(priority.Ranks))
 	for _, rank := range priority.Ranks {
 		if rank.ID == "" {
@@ -2902,13 +2694,6 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 			rank.GPUPressure = schedulerwire.MaxGPUPressure
 		}
 		pending[rank.ID] = rank.Pending
-		if rank.PendingBy != nil {
-			pendingBy[rank.ID] = rank.PendingBy
-		}
-		computedAt[rank.ID] = rank.ComputedAt
-		if rank.ComputedAt == 0 {
-			computedAt[rank.ID] = applied
-		}
 		gpuPressure[rank.ID] = rank.GPUPressure
 	}
 
@@ -2928,22 +2713,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 	p.priorityPending = pending
 	p.priorityGPUPressure = gpuPressure
 	p.priorityReservations = make(map[string]int)
-	p.priorityPendingBy = pendingBy
-	p.priorityComputedAt = computedAt
-	p.reservedBy = nil
-	for k, ts := range p.completions {
-		kept := ts[:0]
-		for _, c := range ts {
-			if c.done > computedAt[k.node] {
-				kept = append(kept, c)
-			}
-		}
-		if len(kept) == 0 {
-			delete(p.completions, k)
-		} else {
-			p.completions[k] = kept
-		}
-	}
+	p.local.applySnapshot(priority) // fork:P6
 	return len(cleaned)
 }
 
