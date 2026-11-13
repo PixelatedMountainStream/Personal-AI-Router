@@ -48,7 +48,6 @@ allow = [
   "services/nvpair-proxy/facade.go",
   "services/nvpair-proxy/main.go",
   "services/nvpair-proxy/proxy.go",
-  "services/nvpair-proxy/reservation_test.go",
   "services/nvpair-ui-broker/broker.go",
   "services/nvpair-ui-broker/discovery.go",
   "services/shared/noderec/noderec.go",
@@ -69,24 +68,14 @@ legacy_added = [
   "services/nvpair-engine-manager/pinned_test.go",
   "services/nvpair-engine-manager/settingsoverrides.go",
   "services/nvpair-engine-manager/settingsoverrides_test.go",
-  "services/nvpair-proxy/affinity.go",
-  "services/nvpair-proxy/affinity_test.go",
-  "services/nvpair-proxy/capacity.go",
-  "services/nvpair-proxy/capacity_test.go",
-  "services/nvpair-proxy/dircapacity.go",
-  "services/nvpair-proxy/dircapacity_test.go",
-  "services/nvpair-proxy/notloaded.go",
-  "services/nvpair-proxy/responses_normalize.go",
-  "services/nvpair-proxy/responses_normalize_test.go",
-  "services/nvpair-proxy/slotscore_test.go",
   "services/shared/noderec/overrides.go",
   "services/shared/noderec/slots_test.go",
 ]
 
 [budget]            # ratchet, lowered per migration PR; raising it needs label surface-budget-raise (budget_raised)
-max_lines = 1065    # changed lines in modified upstream files only (measured at catch-up step 4)
-max_files = 39      # modified upstream files only
-max_legacy_added_lines = 3418   # separate shrinking budget for legacy_added
+max_lines = 536     # changed lines in modified upstream files only (measured at catch-up step 5)
+max_files = 38      # modified upstream files only
+max_legacy_added_lines = 1734   # separate shrinking budget for legacy_added
 
 # Optional per-file budgets for hot files are added by PR-F:
 # [[file]]
@@ -107,6 +96,13 @@ path = "services/nvpair-node-scanner/directory.go"
 max_lines = 1
 max_hunks = 1
 max_seams = 1
+
+# Proxy hooks P1-P9 (catch-up step 5), caps from the measured values.
+[[file]]
+path = "services/nvpair-proxy/proxy.go"
+max_lines = 46
+max_hunks = 22
+max_seams = 7
 
 [go]
 fork_import_prefixes = ["nvpair-proxy/local/", "nvpair-engine-manager/local/", "nvpair-shared/local/"]
