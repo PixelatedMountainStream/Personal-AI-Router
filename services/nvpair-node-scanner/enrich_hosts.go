@@ -4,21 +4,26 @@
 package main
 
 import (
+	"crypto/x509"
 	"log/slog"
+	"slices"
 	"sync"
 
 	"nvpair-shared/noderec"
 )
 
-// modelInventory is a node engine manager's /v1/models answer, carried as one
-// value so the concurrent ask can return it and the last-good cache keeps every
-// part of it together.
+// modelInventory carries engine-manager's model lists and, for remote responses,
+// the certificate used to authenticate the server.
 type modelInventory struct {
 	models             []string
 	byEngine           map[string][]string
 	loadedByEngine     map[string][]string
 	downloadedByEngine map[string][]string
+<<<<<<< HEAD
 	local              modelInventoryExt // fork:S8
+=======
+	certificate        *x509.Certificate
+>>>>>>> 40975d667cbb9785a299f4a3d5e1752fc4927ab9
 }
 
 // applyTo copies the inventory onto a directory entry's model fields.
@@ -29,12 +34,12 @@ func (inv modelInventory) applyTo(node *noderec.DirectoryNode) {
 	node.DownloadedByEngine = inv.downloadedByEngine
 }
 
-// hostKey identifies one node's endpoint for one service. Node-info and the engine
-// manager are different ports and can be reachable at different addresses, so what
-// answered for one says nothing about the other.
+// hostKey identifies address memory for one record and service. Node-info uses
+// discovery record IDs to keep candidates separate from verified peers; model
+// reads use the canonical host UUID. Each service remembers its own working IP.
 type hostKey struct {
-	hostUUID string
-	service  noderec.ServiceKey
+	recordKey string
+	service   noderec.ServiceKey
 }
 
 // hostMemory remembers which published address answered, per node and service.
@@ -83,12 +88,14 @@ func (m *hostMemory) forget(key hostKey) {
 // different machine, which is not an answer for this one.
 func askRemembered[T any](mem *hostMemory, key hostKey, hosts []string, ask func(host string) (T, bool)) (string, T, bool) {
 	if remembered := mem.get(key); remembered != "" {
-		if value, ok := ask(remembered); ok {
-			return remembered, value, true
+		if slices.Contains(hosts, remembered) {
+			if value, ok := ask(remembered); ok {
+				return remembered, value, true
+			}
 		}
 		mem.forget(key)
 		slog.Debug("enrichment: the remembered address stopped answering; trying the rest of the list",
-			"host_uuid", key.hostUUID, "service", key.service, "address", remembered)
+			"record_key", key.recordKey, "service", key.service, "address", remembered)
 		hosts = withoutHost(hosts, remembered)
 	}
 

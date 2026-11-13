@@ -1,2 +1,2 @@
-sha=bb33eccf651272672d30aa9ce1ac0e36c92a3f42
+sha=40975d667cbb9785a299f4a3d5e1752fc4927ab9
 last_release_tag=v1.0.0
