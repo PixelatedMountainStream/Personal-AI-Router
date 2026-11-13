@@ -306,13 +306,11 @@ func (e *Executor) bringUpProcess(ctx context.Context, st *engineState, engine s
 		e.reportStartFailedUnlessShuttingDown(ctx, engine, werr)
 		return werr
 	}
-<<<<<<< HEAD
 	release, err := e.gateStartupLoad(ctx, engine, launch.Args)
 	if err != nil {
 		return err
 	}
 	defer release()
-=======
 	modelScopeEndpoint := ""
 	if engine == "llamacpp" && modelSource(rt) == "modelscope" {
 		modelScopeEndpoint, err = e.modelScopeEndpoint()
@@ -329,7 +327,6 @@ func (e *Executor) bringUpProcess(ctx context.Context, st *engineState, engine s
 		}
 		launch.Env["MODEL_ENDPOINT"] = modelScopeEndpoint
 	}
->>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 
 	diagnostics := newStartupOutput(launchDiagnosticArgs(rt), launch.Env)
 	defer diagnostics.close()
