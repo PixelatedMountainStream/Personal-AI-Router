@@ -306,15 +306,35 @@ func (e *Executor) bringUpProcess(ctx context.Context, st *engineState, engine s
 		e.reportStartFailedUnlessShuttingDown(ctx, engine, werr)
 		return werr
 	}
+<<<<<<< HEAD
 	release, err := e.gateStartupLoad(ctx, engine, launch.Args)
 	if err != nil {
 		return err
 	}
 	defer release()
+=======
+	modelScopeEndpoint := ""
+	if engine == "llamacpp" && modelSource(rt) == "modelscope" {
+		modelScopeEndpoint, err = e.modelScopeEndpoint()
+		if err != nil {
+			return err
+		}
+		if launch.Env == nil {
+			launch.Env = map[string]string{}
+		}
+		for key := range launch.Env {
+			if environmentKey(key) == environmentKey("MODEL_ENDPOINT") {
+				delete(launch.Env, key)
+			}
+		}
+		launch.Env["MODEL_ENDPOINT"] = modelScopeEndpoint
+	}
+>>>>>>> bb33eccf651272672d30aa9ce1ac0e36c92a3f42
 
 	diagnostics := newStartupOutput(launchDiagnosticArgs(rt), launch.Env)
 	defer diagnostics.close()
 	proc, err := startManagedProc(launch.Bin, launch.Args, launch.Env, func(stream, line string) {
+		line = redactModelScopeEndpoint(line, modelScopeEndpoint)
 		_, _ = diagnostics.Write([]byte(line + "\n"))
 		// Vendor diagnostics may echo arbitrary custom arguments. Keep those
 		// out of exported engine logs; report exit/readiness failures separately.
@@ -887,6 +907,11 @@ func (e *Executor) stopAllNow() {
 	}
 	e.mu.Unlock()
 	e.failedStops = e.stopEngines(names)
+	e.mu.Lock()
+	if e.modelScope != nil {
+		_ = e.modelScope.Close()
+	}
+	e.mu.Unlock()
 }
 
 // retryFailedStops tries again to stop the engines whose stop failed in the
