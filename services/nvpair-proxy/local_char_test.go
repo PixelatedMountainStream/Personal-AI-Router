@@ -18,19 +18,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"nvpair-proxy/local/capacity"
 	"nvpair-shared/noderec"
 	"nvpair-shared/schedulerwire"
 )
 
 // charLocal turns on the fork's routing state with capacity c (nil: none).
 func charLocal(p *Proxy, c CapacityProvider) *Proxy {
-	p.capacity = c
+	p.local = &localState{capacity: c}
 	return p
 }
 
 func charDirectory(engine string, nodes ...noderec.DirectoryNode) CapacityProvider {
-	d := newDirectoryCapacity(nil)
-	d.update(engine, nodes)
+	d := capacity.NewDirectory(nil)
+	d.Update(engine, nodes)
 	return d
 }
 

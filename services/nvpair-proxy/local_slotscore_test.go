@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"nvpair-proxy/local/affinity"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,7 @@ func inflightTotal(p *Proxy) int {
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
 	n := 0
-	for _, v := range p.inflight {
+	for _, v := range p.local.inflight {
 		n += v
 	}
 	return n
@@ -37,7 +38,7 @@ func reserveN(p *Proxy, n int, ids ...string) map[string]int {
 
 func TestSlotScore_TwoByTwoSplitsEvenly(t *testing.T) {
 	p := affinityProxy(t, "a", "b")
-	p.capacity = &fakeCap{slots: map[string]int{"a": 2, "b": 2}}
+	p.local.capacity = &fakeCap{slots: map[string]int{"a": 2, "b": 2}}
 	if got := reserveN(p, 4, "a", "b"); got["a"] != 2 || got["b"] != 2 {
 		t.Fatalf("split = %v, want 2/2", got)
 	}
@@ -45,7 +46,7 @@ func TestSlotScore_TwoByTwoSplitsEvenly(t *testing.T) {
 
 func TestSlotScore_FullNodeNotChosenWhileAnotherFree(t *testing.T) {
 	p := affinityProxy(t, "a", "b")
-	p.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 3}}
+	p.local.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 3}}
 	if got := reserveN(p, 4, "a", "b"); got["a"] != 1 || got["b"] != 3 {
 		t.Fatalf("split = %v, want a=1 b=3", got)
 	}
@@ -65,8 +66,8 @@ func TestSlotScore_SnapshotKeepsInflightAndMoveCancelLeavesZero(t *testing.T) {
 	p.releaseReservation(r2)
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
-	if len(p.inflight) != 0 || len(p.reservedBy) != 0 {
-		t.Fatalf("leaked: inflight=%v reservedBy=%v", p.inflight, p.reservedBy)
+	if len(p.local.inflight) != 0 || len(p.local.reservedBy) != 0 {
+		t.Fatalf("leaked: inflight=%v reservedBy=%v", p.local.inflight, p.local.reservedBy)
 	}
 }
 
@@ -85,7 +86,7 @@ func TestSlotScore_OccupancyUsesPendingByAndDiscountsCompletions(t *testing.T) {
 	p := affinityProxy(t, "a")
 	f := p.soleFacade()
 	now := time.UnixMilli(10_000)
-	p.now = func() time.Time { return now }
+	p.local.now = func() time.Time { return now }
 	key := schedulerwire.PendingKey(f.profile.Name, "m")
 	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a"}, Ranks: []schedulerwire.NodeRank{
 		{ID: "a", Pending: 9, LocalRankExt: schedulerwire.LocalRankExt{PendingBy: map[string]int{key: 2}, ComputedAt: 9_000}}}})
@@ -96,11 +97,11 @@ func TestSlotScore_OccupancyUsesPendingByAndDiscountsCompletions(t *testing.T) {
 	}
 	p.priorityMu.Unlock()
 	// A pinned request finishes after the scheduler computed: it is discounted.
-	p.now = func() time.Time { return time.UnixMilli(8_000) }
+	p.local.now = func() time.Time { return time.UnixMilli(8_000) }
 	p.priorityMu.Lock()
 	r := p.takeLocked("a", f.profile.Name, "m", false) // began before the snapshot was computed
 	p.priorityMu.Unlock()
-	p.now = func() time.Time { return now }
+	p.local.now = func() time.Time { return now }
 	p.releaseReservation(r)
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
@@ -112,7 +113,7 @@ func TestSlotScore_OccupancyUsesPendingByAndDiscountsCompletions(t *testing.T) {
 func TestSlotScore_FailoverPicksFreeOverFull(t *testing.T) {
 	p := affinityProxy(t, "a", "b", "c")
 	f := p.soleFacade()
-	p.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1, "c": 1}}
+	p.local.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1, "c": 1}}
 	p.reserveCandidateFor(f, reservationCandidates("b"), "", "m") // b is full
 	_, held, _ := p.reserveCandidateFor(f, reservationCandidates("a"), "", "m")
 	round := reservationCandidates("a", "b", "c")
@@ -133,18 +134,18 @@ func TestSlotScore_EligibilityKnownEmptyJITAndUnknown(t *testing.T) {
 	disc := NewDiscovery()
 	disc.AddManual(nodeForModel(t, "a", a, tc.advertisedModel))
 	disc.AddManual(nodeForModel(t, "b", b, tc.advertisedModel))
-	p := testProxy(tc.profile, disc, tc.profile.FacadePort)
-	p.capacity = &fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty}} // b Unknown
+	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
+	p.local.capacity = &fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty}} // b Unknown
 	f := p.soleFacade()
 	if cands, n := f.resolveCandidatesN(tc.advertisedModel); len(cands) != 1 || cands[0].id != "b" || n != 1 {
 		t.Fatalf("cands=%v skipped=%d, want only b and 1 skipped", cands, n)
 	}
-	p.capacity.(*fakeCap).jit = map[string]bool{"a": true}
+	p.local.capacity.(*fakeCap).jit = map[string]bool{"a": true}
 	if cands, _ := f.resolveCandidatesN(tc.advertisedModel); len(cands) != 2 {
 		t.Fatalf("JIT node should be eligible, got %d", len(cands))
 	}
-	p.capacity.(*fakeCap).res["b"] = ResidencyKnownEmpty
-	p.capacity.(*fakeCap).jit = nil
+	p.local.capacity.(*fakeCap).res["b"] = ResidencyKnownEmpty
+	p.local.capacity.(*fakeCap).jit = nil
 	rec := httptest.NewRecorder()
 	f.handleHTTP(rec, tc.inferenceRequest())
 	if rec.Code != 503 || !strings.Contains(rec.Body.String(), "no live node has model") {
@@ -164,8 +165,8 @@ func TestSlotScore_NotLoaded400FailsOverAndSuppresses(t *testing.T) {
 	disc := NewDiscovery()
 	disc.AddManual(nodeForModel(t, "bad", bad, tc.advertisedModel))
 	disc.AddManual(nodeForModel(t, "good", good, tc.advertisedModel))
-	p := testProxy(tc.profile, disc, tc.profile.FacadePort)
-	p.capacity = &fakeCap{}
+	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
+	p.local.capacity = &fakeCap{}
 	p.soleFacade().SetSelected("bad")
 	rec := httptest.NewRecorder()
 	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
@@ -176,7 +177,7 @@ func TestSlotScore_NotLoaded400FailsOverAndSuppresses(t *testing.T) {
 		t.Fatal("bad node should be suppressed")
 	}
 	// A directory sweep newer than the suppression showing it loaded lifts it.
-	p.capacity = &fakeCap{res: map[string]Residency{"bad": ResidencyLoaded}, seen: time.Now().Add(time.Second)}
+	p.local.capacity = &fakeCap{res: map[string]Residency{"bad": ResidencyLoaded}, seen: time.Now().Add(time.Second)}
 	if !p.eligible("bad", tc.profile.Name, tc.requestedModel) {
 		t.Fatal("a newer Loaded sweep should lift the suppression")
 	}
@@ -191,7 +192,7 @@ func TestSlotScore_NonMatchingAndLongBodiesPassThrough(t *testing.T) {
 		disc := NewDiscovery()
 		disc.AddManual(nodeForModel(t, "bad", srv, tc.advertisedModel))
 		disc.AddManual(nodeForModel(t, "other", other, tc.advertisedModel))
-		p := testProxy(tc.profile, disc, tc.profile.FacadePort)
+		p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
 		p.soleFacade().SetSelected("bad")
 		rec := httptest.NewRecorder()
 		p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
@@ -215,7 +216,7 @@ func TestSlotScore_TruncatedCommittedStreamNotReplayed(t *testing.T) {
 	disc := NewDiscovery()
 	disc.AddManual(nodeForModel(t, "cut", cut.URL, tc.advertisedModel))
 	disc.AddManual(nodeForModel(t, "other", other, tc.advertisedModel))
-	p := testProxy(tc.profile, disc, tc.profile.FacadePort)
+	p := withLocal(testProxy(tc.profile, disc, tc.profile.FacadePort))
 	p.soleFacade().SetSelected("cut")
 	func() {
 		defer func() { _ = recover() }() // the copy error aborts the handler
@@ -232,26 +233,26 @@ func TestSlotScore_TruncatedCommittedStreamNotReplayed(t *testing.T) {
 func TestSlotScore_AffinityHitUsesLocalInflight(t *testing.T) {
 	p := affinityProxy(t, "a", "b")
 	f := p.soleFacade()
-	p.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1}}
+	p.local.capacity = &fakeCap{slots: map[string]int{"a": 1, "b": 1}}
 	_, r, _ := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "k", "m")
 	p.releaseReservation(r)
 	// Stale scheduler pending says a is full; our own inflight says it is free.
 	applySnapshot(p, schedulerwire.Priority{Nodes: []string{"a", "b"}, Ranks: []schedulerwire.NodeRank{
 		{ID: "a", Pending: 5, LocalRankExt: schedulerwire.LocalRankExt{ComputedAt: time.Now().UnixMilli() + 1000}}, {ID: "b"}}})
 	_, _, d := p.reserveCandidateFor(f, reservationCandidates("a", "b"), "k", "m")
-	if d != affinityHit {
+	if d != affinity.Hit {
 		t.Fatalf("decision = %q, want hit", d)
 	}
 }
 
 func TestSlotScore_SuppressionAppliesWithoutProvider(t *testing.T) {
 	p := affinityProxy(t, "a")
-	p.capacity = nil
+	p.local.capacity = nil
 	p.suppress(inflightKey{"e", "m", "a"})
 	if p.eligible("a", "e", "m") {
 		t.Fatal("suppressed node eligible with no capacity provider")
 	}
-	p.capacity = &fakeCap{}
+	p.local.capacity = &fakeCap{}
 	if p.eligible("a", "e", "m") {
 		t.Fatal("suppressed node eligible with Unknown residency")
 	}

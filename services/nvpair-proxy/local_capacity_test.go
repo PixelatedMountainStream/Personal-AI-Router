@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/json"
+	"nvpair-proxy/local/capacity"
 	"testing"
 	"time"
 )
@@ -27,7 +28,7 @@ func (f *fakeCap) JITLoad(id, _ string) bool { return f.jit[id] }
 func TestParseCapacitySettings(t *testing.T) {
 	var raw map[string]json.RawMessage
 	_ = json.Unmarshal([]byte(`{"engine_slots.lmstudio.qwen3.8-27b-mlx":4,"engine_ctx_per_slot.lmstudio.m":"8192","jit_load.ollama":false}`), &raw)
-	c := parseCapacitySettings(raw)
+	c := capacity.ParseSettings(raw)
 	if n, ok := c.Slots("n", "lmstudio", "qwen3.8-27b-mlx"); !ok || n != 4 {
 		t.Fatalf("slots = %d %v", n, ok)
 	}

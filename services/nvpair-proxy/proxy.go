@@ -144,6 +144,8 @@ type RequestEvent struct {
 	Duration int64  `json:"duration_ms"`
 	TTFB     int64  `json:"ttfb_ms,omitempty"`
 	Error    string `json:"error,omitempty"`
+	// fork:P6
+	Affinity string `json:"affinity,omitempty"` // session-affinity decision (hit, miss, rebind, yield)
 }
 
 // Workload lifecycle method names (workload-manager spec 7). The proxy is
@@ -404,6 +406,9 @@ type Proxy struct {
 	// stalled for every engine this process fronts.
 	coolMu    sync.Mutex
 	coolUntil map[string]time.Time
+
+	// fork:P3
+	local *localState
 
 	// transportMu guards the long-lived HTTP transports reused across forwards
 	// and model-list fetches. Allocating a new http.Transport per request
@@ -843,6 +848,8 @@ type candidate struct {
 	id       string
 	url      *url.URL
 	peerUUID string
+	// fork:P5
+	local bool
 }
 
 // candidateTransport returns the reverse-proxy / model-list transport for a
@@ -1148,7 +1155,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
 				continue
 			}
 			seen[item.key] = item
-			models = append(models, item.raw)
+			models = append(models, p.local.annotateModel(f, openAI, candidates, item.key, item.raw)) // fork:P8
 		}
 	}
 	if !success {
@@ -1197,11 +1204,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	role, routed := f.profile.roleFor(r.Method, r.URL.Path)
 	lookup := routed && role == roleModelLookupPOST
 	bodyBytes, model := bufferBodyAndModel(r, lookup)
+	bodyBytes = p.local.rewriteBody(r, bodyBytes) // fork:P4
 	routingModel := ""
 	if isInf || lookup {
 		routingModel = model
 	}
 	candidates := f.resolveCandidates(routingModel)
+	candidates, notLoaded := p.local.filterCandidates(f, routingModel, candidates, !lookup) // fork:P5
+	lr := p.local.request(p, f, r, bodyBytes, model, isInf)                                 // fork:P6
 	if cors.IsPreflight(r) {
 		targets := make([]cors.Target, 0, len(candidates))
 		for _, cand := range candidates {
@@ -1220,7 +1230,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		held  reservation
 	)
 	if isInf && model != "" {
-		candidates, held = p.reserveCandidate(f, candidates)
+		candidates, held = p.localReserve(lr, f, candidates) // fork:P6
 	}
 	// Released exactly once, whichever way the request ends: normal unwind,
 	// client disconnect, or an early return below. Without this a node stays
@@ -1235,6 +1245,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		resMu.Lock()
 		defer resMu.Unlock()
 		held = p.moveReservation(held, nodeID)
+		lr.onMove(nodeID, held) // fork:P7
 	}
 	defer func() {
 		resMu.Lock()
@@ -1272,6 +1283,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				rejectionStatus = http.StatusNotFound
 			}
 		}
+		rejectionBody, rejectionError, rejectionStatus = localNotLoadedRejection(notLoaded, lookup, routingModel, rejectionBody, rejectionError, rejectionStatus) // fork:P5
 		slog.Warn("proxy request rejected",
 			"id", reqID, "method", r.Method, "path", r.URL.Path,
 			"remote", r.RemoteAddr, "reason", rejectionError)
@@ -1462,6 +1474,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			"duration_ms", time.Since(start).Milliseconds(),
 			"ttfb_ms", ttfbMs,
 			"err", reportErr,
+			"affinity", lr.affinityDecision(), // fork:P6
 		)
 
 		_ = f.notify("proxy/request", RequestEvent{
@@ -1474,6 +1487,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			Duration: time.Since(start).Milliseconds(),
 			TTFB:     ttfbMs,
 			Error:    reportErr,
+			Affinity: lr.affinityDecision(), // fork:P6
 		})
 
 		// Terminal workload transition pairs with the workload:started emitted
@@ -1565,7 +1579,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		defer resMu.Unlock()
 		p.releaseReservation(held)
 		var out []candidate
-		out, held = p.reserveCandidate(f, cands)
+		out, held = p.localReserve(lr, f, cands) // fork:P6
 		return out
 	}
 
@@ -1636,10 +1650,12 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			round = f.resolveCandidates(routingModel)
+			round, _ = p.local.filterCandidates(f, routingModel, round, true) // fork:P5
 			if isInf && model != "" {
 				round = takeHeld(round)
 			}
 			next = 0
+			lr.resetTried() // fork:P7
 			if len(round) == 0 {
 				// Every owner went away mid-flight. Not a rejection: keep
 				// waiting for one to come back. This consumes no attempt, which
@@ -1648,6 +1664,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		cand := round[next]
+		cand, skipRound := lr.pick(round, next, cand, &resMu, &held) // fork:P7
+		if skipRound {                                               // fork:P7
+			next = len(round)
+			continue
+		}
 		next++
 		dispatches++
 		// lastPermitted means no further dispatch can happen, so this attempt's
@@ -1662,6 +1683,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// a node for the whole first-content budget, and for that time it is
 		// the node under load. A same-node move is a no-op.
 		moveHeld(cand.id)
+		lr.attemptStart(reqID, dispatches, cand.id, len(round), &resMu, &held) // fork:P7
 
 		// Each attempt runs on its own context, a child of the request's, so we
 		// can abandon this dispatch without touching the request itself. The
@@ -1737,6 +1759,10 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			// have arrived but before the body streams. That's both the retry
 			// decision point and, on commit, the time-to-first-byte boundary.
 			ModifyResponse: func(resp *http.Response) error {
+				if lr.notLoaded(attemptCtx, resp, cand.id, last, attemptStart) { // fork:P9
+					retry = true
+					return retrySignal{}
+				}
 				if !last && shouldRetry(resp.StatusCode) {
 					// Abort before streaming: ReverseProxy closes resp.Body and
 					// calls ErrorHandler with our sentinel, then we try next.
@@ -1909,6 +1935,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 		proxy.ServeHTTP(sc, attemptReq)
 		cancelAttempt()
+		lr.attemptEnd(reqID, dispatches, cand.id, attemptStart, retry) // fork:P7
 		// Record how this candidate behaved for the next request's ordering.
 		// Measured, not classified from the error: a dial failure is bounded by
 		// the much shorter dial timeout and a status-based retry commits a
@@ -1937,6 +1964,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			finalStatus = sc.status
 			committedSC = sc
 			committed = true
+			lr.releaseEarly(&resMu, &held) // fork:P6
 		}
 	}
 
@@ -2148,6 +2176,8 @@ type reservation struct {
 	// held distinguishes "no reservation was taken" from "a reservation on the
 	// zero-value node", so release on the paths that never reserved is a no-op.
 	held bool
+	// fork:P6
+	localClaim
 }
 
 // reserveCandidate atomically moves the least estimated loaded scheduler-listed
@@ -2168,6 +2198,9 @@ type reservation struct {
 // Process-wide is the point: two facades bursting at once are competing for the
 // same GPU, so a dispatch through either has to be visible to the other.
 func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate, reservation) {
+	if out, res, ok := p.localReserveHook(f, candidates); ok { // fork:P6
+		return out, res
+	}
 	if len(candidates) == 0 {
 		return candidates, reservation{}
 	}
@@ -2339,6 +2372,9 @@ func (p *Proxy) releaseReservation(r reservation) {
 	}
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
+	if p.localDropLocked(r) { // fork:P6
+		return
+	}
 	if r.generation != p.appliedPriorityGeneration {
 		return
 	}
@@ -2365,6 +2401,9 @@ func (p *Proxy) moveReservation(r reservation, nodeID string) reservation {
 	}
 	p.priorityMu.Lock()
 	defer p.priorityMu.Unlock()
+	if res, ok := p.localMoveLocked(r, nodeID); ok { // fork:P6
+		return res
+	}
 	if r.generation == p.appliedPriorityGeneration {
 		if p.priorityReservations[r.nodeID] <= 1 {
 			delete(p.priorityReservations, r.nodeID)
@@ -2673,6 +2712,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
 	p.priorityPending = pending
 	p.priorityGPUPressure = gpuPressure
 	p.priorityReservations = make(map[string]int)
+	p.local.applySnapshot(priority) // fork:P6
 	return len(cleaned)
 }
 

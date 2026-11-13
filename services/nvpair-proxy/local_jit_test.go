@@ -4,6 +4,7 @@
 package main
 
 import (
+	"nvpair-proxy/local/capacity"
 	"testing"
 	"time"
 
@@ -14,12 +15,12 @@ import (
 // jit_load key, LM Studio never loads on demand and Ollama and llama.cpp do,
 // in both the env settings and the directory capacity providers.
 func TestLocalJITFallbackLMStudioParity(t *testing.T) {
-	d := newDirectoryCapacity(nil)
+	d := capacity.NewDirectory(nil)
 	for _, e := range []string{"lmstudio", "ollama", "llamacpp"} {
-		d.update(e, []noderec.DirectoryNode{{HostUUID: "n"}})
+		d.Update(e, []noderec.DirectoryNode{{HostUUID: "n"}})
 	}
 	for e, want := range map[string]bool{"lmstudio": false, "ollama": true, "llamacpp": true} {
-		if got := (settingsCapacity{}).JITLoad("n", e); got != want {
+		if got := (capacity.Settings{}).JITLoad("n", e); got != want {
 			t.Errorf("settings JITLoad(%s) = %v, want %v", e, got, want)
 		}
 		if got := d.JITLoad("n", e); got != want {
@@ -34,7 +35,7 @@ func TestLocalJITFallbackLMStudioParity(t *testing.T) {
 // served name (modelsByEngine) is eligible as Loaded although loadedByEngine
 // names the --model root; a stopped vLLM serves nothing.
 func TestLocalVLLMDownloadedOnlyNeverEligible(t *testing.T) {
-	if (settingsCapacity{}).JITLoad("n", "vllm") {
+	if (capacity.Settings{}).JITLoad("n", "vllm") {
 		t.Fatal("settings fallback must not JIT vLLM")
 	}
 	vllm := func(id string, served, loaded []string, jit map[string]bool) noderec.DirectoryNode {
@@ -47,14 +48,14 @@ func TestLocalVLLMDownloadedOnlyNeverEligible(t *testing.T) {
 		}
 		return n
 	}
-	d := newDirectoryCapacity(nil)
-	d.update("vllm", []noderec.DirectoryNode{
+	d := capacity.NewDirectory(nil)
+	d.Update("vllm", []noderec.DirectoryNode{
 		vllm("quiet", []string{"qwen-api"}, []string{"org/m"}, nil),
 		vllm("said", []string{"qwen-api"}, []string{"org/m"}, map[string]bool{"vllm": false}),
 		vllm("stopped", nil, []string{}, map[string]bool{"vllm": false}),
 	})
-	p := &Proxy{suppressed: map[inflightKey]time.Time{}, now: time.Now}
-	p.capacity = d
+	p := &Proxy{local: &localState{suppressed: map[inflightKey]time.Time{}, now: time.Now}}
+	p.local.capacity = d
 	for _, id := range []string{"quiet", "said", "stopped"} {
 		for _, m := range []string{"org/other", "org/m"} {
 			if p.eligible(id, "vllm", m) {
@@ -73,12 +74,12 @@ func TestLocalVLLMDownloadedOnlyNeverEligible(t *testing.T) {
 // omits downloadedByEngine.vllm, but the served alias is still Loaded (not
 // compared with the --model root) and eligible.
 func TestLocalVLLMServedAliasWithoutDownloadedInventory(t *testing.T) {
-	d := newDirectoryCapacity(nil)
-	d.update("vllm", []noderec.DirectoryNode{{HostUUID: "n",
+	d := capacity.NewDirectory(nil)
+	d.Update("vllm", []noderec.DirectoryNode{{HostUUID: "n",
 		ModelsByEngine: map[string][]string{"vllm": {"qwen-api"}},
 		LoadedByEngine: map[string][]string{"vllm": {"org/model"}}}})
-	p := &Proxy{suppressed: map[inflightKey]time.Time{}, now: time.Now}
-	p.capacity = d
+	p := &Proxy{local: &localState{suppressed: map[inflightKey]time.Time{}, now: time.Now}}
+	p.local.capacity = d
 	if r, _ := d.Residency("n", "vllm", "qwen-api"); r != ResidencyLoaded || !p.eligible("n", "vllm", "qwen-api") {
 		t.Fatalf("served alias residency %v", r)
 	}

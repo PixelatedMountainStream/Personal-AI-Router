@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-package main
+package respnorm
 
 import "testing"
 
@@ -22,7 +22,7 @@ func TestNormalizeResponsesInput(t *testing.T) {
 			if want == "" {
 				want = c.in
 			}
-			if got := string(normalizeResponsesInput([]byte(c.in))); got != want {
+			if got := string(Normalize([]byte(c.in))); got != want {
 				t.Fatalf("got  %s\nwant %s", got, want)
 			}
 		})

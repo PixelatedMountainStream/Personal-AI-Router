@@ -1,20 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-package main
+package respnorm
 
 import (
 	"bytes"
 	"encoding/json"
 )
 
-// normalizeResponsesInput rewrites a /v1/responses body so that developer/system
+// Normalize rewrites a /v1/responses body so that developer/system
 // messages appearing after the leading run of system/developer items become
 // user messages prefixed with "[developer]\n". Some backend chat templates
 // (e.g. Qwen's) reject a system message anywhere but the start. Everything
 // else is left byte-identical; on any parse problem or no-op the original
 // bytes are returned.
-func normalizeResponsesInput(body []byte) []byte {
+func Normalize(body []byte) []byte {
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(body, &top); err != nil {
 		return body
