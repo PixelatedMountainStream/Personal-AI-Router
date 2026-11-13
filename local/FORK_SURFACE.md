@@ -249,14 +249,14 @@ Tests: services/nvpair-proxy . -run 'TestP4_Nil|TestCharResponsesInputNormalised
 ### P5
 files: services/nvpair-proxy/proxy.go
 kind: hook
-recipe: In handleHTTP add `candidates, notLoaded := p.local.filterCandidates(f, routingModel, candidates, !lookup) // fork:P5` after the first resolveCandidates and `round, _ = p.local.filterCandidates(f, routingModel, round, true) // fork:P5` after the round re-resolution; add `rejectionBody, rejectionError, rejectionStatus = localNotLoadedRejection(...) // fork:P5` after the routingModel rejection block; add `// fork:P5` then `local bool` as the last candidate field. The filter runs after NVIDIA's demoteCooling and keeps its order.
-Tests: services/nvpair-proxy . -run 'TestP5_Nil|TestHandleHTTP_ModelLookupIgnoresResidency|TestCharLMStudio|TestLocalFilterKeepsCoolingOrder'
+recipe: In handleHTTP add `candidates, notLoaded := p.local.filterCandidates(f, routingModel, candidates, !lookup) // fork:P5` after the first resolveCandidates and `round, _ = p.local.filterCandidates(f, routingModel, round, true) // fork:P5` after the round re-resolution; add `rejectionBody, rejectionError, rejectionStatus = localNotLoadedRejection(...) // fork:P5` after the routingModel rejection block; add `// fork:P5` then `local bool` as the last candidate field. In resolveCandidates' add closure add `seenHost[u.Host] = p.local.claimsHost(f, model, n.ID) // fork:P5` after `seenHost[u.Host] = true`, so an ineligible ID does not claim its host. The filter runs after NVIDIA's demoteCooling and keeps its order.
+Tests: services/nvpair-proxy . -run 'TestP5_Nil|TestHandleHTTP_ModelLookupIgnoresResidency|TestCharLMStudio|TestLocalFilterKeepsCoolingOrder|TestLocalSameHostLoadedIDSurvivesDedup'
 
 ### P6
 files: services/nvpair-proxy/proxy.go
 kind: hook
 recipe: In handleHTTP add `lr := p.local.request(...) // fork:P6` after P5, replace both `p.reserveCandidate(f, ...)` calls with `p.localReserve(lr, f, ...) // fork:P6`, add `lr.releaseEarly(&resMu, &held) // fork:P6` after `committed = true`, `Affinity: lr.affinityDecision(), // fork:P6` last in the finalize RequestEvent and `"affinity", lr.affinityDecision(), // fork:P6` last in its slog; add `// fork:P6` then `Affinity` as the last RequestEvent field and `localClaim` as the last reservation field; open reserveCandidate with `if out, res, ok := p.localReserveHook(f, candidates); ok { // fork:P6`, releaseReservation (after its Lock/defer) with `if p.localDropLocked(r) { // fork:P6`, moveReservation (after its Lock/defer) with `if res, ok := p.localMoveLocked(r, nodeID); ok { // fork:P6`; add `p.local.applySnapshot(priority) // fork:P6` before setPriorityLocked's return. Cooling (NVIDIA #144) is routing.Better's outer key.
-Tests: services/nvpair-proxy . -run 'TestP6_Nil|TestReserveCandidate_|TestAffinity|TestSlotScore_|TestLocalCooling|TestLocalAllCooling|TestLocalAffinityLeavesCoolingBoundNode|TestCharLMStudioSlots'
+Tests: services/nvpair-proxy . -run 'TestP6_Nil|TestReserveCandidate_|TestAffinity|TestSlotScore_|TestLocalCooling|TestLocalAllCooling|TestLocalAffinityLeavesCoolingBoundNode|TestLocalAffinityDoesNotYieldToCoolingNode|TestCharLMStudioSlots'
 
 ### P7
 files: services/nvpair-proxy/proxy.go

@@ -2126,6 +2126,7 @@ func (f *facade) resolveCandidates(model string) []candidate {
 			return
 		}
 		seenHost[u.Host] = true
+		seenHost[u.Host] = p.local.claimsHost(f, model, n.ID) // fork:P5
 		out = append(out, candidate{
 			id:       n.ID,
 			url:      u,

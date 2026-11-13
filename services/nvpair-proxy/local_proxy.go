@@ -155,7 +155,19 @@ func (s *localState) filterCandidates(f *facade, model string, cands []candidate
 		}
 	}
 	if model == "" || !requireEligible {
-		return cands, 0
+		// claimsHost may have let a second ID through on one host; a lookup
+		// keeps NVIDIA's first-per-host.
+		seen, out := map[string]bool{}, cands[:0:0]
+		for _, c := range cands {
+			if c.url != nil && seen[c.url.Host] {
+				continue
+			}
+			if c.url != nil {
+				seen[c.url.Host] = true
+			}
+			out = append(out, c)
+		}
+		return out, 0
 	}
 	out, dropped := cands[:0:0], 0
 	for _, c := range cands {
@@ -166,6 +178,15 @@ func (s *localState) filterCandidates(f *facade, model string, cands []candidate
 		}
 	}
 	return out, dropped
+}
+
+// claimsHost reports whether a resolved node claims its host in NVIDIA's
+// per-host de-duplication (P5). A node that is not eligible for model does
+// not, so a later eligible ID on the same host is still resolved, as the
+// pre-step fork (which filtered before de-dup) did; filterCandidates then
+// drops the ineligible one, or de-dups by host for lookups.
+func (s *localState) claimsHost(f *facade, model, nodeID string) bool {
+	return s == nil || model == "" || s.eligible(nodeID, f.profile.Name, model)
 }
 
 // localNotLoadedRejection turns an inference rejection into a 503 when owners
@@ -361,7 +382,7 @@ func (p *Proxy) reserveCandidateFor(f *facade, candidates []candidate, key, mode
 				// pending, which can be stale enough to break sequential hits.
 				if s.inflight[inflightKey{engine, model, bound}] < s.nodeSlots(bound, engine, model) {
 					bestIndex, decision, reason = index, affinity.Hit, "affinity-hit"
-				} else if other := best(free); other >= 0 {
+				} else if other := best(func(id string) bool { return free(id) && (!cooling[id] || cooling[bound]) }); other >= 0 {
 					bestIndex, decision, reason = other, affinity.Yield, "affinity-yield"
 				} else if lowest := best(nil); lowest >= 0 {
 					// Every node is full: stay unless another is clearly shorter.

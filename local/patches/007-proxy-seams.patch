@@ -1,6 +1,6 @@
-From 86ed8da797cd70f807f88a462bfd520809c53b87 Mon Sep 17 00:00:00 2001
+From 55670f7bd1e75e04c3eb1829d64ef6e7216b0f3c Mon Sep 17 00:00:00 2001
 From: "erik.hauan" <erik.hauan@radiantvs.com>
-Date: Thu, 12 Nov 2026 16:45:47 -0800
+Date: Thu, 12 Nov 2026 17:01:42 -0800
 Subject: [PATCH] proxy: slot-aware routing, affinity, JIT, residency behind
  P1-P9
 
@@ -63,13 +63,13 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  services/nvpair-proxy/local_char_test.go      | 146 ++++
  .../nvpair-proxy/local_dircapacity_test.go    | 197 +++++
  services/nvpair-proxy/local_jit_test.go       |  89 ++
- services/nvpair-proxy/local_p_test.go         | 165 ++++
- services/nvpair-proxy/local_proxy.go          | 759 ++++++++++++++++++
+ services/nvpair-proxy/local_p_test.go         | 198 +++++
+ services/nvpair-proxy/local_proxy.go          | 780 ++++++++++++++++++
  services/nvpair-proxy/local_proxy_test.go     |  69 ++
  services/nvpair-proxy/local_slotscore_test.go | 311 +++++++
  services/nvpair-proxy/main.go                 |   1 +
- services/nvpair-proxy/proxy.go                |  46 +-
- 21 files changed, 3112 insertions(+), 3 deletions(-)
+ services/nvpair-proxy/proxy.go                |  47 +-
+ 21 files changed, 3167 insertions(+), 3 deletions(-)
  create mode 100644 services/nvpair-proxy/local/affinity/affinity.go
  create mode 100644 services/nvpair-proxy/local/affinity/affinity_test.go
  create mode 100644 services/nvpair-proxy/local/capacity/capacity.go
@@ -1950,10 +1950,10 @@ index 0000000..07ec4bc
 +}
 diff --git a/services/nvpair-proxy/local_p_test.go b/services/nvpair-proxy/local_p_test.go
 new file mode 100644
-index 0000000..323ffe7
+index 0000000..c151d1e
 --- /dev/null
 +++ b/services/nvpair-proxy/local_p_test.go
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,198 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -2119,12 +2119,45 @@ index 0000000..323ffe7
 +	p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, tc.inferencePath, strings.NewReader(tc.inferenceBody())))
 +	assert.Equal(t, http.StatusOK, rec.Code)
 +}
++
++// Codex P1: two IDs on one host advertise the model; the first is known empty
++// with JIT off, the second has it loaded. The loaded one must be served.
++func TestLocalSameHostLoadedIDSurvivesDedup(t *testing.T) {
++	tc := lmstudioCase(t)
++	srv, hits := newCountingServer(t, 200, "{}")
++	disc := NewDiscovery()
++	disc.AddManual(nodeForModel(t, "a", srv, tc.advertisedModel))
++	disc.AddManual(nodeForModel(t, "b", srv, tc.advertisedModel))
++	p := charLocal(testProxy(tc.profile, disc, tc.profile.FacadePort),
++		&fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty, "b": ResidencyLoaded}})
++	rec := httptest.NewRecorder()
++	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
++	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
++	assert.Equal(t, 1, hits())
++	// A lookup still sends one candidate per host.
++	cands := p.soleFacade().resolveCandidates(tc.advertisedModel)
++	out, _ := p.local.filterCandidates(p.soleFacade(), tc.advertisedModel, cands, false)
++	assert.Len(t, out, 1)
++}
++
++// Codex P2: bound warm node full, other node idle but cooling: the request
++// stays (queues) on the bound node rather than yielding to the cooling one.
++func TestLocalAffinityDoesNotYieldToCoolingNode(t *testing.T) {
++	p := affinityProxy(t, "a", "b")
++	f := p.soleFacade()
++	_, held, _ := p.reserveCandidateKey(f, reservationCandidates("a", "b"), "conv")
++	require.Equal(t, "a", held.nodeID)
++	p.noteNoFirstByte("b", time.Now())
++	out, _, d := p.reserveCandidateKey(f, reservationCandidates("a", "b"), "conv")
++	assert.Equal(t, "a", out[0].id)
++	assert.Equal(t, "hit", d)
++}
 diff --git a/services/nvpair-proxy/local_proxy.go b/services/nvpair-proxy/local_proxy.go
 new file mode 100644
-index 0000000..889d3e9
+index 0000000..d6783ae
 --- /dev/null
 +++ b/services/nvpair-proxy/local_proxy.go
-@@ -0,0 +1,759 @@
+@@ -0,0 +1,780 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -2282,7 +2315,19 @@ index 0000000..889d3e9
 +		}
 +	}
 +	if model == "" || !requireEligible {
-+		return cands, 0
++		// claimsHost may have let a second ID through on one host; a lookup
++		// keeps NVIDIA's first-per-host.
++		seen, out := map[string]bool{}, cands[:0:0]
++		for _, c := range cands {
++			if c.url != nil && seen[c.url.Host] {
++				continue
++			}
++			if c.url != nil {
++				seen[c.url.Host] = true
++			}
++			out = append(out, c)
++		}
++		return out, 0
 +	}
 +	out, dropped := cands[:0:0], 0
 +	for _, c := range cands {
@@ -2293,6 +2338,15 @@ index 0000000..889d3e9
 +		}
 +	}
 +	return out, dropped
++}
++
++// claimsHost reports whether a resolved node claims its host in NVIDIA's
++// per-host de-duplication (P5). A node that is not eligible for model does
++// not, so a later eligible ID on the same host is still resolved, as the
++// pre-step fork (which filtered before de-dup) did; filterCandidates then
++// drops the ineligible one, or de-dups by host for lookups.
++func (s *localState) claimsHost(f *facade, model, nodeID string) bool {
++	return s == nil || model == "" || s.eligible(nodeID, f.profile.Name, model)
 +}
 +
 +// localNotLoadedRejection turns an inference rejection into a 503 when owners
@@ -2488,7 +2542,7 @@ index 0000000..889d3e9
 +				// pending, which can be stale enough to break sequential hits.
 +				if s.inflight[inflightKey{engine, model, bound}] < s.nodeSlots(bound, engine, model) {
 +					bestIndex, decision, reason = index, affinity.Hit, "affinity-hit"
-+				} else if other := best(free); other >= 0 {
++				} else if other := best(func(id string) bool { return free(id) && (!cooling[id] || cooling[bound]) }); other >= 0 {
 +					bestIndex, decision, reason = other, affinity.Yield, "affinity-yield"
 +				} else if lowest := best(nil); lowest >= 0 {
 +					// Every node is full: stay unless another is clearly shorter.
@@ -3289,7 +3343,7 @@ index ebfa902..b4a1624 100644
  	// the proxy serves only the loopback plaintext personality; once this node is
  	// a member the same listener also serves the pin-gated LAN mTLS ingress, and
 diff --git a/services/nvpair-proxy/proxy.go b/services/nvpair-proxy/proxy.go
-index 3448b8e..97551c9 100644
+index 3448b8e..849531f 100644
 --- a/services/nvpair-proxy/proxy.go
 +++ b/services/nvpair-proxy/proxy.go
 @@ -144,6 +144,8 @@ type RequestEvent struct {
@@ -3454,7 +3508,15 @@ index 3448b8e..97551c9 100644
  		}
  	}
  
-@@ -2148,6 +2176,8 @@ type reservation struct {
+@@ -2098,6 +2126,7 @@ func (f *facade) resolveCandidates(model string) []candidate {
+ 			return
+ 		}
+ 		seenHost[u.Host] = true
++		seenHost[u.Host] = p.local.claimsHost(f, model, n.ID) // fork:P5
+ 		out = append(out, candidate{
+ 			id:       n.ID,
+ 			url:      u,
+@@ -2148,6 +2177,8 @@ type reservation struct {
  	// held distinguishes "no reservation was taken" from "a reservation on the
  	// zero-value node", so release on the paths that never reserved is a no-op.
  	held bool
@@ -3463,7 +3525,7 @@ index 3448b8e..97551c9 100644
  }
  
  // reserveCandidate atomically moves the least estimated loaded scheduler-listed
-@@ -2168,6 +2198,9 @@ type reservation struct {
+@@ -2168,6 +2199,9 @@ type reservation struct {
  // Process-wide is the point: two facades bursting at once are competing for the
  // same GPU, so a dispatch through either has to be visible to the other.
  func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate, reservation) {
@@ -3473,7 +3535,7 @@ index 3448b8e..97551c9 100644
  	if len(candidates) == 0 {
  		return candidates, reservation{}
  	}
-@@ -2339,6 +2372,9 @@ func (p *Proxy) releaseReservation(r reservation) {
+@@ -2339,6 +2373,9 @@ func (p *Proxy) releaseReservation(r reservation) {
  	}
  	p.priorityMu.Lock()
  	defer p.priorityMu.Unlock()
@@ -3483,7 +3545,7 @@ index 3448b8e..97551c9 100644
  	if r.generation != p.appliedPriorityGeneration {
  		return
  	}
-@@ -2365,6 +2401,9 @@ func (p *Proxy) moveReservation(r reservation, nodeID string) reservation {
+@@ -2365,6 +2402,9 @@ func (p *Proxy) moveReservation(r reservation, nodeID string) reservation {
  	}
  	p.priorityMu.Lock()
  	defer p.priorityMu.Unlock()
@@ -3493,7 +3555,7 @@ index 3448b8e..97551c9 100644
  	if r.generation == p.appliedPriorityGeneration {
  		if p.priorityReservations[r.nodeID] <= 1 {
  			delete(p.priorityReservations, r.nodeID)
-@@ -2673,6 +2712,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
+@@ -2673,6 +2713,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
  	p.priorityPending = pending
  	p.priorityGPUPressure = gpuPressure
  	p.priorityReservations = make(map[string]int)

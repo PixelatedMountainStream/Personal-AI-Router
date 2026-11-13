@@ -163,3 +163,36 @@ func TestLocalFilterKeepsCoolingOrder(t *testing.T) {
 	p.soleFacade().handleHTTP(rec, httptest.NewRequest(http.MethodPost, tc.inferencePath, strings.NewReader(tc.inferenceBody())))
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
+
+// Codex P1: two IDs on one host advertise the model; the first is known empty
+// with JIT off, the second has it loaded. The loaded one must be served.
+func TestLocalSameHostLoadedIDSurvivesDedup(t *testing.T) {
+	tc := lmstudioCase(t)
+	srv, hits := newCountingServer(t, 200, "{}")
+	disc := NewDiscovery()
+	disc.AddManual(nodeForModel(t, "a", srv, tc.advertisedModel))
+	disc.AddManual(nodeForModel(t, "b", srv, tc.advertisedModel))
+	p := charLocal(testProxy(tc.profile, disc, tc.profile.FacadePort),
+		&fakeCap{res: map[string]Residency{"a": ResidencyKnownEmpty, "b": ResidencyLoaded}})
+	rec := httptest.NewRecorder()
+	p.soleFacade().handleHTTP(rec, tc.inferenceRequest())
+	assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, 1, hits())
+	// A lookup still sends one candidate per host.
+	cands := p.soleFacade().resolveCandidates(tc.advertisedModel)
+	out, _ := p.local.filterCandidates(p.soleFacade(), tc.advertisedModel, cands, false)
+	assert.Len(t, out, 1)
+}
+
+// Codex P2: bound warm node full, other node idle but cooling: the request
+// stays (queues) on the bound node rather than yielding to the cooling one.
+func TestLocalAffinityDoesNotYieldToCoolingNode(t *testing.T) {
+	p := affinityProxy(t, "a", "b")
+	f := p.soleFacade()
+	_, held, _ := p.reserveCandidateKey(f, reservationCandidates("a", "b"), "conv")
+	require.Equal(t, "a", held.nodeID)
+	p.noteNoFirstByte("b", time.Now())
+	out, _, d := p.reserveCandidateKey(f, reservationCandidates("a", "b"), "conv")
+	assert.Equal(t, "a", out[0].id)
+	assert.Equal(t, "hit", d)
+}

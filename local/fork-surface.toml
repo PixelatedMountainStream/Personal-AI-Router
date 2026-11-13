@@ -73,7 +73,7 @@ legacy_added = [
 ]
 
 [budget]            # ratchet, lowered per migration PR; raising it needs label surface-budget-raise (budget_raised)
-max_lines = 536     # changed lines in modified upstream files only (measured at catch-up step 5)
+max_lines = 537     # changed lines in modified upstream files only (measured at catch-up step 5)
 max_files = 38      # modified upstream files only
 max_legacy_added_lines = 1734   # separate shrinking budget for legacy_added
 
@@ -100,8 +100,8 @@ max_seams = 1
 # Proxy hooks P1-P9 (catch-up step 5), caps from the measured values.
 [[file]]
 path = "services/nvpair-proxy/proxy.go"
-max_lines = 46
-max_hunks = 22
+max_lines = 47
+max_hunks = 23
 max_seams = 7
 
 [go]
