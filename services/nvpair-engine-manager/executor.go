@@ -125,10 +125,14 @@ type Executor struct {
 	// streaming handlers) in addition to the local engine:install-progress
 	// notification path. See progress.go.
 	progress *progressHub
+<<<<<<< HEAD
 	baseDir  string // user-scoped install base
 	// settingsOverrides returns the flat node-settings engine overrides
 	// (engine_slots.*, engine_ctx_per_slot.*, jit_load.*); nil means none.
 	settingsOverrides func() map[string]json.RawMessage
+=======
+	baseDir  string // default user-scoped install base
+>>>>>>> 443b09299676d407d8bb25a8c60ca76ab6ae3ee6
 	// desired persists explicit per-engine ON/OFF intent. Runtime state remains
 	// in-memory; shutdown cleanup must not rewrite this store.
 	desired *desiredStateStore
@@ -292,18 +296,34 @@ func (e *Executor) state(engine string) (*engineState, error) {
 	if !ok {
 		return nil, fmt.Errorf("%s is not supported on %s/%s", m.DisplayName, runtime.GOOS, runtime.GOARCH)
 	}
+	installDir, err := engineInstallDir(e.baseDir, engine, plat.InstallDir)
+	if err != nil {
+		return nil, fmt.Errorf("engine %q: %w", engine, err)
+	}
 	st := &engineState{
 		manifest:   m,
 		plat:       plat,
 		logs:       newLogBuffer(),
 		port:       plat.Runtime.Port,
-		installDir: filepath.Join(e.baseDir, engine),
+		installDir: installDir,
 	}
 	if plat.ModelsDir != "" {
 		st.modelsDir = expandPath(plat.ModelsDir)
 	}
 	e.engines[engine] = st
 	return st, nil
+}
+
+func engineInstallDir(defaultBase, engine, configured string) (string, error) {
+	if configured == "" {
+		return filepath.Join(defaultBase, engine), nil
+	}
+	dir := expandPath(configured)
+	// Clean turns an empty expansion into ".", which is unsafe as an uninstall target.
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("install_dir must not expand to an empty path")
+	}
+	return filepath.Clean(dir), nil
 }
 
 // pathVars are the directory placeholders every templated manifest string can
