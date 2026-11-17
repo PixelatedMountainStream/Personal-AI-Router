@@ -23,6 +23,15 @@ extensibility story for an open-source product.
   [LAUNCH_TEXT.md](LAUNCH_TEXT.md).
 - Detect installation; **user-mode** install (HTTPS download + checksum-verify-when-pinned + run) per OS/arch.
 - Lifecycle: start (with readiness probe), stop, restart, status, periodic health.
+- The bundled LM Studio stop policy reads `lms daemon status --json`: a headless
+  host uses `lms daemon down` to release its daemon and loaded models; a GUI host
+  uses `lms server stop`, preserving the GUI and its models. Failed or
+  unrecognized host status also uses `server stop`, so the host and models may
+  remain in memory. An explicit `not-running` status requires no stop command.
+  Detection and shutdown share a ten-second command
+  timeout, followed by up to ten seconds to confirm server closure. Restart and
+  shutdown use the same policy on every supported platform; custom stop commands
+  remain unchanged.
 - Persistent server-port changes preserve arguments, environment and unrelated
   manifest overrides. Resetting to the bundled port removes only shared and
   host-platform port overrides, deleting the file only when it has no other
@@ -153,6 +162,21 @@ implementation is used.
 ```
 
 Errors are emitted with the `nvpair-shared/errors.ServiceError` wire shape (`id`, `message`, `severity`, `action`, …), mirrored locally in `reporter.go` with identical JSON tags. `id` follows `engine-manager:<class>:<engine>`; the Broker stamps `nodeId` / `timestamp`.
+
+When startup output identifies a Metal out-of-memory failure, the error message
+includes an explanation that available GPU memory is insufficient and advice to
+unload models from other engines or free memory before retrying. Classification
+is shared across engine names, process and privately captured command launches,
+and host platforms; it depends on the emitted Metal diagnostic rather than the
+engine or OS. Commands use this capture when custom launch arguments or environment
+are supplied. The public error retains its existing engine or command context before the advice
+and appends the bounded, redacted diagnostic tail under `Engine details:`. The
+original error cause remains available. Detection occurs after redaction and
+survives subsequent traceback truncation. The tail is bounded to 8 KiB. Unrelated
+failures keep their existing explanations and lifecycle behavior. Cancellation
+and expired operation deadlines are identified from the operation context as
+well as the returned error; both the interruption and any underlying subprocess
+error remain available, without being reclassified as memory failures.
 
 Example request:
 ```json

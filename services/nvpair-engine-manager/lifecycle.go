@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -372,7 +373,7 @@ func (e *Executor) bringUpProcess(ctx context.Context, st *engineState, engine s
 		st.mu.Lock()
 		st.proc = nil
 		st.mu.Unlock()
-		werr := fmt.Errorf("engine %q did not become ready: %w", engine, diagnostics.failure(err))
+		werr := fmt.Errorf("engine %q did not become ready: %w", engine, diagnostics.failure(ctx, err))
 		e.reportStartFailedUnlessShuttingDown(ctx, engine, werr)
 		e.emitState(engine)
 		return werr
@@ -403,6 +404,9 @@ func (e *Executor) bringUpCommand(ctx context.Context, st *engineState, engine s
 			return errors.Join(startErr, fmt.Errorf("clean up failed %s start: %w", engine, stopErr))
 		}
 		return startErr
+	}
+	if engine == "lmstudio" && rt.CLI != "" {
+		e.startLMStudioHost(ctx, expandPath(rt.CLI))
 	}
 	for index := range rt.Start {
 		launch, err := resolveRuntimeCommand(rt, index, vars)
@@ -470,7 +474,7 @@ func runPrivateLaunchCommand(ctx context.Context, argv []string, environment map
 	}
 	configureSysProcAttr(cmd)
 	if err := cmd.Run(); err != nil {
-		return diagnostics.failure(fmt.Errorf("launch command failed: %w", err))
+		return diagnostics.failure(ctx, fmt.Errorf("launch command failed: %w", err))
 	}
 	return nil
 }
@@ -633,7 +637,12 @@ func (e *Executor) runCommandStop(st *engineState, engine string, rt Runtime, po
 	// force-kills engine-manager on a timeout, so an unbounded stop command
 	// would wedge StopAll and, in turn, the whole app shutdown.
 	stopCtx, cancelStop := context.WithTimeout(context.Background(), commandStopTimeout(rt))
-	runErr := e.runCommand(stopCtx, argv)
+	var runErr error
+	if engine == "lmstudio" && slices.Equal(sp.Cmd, []string{"{cli}", "daemon", "down"}) {
+		runErr = e.stopLMStudio(stopCtx, argv[0])
+	} else {
+		runErr = e.runCommand(stopCtx, argv)
+	}
 	cancelStop()
 	if runErr != nil {
 		return fmt.Errorf("stop %s: %w", engine, runErr)

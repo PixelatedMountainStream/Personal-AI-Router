@@ -84,6 +84,22 @@ func main() {
 	// "--fail-launch", or a model named org/fails-to-load, stands in for a launch
 	// the engine rejects, such as a model that does not fit in GPU memory.
 	for _, arg := range os.Args[1:] {
+		if arg == "--fail-metal-oom" || arg == "--metal-oom-before-wait" {
+			// Captured vLLM-Metal warm-up diagnostic. The same Metal signature is
+			// reported at https://github.com/ml-explore/mlx-examples/issues/481.
+			fmt.Fprintln(os.Stderr, "RuntimeError: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory).")
+			if arg == "--metal-oom-before-wait" {
+				if err := os.WriteFile(os.Getenv("PAIR_TEST_STARTUP_MARKER"), []byte("ready"), 0o600); err != nil {
+					os.Exit(2)
+				}
+				// Keep the child alive so cancellation, rather than an OOM exit,
+				// is what ends this synthetic startup.
+				time.Sleep(time.Hour)
+				return
+			}
+			fmt.Fprintln(os.Stderr, "RuntimeError: Engine core initialization failed.")
+			os.Exit(1)
+		}
 		if arg == "--fail-launch" || arg == "org/fails-to-load" {
 			fmt.Fprintln(os.Stderr, "invalid launch", os.Args[1:])
 			os.Exit(2)
@@ -119,6 +135,20 @@ func main() {
 	// exit (no server), standing in for a daemon's control CLI.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "daemon", "server":
+			if strings.Join(os.Args[1:], " ") == "daemon status --json" {
+				if os.Getenv("PAIR_TEST_LMS_STATUS") == "command-error" {
+					fmt.Fprintln(os.Stderr, "host status unavailable")
+					os.Exit(1)
+				}
+				fmt.Println(os.Getenv("PAIR_TEST_LMS_STATUS"))
+				return
+			}
+			data, err := json.Marshal(os.Args[1:])
+			if err != nil || os.WriteFile(os.Getenv("PAIR_TEST_LMS_STOP"), data, 0o600) != nil {
+				os.Exit(1)
+			}
+			return
 		case "-I": // stand in for the memory probe's Python -I -c invocation
 			// Distinct readings in the service and engine environments let a test
 			// observe which environment the probe actually received.
