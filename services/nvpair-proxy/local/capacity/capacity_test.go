@@ -28,3 +28,16 @@ func TestServedLoaded_AvailableVLLMOnlyLoaded(t *testing.T) {
 		t.Fatalf("stopped engine loaded = %v, want empty", got)
 	}
 }
+
+// A served name equal to another downloaded id (root org/root served as
+// org/cold) must come from the relayed served names, not alias inference.
+func TestServedLoaded_UsesRelayedServedNames(t *testing.T) {
+	n := noderec.DirectoryNode{
+		ModelsByEngine:     map[string][]string{"vllm": {"org/cold"}},
+		DownloadedByEngine: map[string][]string{"vllm": {"org/root", "org/cold"}},
+	}
+	n.ServedLoadedByEngine = map[string][]string{"vllm": {"org/cold"}}
+	if got := ServedLoaded(n, "vllm", []string{"org/root"}); !slices.Equal(got, []string{"org/cold"}) {
+		t.Fatalf("served = %v, want [org/cold]", got)
+	}
+}

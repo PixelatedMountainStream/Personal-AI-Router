@@ -145,6 +145,7 @@ func (e *Executor) modelsResult(ctx context.Context) (ModelsResult, error) {
 			// is not what a peer or the proxy may route to, so it is reported apart.
 			if (mf.AdvertisedModels == advertisedModelsLoaded || mf.AdvertisedModels == advertisedModelsAvailable) && loadedSpec != nil {
 				r := e.loadedOnlyEngineModels(ctx, name, st, listSpec, loadedSpec)
+				lx.servedLoaded(i, r.loadedOK, r.advertisedOK, r.advertised) // fork:E11
 				if mf.AdvertisedModels == advertisedModelsAvailable {
 					served, servedOK := r.advertised, r.advertisedOK
 					r.advertised = nil

@@ -19,12 +19,13 @@ import (
 type modelInventoryExt struct {
 	slotsByEngine map[string]map[string]noderec.SlotInfo
 	jitByEngine   map[string]bool
+	servedLoaded  map[string][]string
 	observedAt    int64
 }
 
 // node is the extension published on a directory entry.
 func (x modelInventoryExt) node() noderec.LocalNodeExt {
-	return noderec.LocalNodeExt{SlotsByEngine: x.slotsByEngine, JITLoadByEngine: x.jitByEngine, ModelsObservedAt: x.observedAt}
+	return noderec.LocalNodeExt{SlotsByEngine: x.slotsByEngine, JITLoadByEngine: x.jitByEngine, ServedLoadedByEngine: x.servedLoaded, ModelsObservedAt: x.observedAt}
 }
 
 // applyTo publishes the extension on a directory entry, alongside upstream's
@@ -36,8 +37,9 @@ func (x modelInventoryExt) applyTo(node *noderec.DirectoryNode) {
 // localModelsWire is embedded in fetchModels' decode struct (seam S8), so the
 // fork's /v1/models keys decode in the same pass as upstream's.
 type localModelsWire struct {
-	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine"`
-	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine"`
+	SlotsByEngine        map[string]map[string]noderec.SlotInfo `json:"slotsByEngine"`
+	JITLoadByEngine      map[string]bool                        `json:"jitLoadByEngine"`
+	ServedLoadedByEngine map[string][]string                    `json:"servedLoadedByEngine"`
 }
 
 // localScanState is the daemon's fork state (seam S4). Its only job since
@@ -54,7 +56,7 @@ func newLocalScanState() *localScanState {
 
 // ext builds a fetch's extension from the decoded fork keys (seam S8).
 func (s *localScanState) ext(w localModelsWire) modelInventoryExt {
-	x := modelInventoryExt{slotsByEngine: w.SlotsByEngine, jitByEngine: w.JITLoadByEngine}
+	x := modelInventoryExt{slotsByEngine: w.SlotsByEngine, jitByEngine: w.JITLoadByEngine, servedLoaded: w.ServedLoadedByEngine}
 	if s != nil {
 		x.observedAt = s.now().UnixMilli()
 	}
@@ -80,6 +82,7 @@ func (d *directory) localMergeCapacity(hostUUID string, inv modelInventory, node
 	n, x := d.nodes[hostUUID], inv.local
 	if !*changed && reflect.DeepEqual(n.SlotsByEngine, x.slotsByEngine) &&
 		reflect.DeepEqual(n.JITLoadByEngine, x.jitByEngine) &&
+		reflect.DeepEqual(n.ServedLoadedByEngine, x.servedLoaded) &&
 		x.observedAt-n.ModelsObservedAt < modelsObservedHeartbeat.Milliseconds() {
 		return
 	}

@@ -447,6 +447,9 @@ func (e *Executor) exclusiveRun(ctx context.Context, req PinnedRequest, load fun
 		return PinnedResult{}, &pinnedError{Status: http.StatusConflict, Message: "another pinned load is in progress on this node"}
 	}
 	defer e.loadMu.Unlock()
+	// The restart a load triggers (vLLM launch_model) starts under this gate;
+	// gateStartupLoad must not re-take loadMu for it.
+	ctx = context.WithValue(ctx, loadGateHeldKey{}, true)
 
 	ops := e.pinnedOps()
 	if load == nil {
@@ -622,13 +625,17 @@ func launchLoadsModel(args []string) bool {
 	return false
 }
 
+// loadGateHeldKey marks a context whose caller (exclusiveRun) already holds
+// loadMu, so internal restarts keep the gate without re-acquiring it.
+type loadGateHeldKey struct{}
+
 // gateStartupLoad gates an engine start whose launch args load a model (an
 // auto-start or custom launch): it refuses with 409 when a large model is
 // already resident, else holds loadMu until the returned release runs so no
 // pinned load interleaves with the start.
 func (e *Executor) gateStartupLoad(ctx context.Context, engine string, args []string) (func(), error) {
 	noop := func() {}
-	if !launchLoadsModel(args) {
+	if !launchLoadsModel(args) || ctx.Value(loadGateHeldKey{}) != nil {
 		return noop, nil
 	}
 	if !e.loadMu.TryLock() {

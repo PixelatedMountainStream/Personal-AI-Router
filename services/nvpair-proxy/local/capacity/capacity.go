@@ -342,11 +342,15 @@ func (o Override) OtherEngineLoaded(n, e string) bool {
 // is not the loaded set: only the loaded roots are translated. A root the
 // inventory lists serves as itself; otherwise it is served by the single
 // alias the inventory lists that is not a downloaded root (--served-model-name),
-// and with no such unique alias it stays the root. Any other engine keeps
+// and with no such unique alias it stays the root. A node that relays
+// servedLoadedByEngine is used as reported instead. Any other engine keeps
 // loadedByEngine.
 func ServedLoaded(n noderec.DirectoryNode, engine string, loaded []string) []string {
 	if _, loadedOnly := n.DownloadedByEngine[engine]; !loadedOnly && engine != engines.NameVLLM {
 		return loaded
+	}
+	if sv, ok := n.ServedLoadedByEngine[engine]; ok {
+		return sv // the engine's own served names; no inference
 	}
 	var aliases []string
 	for _, m := range n.ModelsByEngine[engine] {

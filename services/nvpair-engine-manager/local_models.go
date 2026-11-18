@@ -31,6 +31,11 @@ type LocalModelsExt struct {
 	// demand: the node-settings jit_load.<engine> override, else the engine
 	// default (noderec.DefaultJITLoad). Present only for engines that reported.
 	JITLoadByEngine map[string]bool `json:"jitLoadByEngine,omitempty"`
+	// ServedLoadedByEngine is the names a loaded-only engine (vLLM) answers to
+	// for its loaded models, as the engine reported them (--served-model-name),
+	// so a peer matches a request without inferring root->served. Present only
+	// when the engine reported both its served names and its loaded set.
+	ServedLoadedByEngine map[string][]string `json:"servedLoadedByEngine,omitempty"`
 }
 
 // SlotInfo is a loaded model's parallel capacity: concurrent request slots and
@@ -43,13 +48,14 @@ type SlotInfo = noderec.SlotInfo
 type localSlotSweep struct {
 	acts       []*Action
 	slots      []map[string]SlotInfo
+	served     []*[]string     // per engine: served names of a loaded-only engine's loaded models
 	loadedOnly map[string]bool // engines with advertised_models "loaded" or "available" (vLLM)
 }
 
 // newLocalSlotSweep records each engine's optional slots action (one with a
 // record spec) and which engines advertise only their loaded models.
 func newLocalSlotSweep(e *Executor, engineNames []string) *localSlotSweep {
-	s := &localSlotSweep{acts: make([]*Action, len(engineNames)), slots: make([]map[string]SlotInfo, len(engineNames))}
+	s := &localSlotSweep{acts: make([]*Action, len(engineNames)), slots: make([]map[string]SlotInfo, len(engineNames)), served: make([]*[]string, len(engineNames))}
 	for i, name := range engineNames {
 		mf, ok := e.reg.Get(name)
 		if !ok {
@@ -79,11 +85,30 @@ func (s *localSlotSweep) collect(ctx context.Context, e *Executor, i int, name s
 	s.slots[i] = e.querySlots(ctx, name, s.acts[i], loaded)
 }
 
+// servedLoaded records engine i's reported served names (each goroutine writes
+// only index i) when both its served names and loaded set were read.
+func (s *localSlotSweep) servedLoaded(i int, loadedOK, servedOK bool, served []string) {
+	if s == nil || !loadedOK || !servedOK {
+		return
+	}
+	names := append([]string{}, served...)
+	s.served[i] = &names
+}
+
 // finish merges the collected slots into res and applies the node-settings
 // overrides (which also resolve jit_load for every reporting engine).
 func (s *localSlotSweep) finish(e *Executor, res *ModelsResult, engineNames []string) {
 	if s == nil {
 		return
+	}
+	for i, sv := range s.served {
+		if sv == nil {
+			continue
+		}
+		if res.ServedLoadedByEngine == nil {
+			res.ServedLoadedByEngine = make(map[string][]string)
+		}
+		res.ServedLoadedByEngine[engineNames[i]] = *sv
 	}
 	for i, sl := range s.slots {
 		if sl == nil {
@@ -137,6 +162,9 @@ func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMess
 // itself, otherwise as the one listed name that is not a downloaded root
 // (--served-model-name); with no unique such name the root stays.
 func (r *ModelsResult) servedNames(engine string, loaded []string) []string {
+	if sv, ok := r.ServedLoadedByEngine[engine]; ok {
+		return sv
+	}
 	var aliases []string
 	for _, m := range r.ByEngine[engine] {
 		if !slices.Contains(r.DownloadedByEngine[engine], m) {
