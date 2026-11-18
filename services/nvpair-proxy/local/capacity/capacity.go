@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -333,15 +334,32 @@ func (o Override) OtherEngineLoaded(n, e string) bool {
 }
 
 // ServedLoaded is the loaded set directory residency compares a request's
-// model with. A loaded-only engine (vLLM by name, or any engine the node gives a
-// downloadedByEngine entry; the name alone covers a failed disk-inventory read,
-// which omits that entry) names its loadedByEngine models by --model root (NVIDIA #181),
-// but a request names the served model, which is what its modelsByEngine
-// advertises; a stopped one advertises nothing, so nothing is loaded. Any
-// other engine keeps loadedByEngine.
+// model with. A loaded-only/available engine (vLLM by name, or any engine the
+// node gives a downloadedByEngine entry; the name alone covers a failed
+// disk-inventory read, which omits that entry) names its loadedByEngine models
+// by --model root (NVIDIA #181), but a request names the served model. Its
+// modelsByEngine is the whole available inventory (also while stopped), so it
+// is not the loaded set: only the loaded roots are translated. A root the
+// inventory lists serves as itself; otherwise it is served by the single
+// alias the inventory lists that is not a downloaded root (--served-model-name),
+// and with no such unique alias it stays the root. Any other engine keeps
+// loadedByEngine.
 func ServedLoaded(n noderec.DirectoryNode, engine string, loaded []string) []string {
-	if _, loadedOnly := n.DownloadedByEngine[engine]; loadedOnly || engine == engines.NameVLLM {
-		return n.ModelsByEngine[engine]
+	if _, loadedOnly := n.DownloadedByEngine[engine]; !loadedOnly && engine != engines.NameVLLM {
+		return loaded
 	}
-	return loaded
+	var aliases []string
+	for _, m := range n.ModelsByEngine[engine] {
+		if !slices.Contains(n.DownloadedByEngine[engine], m) {
+			aliases = append(aliases, m)
+		}
+	}
+	out := make([]string, 0, len(loaded))
+	for _, m := range loaded {
+		if !slices.Contains(n.ModelsByEngine[engine], m) && len(aliases) == 1 {
+			m = aliases[0]
+		}
+		out = append(out, m)
+	}
+	return out
 }

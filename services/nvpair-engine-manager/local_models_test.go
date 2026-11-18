@@ -114,6 +114,20 @@ func TestApplySettingsOverrides(t *testing.T) {
 	assert.True(t, r.JITLoadByEngine["ollama"], "jit defaults = %v", r.JITLoadByEngine)
 }
 
+// An available-mode engine lists its whole inventory in ByEngine; a slot
+// override keyed by the served alias applies to the loaded root only.
+func TestApplySettingsOverrides_AvailableEngineUsesLoadedAlias(t *testing.T) {
+	r := ModelsResult{
+		ByEngine:           map[string][]string{"vllm": {"alias"}},
+		LoadedByEngine:     map[string][]string{"vllm": {"org/root"}},
+		DownloadedByEngine: map[string][]string{"vllm": {"org/root", "org/cold"}},
+	}
+	r.applySettingsOverrides(func() map[string]json.RawMessage {
+		return map[string]json.RawMessage{"engine_slots.vllm.alias": json.RawMessage(`4`), "engine_slots.vllm.org/cold": json.RawMessage(`2`)}
+	}, map[string]bool{"vllm": true})
+	assert.Equal(t, map[string]map[string]SlotInfo{"vllm": {"alias": {Slots: 4}}}, r.SlotsByEngine)
+}
+
 // TestLocalModelsResultJSONKeys (step-3 characterization, E11): the fork's
 // capacity fields keep their wire keys and drop out when empty.
 func TestLocalModelsResultJSONKeys(t *testing.T) {
