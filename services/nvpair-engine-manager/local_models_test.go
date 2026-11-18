@@ -107,7 +107,7 @@ func TestApplySettingsOverrides(t *testing.T) {
 	}
 	r.applySettingsOverrides(func() map[string]json.RawMessage {
 		return map[string]json.RawMessage{"engine_slots.lmstudio.m": json.RawMessage(`3`), "engine_slots.ollama.q": json.RawMessage(`2`)}
-	}, nil)
+	}, nil, nil)
 	assert.Equal(t, 3, r.SlotsByEngine["lmstudio"]["m"].Slots, "override not applied: %v", r.SlotsByEngine)
 	assert.NotContains(t, r.SlotsByEngine, "ollama", "override for a non-loaded model must not apply")
 	assert.False(t, r.JITLoadByEngine["lmstudio"], "jit defaults = %v", r.JITLoadByEngine)
@@ -124,8 +124,11 @@ func TestApplySettingsOverrides_AvailableEngineUsesLoadedAlias(t *testing.T) {
 	}
 	r.applySettingsOverrides(func() map[string]json.RawMessage {
 		return map[string]json.RawMessage{"engine_slots.vllm.alias": json.RawMessage(`4`), "engine_slots.vllm.org/cold": json.RawMessage(`2`)}
-	}, map[string]bool{"vllm": true})
+	}, map[string]bool{"vllm": true}, map[string]bool{"vllm": true})
 	assert.Equal(t, map[string]map[string]SlotInfo{"vllm": {"alias": {Slots: 4}}}, r.SlotsByEngine)
+	assert.True(t, r.JITLoadByEngine["vllm"], "available mode loads a cached model on request")
+	r.applySettingsOverrides(nil, map[string]bool{"vllm": true}, nil)
+	assert.False(t, r.JITLoadByEngine["vllm"], "loaded mode never loads on request")
 }
 
 // TestLocalModelsResultJSONKeys (step-3 characterization, E11): the fork's

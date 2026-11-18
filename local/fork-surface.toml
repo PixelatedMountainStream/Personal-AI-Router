@@ -55,7 +55,7 @@ allow = [
   "services/shared/schedulerwire/schedulerwire_test.go",
 ]
 # Taken from upstream on conflict; excluded from budgets.
-generated = ["services/versions.json", "CHANGELOG.md", "desktop/package.json", "desktop/package-lock.json"]
+generated = ["services/versions.json", "CHANGELOG.md", "desktop/package.json", "desktop/package-lock.json", "desktop/docs/services-api.md"]
 # Held: kept byte-identical to the base branch by the sync (upstream workflow changes are ported by hand), so
 # they are excluded from not_allowlisted and the budgets. Changing this list needs surface-budget-raise.
 held = [".github/workflows/**"]

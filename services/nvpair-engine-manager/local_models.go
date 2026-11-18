@@ -50,6 +50,7 @@ type localSlotSweep struct {
 	slots      []map[string]SlotInfo
 	served     []*[]string     // per engine: served names of a loaded-only engine's loaded models
 	loadedOnly map[string]bool // engines with advertised_models "loaded" or "available" (vLLM)
+	onRequest  map[string]bool // the "available" subset: NVIDIA loads a cached model on request (#203)
 }
 
 // newLocalSlotSweep records each engine's optional slots action (one with a
@@ -69,6 +70,12 @@ func newLocalSlotSweep(e *Executor, engineNames []string) *localSlotSweep {
 				s.loadedOnly = map[string]bool{}
 			}
 			s.loadedOnly[name] = true
+			if mf.AdvertisedModels == advertisedModelsAvailable {
+				if s.onRequest == nil {
+					s.onRequest = map[string]bool{}
+				}
+				s.onRequest[name] = true
+			}
 		}
 	}
 	return s
@@ -119,7 +126,7 @@ func (s *localSlotSweep) finish(e *Executor, res *ModelsResult, engineNames []st
 		}
 		res.SlotsByEngine[engineNames[i]] = sl
 	}
-	res.applySettingsOverrides(e.settingsOverrides, s.loadedOnly)
+	res.applySettingsOverrides(e.settingsOverrides, s.loadedOnly, s.onRequest)
 }
 
 // applySettingsOverrides merges node-settings engine overrides (slots, ctx per
@@ -131,7 +138,7 @@ func (s *localSlotSweep) finish(e *Executor, res *ModelsResult, engineNames []st
 // jit_load is false whatever the settings say, and its slot overrides are
 // keyed on the served name (modelsByEngine, what a request names), not on the
 // --model root that its loadedByEngine entry uses.
-func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage, loadedOnly map[string]bool) {
+func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage, loadedOnly, onRequest map[string]bool) {
 	var raw map[string]json.RawMessage
 	if src != nil {
 		raw = src()
@@ -153,7 +160,27 @@ func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMess
 			}
 		}
 	}
-	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, served, r.SlotsByEngine, loadedOnly)
+	// An available-mode engine loads a cached model when a request names it
+	// (NVIDIA #203), so it is JIT by default; only "loaded" mode never is.
+	never := maps.Clone(loadedOnly)
+	for n := range onRequest {
+		delete(never, n)
+	}
+	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, served, r.SlotsByEngine, never)
+	for n := range onRequest {
+		if !reported[n] {
+			continue
+		}
+		if r.JITLoadByEngine == nil {
+			r.JITLoadByEngine = map[string]bool{}
+		}
+		r.JITLoadByEngine[n] = true
+		if v, ok := raw[noderec.SettingJITLoad+n]; ok {
+			if b, err := strconv.ParseBool(strings.Trim(string(v), `"`)); err == nil {
+				r.JITLoadByEngine[n] = b
+			}
+		}
+	}
 }
 
 // servedNames translates an engine's loaded --model roots to the names a request
