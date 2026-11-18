@@ -21,6 +21,8 @@ Hooks in Go files are marked `// fork:<id>` (trailing, or a standalone comment o
 
 One per file in `allow` today. PR-C..F replace them with real hook records (P/E/S ids) and shrink `allow`.
 
+Budget raise (surface-budget-raise): after the 20261118 sync, commits aa3e3a2/86e5abb added 1 counted line (models.go E11 hook call) and 43 legacy_added lines (exclusive.go, exclusive_test.go); budgets are now 537 lines / 38 files / 1777 legacy. The gate test moved to fork-owned local_exclusive_gate_test.go (no new allowlisted file).
+
 ### L-services-nvpair-engine-manager-manifest-md
 files: services/nvpair-engine-manager/MANIFEST.md
 kind: legacy

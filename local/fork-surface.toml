@@ -73,9 +73,9 @@ legacy_added = [
 ]
 
 [budget]            # ratchet, lowered per migration PR; raising it needs label surface-budget-raise (budget_raised)
-max_lines = 536     # changed lines in modified upstream files only (measured at the 20261118 sync, 18967eebed)
+max_lines = 537     # raised 536->537 (+1: models.go E11 hook call servedLoaded for residency served names); was changed lines in modified upstream files only (measured at the 20261118 sync, 18967eebed)
 max_files = 38      # modified upstream files only
-max_legacy_added_lines = 1734   # separate shrinking budget for legacy_added
+max_legacy_added_lines = 1777   # raised 1734->1777 (exclusive.go/exclusive_test.go load-gate and inventory_field residency fixes, aa3e3a2/86e5abb); was separate shrinking budget for legacy_added
 
 # Optional per-file budgets for hot files are added by PR-F:
 # [[file]]
