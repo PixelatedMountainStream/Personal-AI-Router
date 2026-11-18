@@ -42,7 +42,8 @@ const modelsTimeout = 5 * time.Second
 // the whole map when no engine reports loaded state.
 //
 // DownloadedByEngine is the model inventory of an engine that advertises only
-// what it is serving (advertised_models "loaded", such as vLLM): ByEngine holds
+// what is resident or available on request (advertised_models "loaded" or
+// "available"): ByEngine holds
 // the names a request may be routed to, and this holds every model the engine
 // can load, so a model manager keeps its rows for models that are on disk but
 // not being served. It is read whenever the engine is installed, running or
@@ -58,8 +59,15 @@ type ModelsResult struct {
 	ByEngine           map[string][]string `json:"modelsByEngine,omitempty"`
 	LoadedByEngine     map[string][]string `json:"loadedByEngine,omitempty"`
 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
+<<<<<<< HEAD
 	// fork:E11
 	LocalModelsExt
+=======
+	// RequestableByEngine is loader capability independent of ON/OFF intent.
+	// Only the broker uses it to restore local routes on an enable event.
+	// It is neither residency nor an advertised routing inventory.
+	RequestableByEngine map[string][]string `json:"requestableByEngine,omitempty"`
+>>>>>>> 18967eebed7c0f4ae98f8046f8e0f5252e280884
 }
 
 // Models returns the union of model names served by every installed, running
@@ -74,9 +82,9 @@ func (e *Executor) Models(ctx context.Context) []string {
 // has an ok flag because an empty list read successfully and a list that could
 // not be read mean different things on the wire.
 type engineModels struct {
-	advertised, loaded, downloaded       []string
-	advertisedOK, loadedOK, downloadedOK bool
-	statusErr                            error
+	advertised, loaded, downloaded, requestable         []string
+	advertisedOK, loadedOK, downloadedOK, requestableOK bool
+	statusErr                                           error
 }
 
 // ModelsResult queries each installed, running engine's loopback list_models
@@ -138,8 +146,38 @@ func (e *Executor) modelsResult(ctx context.Context) (ModelsResult, error) {
 			// An engine that can only answer for what it is running advertises its
 			// loaded set. Its list_models is a view of what could be loaded, which
 			// is not what a peer or the proxy may route to, so it is reported apart.
-			if mf.AdvertisedModels == advertisedModelsLoaded && loadedSpec != nil {
-				perEngine[i] = e.loadedOnlyEngineModels(ctx, name, st, listSpec, loadedSpec)
+			if (mf.AdvertisedModels == advertisedModelsLoaded || mf.AdvertisedModels == advertisedModelsAvailable) && loadedSpec != nil {
+				r := e.loadedOnlyEngineModels(ctx, name, st, listSpec, loadedSpec)
+				if mf.AdvertisedModels == advertisedModelsAvailable {
+					served, servedOK := r.advertised, r.advertisedOK
+					r.advertised = nil
+					r.advertisedOK = r.downloadedOK || servedOK
+					r.requestableOK = r.advertisedOK
+					state, stateErr := e.state(name)
+					customName := false
+					if stateErr == nil {
+						state.mu.Lock()
+						args := state.plat.Runtime.Args
+						if state.plat.Runtime.LaunchArgs != nil {
+							args = state.plat.Runtime.LaunchArgs
+						}
+						_, customName = launchFlagValue(args, "--served-model-name")
+						state.mu.Unlock()
+					}
+					if !customName {
+						r.requestable = append([]string{}, r.downloaded...)
+					}
+					for _, alias := range served {
+						if !slices.Contains(r.requestable, alias) {
+							r.requestable = append(r.requestable, alias)
+						}
+					}
+					enabled, known, err := e.desired.get(name)
+					if err == nil && known && enabled {
+						r.advertised = append([]string{}, r.requestable...)
+					}
+				}
+				perEngine[i] = r
 				return
 			}
 			if !st.Running {
@@ -178,6 +216,9 @@ func (e *Executor) modelsResult(ctx context.Context) (ModelsResult, error) {
 		}
 		if r.downloadedOK {
 			res.DownloadedByEngine = withModels(res.DownloadedByEngine, name, r.downloaded)
+		}
+		if r.requestableOK {
+			res.RequestableByEngine = withModels(res.RequestableByEngine, name, r.requestable)
 		}
 	}
 <<<<<<< HEAD

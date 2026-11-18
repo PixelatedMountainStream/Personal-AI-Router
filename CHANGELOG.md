@@ -11,6 +11,33 @@ published releases on GitHub.
 Builds from this repository are unsigned and configure no update feed, so
 automatic updates are unavailable in them.
 
+## 1.0.38 — Cancel model downloads and see their progress (#111)
+
+- Model downloads show live progress and a Cancel button for Ollama, LM Studio, llama.cpp, and vLLM, including downloads running on remote nodes.
+- Canceling an Ollama or LM Studio download removes the partial files PAIR can attribute to it, while preserving completed models, other quantizations, and downloads belonging to other clients on the same machine. llama.cpp and vLLM keep a canceled download's files so the next download can resume them.
+- Downloads for one engine queue behind each other instead of failing, a second request for a model that is already downloading joins that download, and a queued download can be canceled or retried before it starts.
+- The terminal interface can cancel a download from a node's detail screen, on this machine or a peer.
+
+## 1.0.37 — vLLM starts on DGX Spark, and a timed-out start explains itself (#215)
+
+- Enabling vLLM on Linux now installs vLLM 0.34.0 and loads model weights into memory first, which fixes starts that took over eight minutes on DGX Spark and failed with "not ready after 8m0s".
+- vLLM now has 30 minutes to become ready before PAIR reports a failure, and the app, terminal interface and cluster peers wait that long too.
+- A start that times out now shows the last lines of the engine's output instead of a long, cut-off log tail.
+
+## 1.0.36 — Choose vLLM models and load downloaded models on request (#203)
+
+- New vLLM setups wait for model selection without downloading a default model. Requests can load models that are already fully downloaded.
+- Eject frees model memory while keeping vLLM enabled. Model changes wait for active responses to finish, and cancelling one request does not interrupt a shared model load.
+- Model lists reflect what each computer can serve and refresh after remote downloads or deletions.
+
+## 1.0.35 — Add model shows more ModelScope models and says the list is partial (#212)
+
+- With ModelScope as the llama.cpp download source, Add model now lists more models when the search box is empty, including popular chat models it used to leave out. Before, it could show as few as three.
+- Add model now says it is showing popular models and that a search finds more, for llama.cpp and vLLM.
+- Add model no longer offers ModelScope embedding, speech and image models that ModelScope labels as text generation.
+- During a ModelScope outage, Add model keeps the last list it loaded, even after many searches. A few models whose details ModelScope fails to return can be missing until the list refreshes.
+- On a slow connection, Add model shows the ModelScope models it loaded in time instead of none, and tries again for the rest two minutes later.
+
 ## 1.0.34 — Add model for a peer's llama.cpp lists that peer's download source (#214)
 
 - Opening Add model for llama.cpp on another device now lists models from that device's Model download source, Hugging Face or ModelScope. Before, it listed this device's source, so a device set to ModelScope showed Hugging Face models when opened from a peer.

@@ -148,7 +148,7 @@ The single front door every PAIR client talks to, and the supervisor of every ot
 
 **Non-functional**
 - Compiles and runs on Windows / macOS / Linux × amd64 / arm64, user mode, no elevation at runtime.
-- Never blocks the read loop: long relays (`engine:*`, manual-node probes) are asynchronous, and every worker-round-trip triggered from a reader goroutine is dispatched on its own goroutine to avoid self-deadlock.
+- Never blocks the read loop: long relays (`engine:*`, manual-node probes) are asynchronous, and every worker-round-trip triggered from a reader goroutine is dispatched on its own goroutine to avoid self-deadlock. The download methods are written to `nvpair-engine-manager` from the read loop to keep their order (§7.3), but their responses are still awaited off it.
 - Stdout writes are serialized so frames never interleave.
 - A parent that stops reading stderr must never block a worker: worker stderr is decoupled through a bounded in-process sink.
 - Never logs a prompt, chat message, request or response body, PIN, certificate, or key; log lines carry method names, worker names, node ids, ports, and normalized error text only.
@@ -373,7 +373,7 @@ The discovery change hook is attached only **after** `app:ready` is on the wire,
 ### 7.3 The relay and subscription mechanism
 Every worker runs behind `startRPCWorker(name, path, args, notifyHook)` or a worker-specific equivalent, which owns the child process and wraps its pipes in a bidirectional `jsonrpc.Peer`. The peer does id correlation and runs the read pump; the handle owns the OS process lifecycle and exposes `Call` (bounded, `rpcWorkerCallTimeout` = 5s), `CallNoTimeout`, `RelayRequest` (asynchronous, response delivered to a callback), and `Notify`. The generic `startRPCWorker` links — engine-manager, manual-nodes, node-settings, and the scheduler — read frames up to `jsonrpc.WorkerFrameBytes` (8 MiB), because `engine:catalog`'s Ollama reply alone is about 1.9 MiB and an over-long line is a terminal read error that silently drops the peer. `nvpair-tui` reads the broker with the same cap, since a relayed reply must fit every hop. The purpose-built links to the scanner, errors, cluster manager, and proxy keep the shared codec's 1 MiB default.
 
-Relay choice follows the operation's real duration. `settings/*`, `cluster:*` / `nodes:*`, and every `<engine>-proxy:*` are local request/response and use the bounded synchronous `Call`. `engine:*` and the manual-node methods use the asynchronous `RelayRequest` with **no broker-imposed deadline**, because an install or a model pull runs for minutes and reports progress via push events — the broker waits for the real response and keeps serving other requests meanwhile, rather than fabricating a timeout. The broker-owned settings methods run on their own goroutine for the same reason. Method names are forwarded verbatim for `engine:`, `settings/`, `cluster:`, `nodes:`, and the manual-node methods, because those workers' methods are already namespaced. Only the facade namespaces are rewritten: one process holds every facade, so a message on that link must name the engine it concerns, and the client's component prefix (`ollama-proxy:`) is replaced by the bare engine address (`ollama:`). The two strings are not interchangeable.
+Relay choice follows the operation's real duration. `settings/*`, `cluster:*` / `nodes:*`, and every `<engine>-proxy:*` are local request/response and use the bounded synchronous `Call`. `engine:*` and the manual-node methods use the asynchronous `RelayRequest` with **no broker-imposed deadline**, because an install or a model pull runs for minutes and reports progress via push events — the broker waits for the real response and keeps serving other requests meanwhile, rather than fabricating a timeout. The download methods — `engine:action`, `engine:cancel-pull`, `engine:remote-pull-model`, and `engine:remote-cancel-pull` — are also written to `nvpair-engine-manager` from the read loop itself, so they reach it in the order the client sent them: the engine manager orders a cancel behind the pull it names only from its own read loop onward, and a cancel that overtook its pull would find nothing to stop. Only their responses are awaited asynchronously, and none of them waits on a port gate or the engine-config lock. The broker-owned settings methods run on their own goroutine for the same reason. Method names are forwarded verbatim for `engine:`, `settings/`, `cluster:`, `nodes:`, and the manual-node methods, because those workers' methods are already namespaced. Only the facade namespaces are rewritten: one process holds every facade, so a message on that link must name the engine it concerns, and the client's component prefix (`ollama-proxy:`) is replaced by the bare engine address (`ollama:`). The two strings are not interchangeable.
 
 Subscriptions run in the opposite direction too. A **client** subscribing sets a per-session flag and receives the client-facing event stream. A **worker child** may itself send `discovery:subscribe` upward — `nvpair-errors` for its `er` peer set, `nvpair-workload-manager` for `wl`, `nvpair-cluster-manager` for `cl`, `nvpair-engine-manager` for `ec`, and each `nvpair-proxy` facade for its engine's `ol`, `lm`, `lc`, or `vl` — and the broker registers it against the shared `relay.Directory` via `subscribeRelay`, pushing `discovery:nodes{nodes:[DirectoryNode]}` snapshots down that worker's stdin. The two are different contracts on a shared method name: the client stream is the narrow camelCase `AvailableNode[]` under `discovery:nodes-changed`, the worker stream is the richer `DirectoryNode` set under `discovery:nodes`. A re-subscribe drops the prior registration first so a worker is never double-fed, and a worker's exit unsubscribes it so nothing pushes into a closed stdin.
 
@@ -584,7 +584,7 @@ The broker owns the combined settings operation for each engine: its server port
   in-memory and repopulates from producer notifications after restart.
 
 ## 10. Design Constraints
-- **Performance**: a control plane, not a data plane. Broker-local methods answer from memory with no worker round-trip; relayed methods add one process hop. The read loop is never blocked: long operations are asynchronous and any worker call triggered from a reader goroutine is dispatched onto its own goroutine, because the response would otherwise arrive on the very goroutine that is waiting.
+- **Performance**: a control plane, not a data plane. Broker-local methods answer from memory with no worker round-trip; relayed methods add one process hop. The read loop never waits on a response: long operations are asynchronous and any worker call triggered from a reader goroutine is dispatched onto its own goroutine, because the response would otherwise arrive on the very goroutine that is waiting. The download methods are written to `nvpair-engine-manager` from the read loop itself, so they reach it in the order the client sent them (§7.3), and only their responses are awaited off it.
 - **Scalability**: one broker per node, one client per broker, ten supervised children. Discovery and workload volumes are LAN-scale — tens of nodes, not thousands. High-frequency routing detail stays below the default log level.
 - **Reliability**: exponential backoff from 1s to 16s, a budget of 5 attempts per unhealthy streak, and a 60s healthy-reset that clears the crash error and resets the counter. Only the scanner's *first* spawn is fatal; every other startup failure degrades one capability. Crash callbacks drop handles so no stale state is served during a down window, and generation checks stop a replaced process from being mistaken for its successor. Teardown is bounded end to end (§7.1), so a hung worker costs its grace, not the whole shutdown.
 - **Security**: cluster-manager owns membership and certificate pins; workers
@@ -601,7 +601,7 @@ The broker owns the combined settings operation for each engine: its server port
 - Workers are cooperative children: they speak newline-delimited JSON-RPC on stdio, exit when their stdin closes, and write diagnostics to stderr.
 - A worker's JSON-RPC error is meaningful to the client as-is, which is why it is relayed with its original code and message rather than being rewrapped.
 - `nvpair-errors` is best-effort; its absence degrades error surfacing to local logs and never fails an operation.
-- `nvpair-engine-manager` bounds its own `StopAll` well inside the 5 seconds the broker allows `engine:prepare-shutdown`.
+- `nvpair-engine-manager` waits at most 4 of the 5 seconds the broker allows `engine:prepare-shutdown` for its model downloads to stop, though an engine's own stop, such as LM Studio's server waiting out its grace, can take longer.
 - The parent — the desktop app or `nvpair-tui` — allows at least 15 seconds for the broker to exit after asking it to shut down, which covers the 10-second teardown budget plus the 5-second workload-history flush.
 - The per-user data dir is writable; if it is not, workload history runs purely in memory and startup still succeeds.
 - `nvpair-cluster-manager` and `nvpair-node-settings` resolve the same cluster directory the broker resolved, because a mismatch would leave a node that looks clustered while no worker reads the tree the manager writes.
@@ -678,3 +678,58 @@ Each worker is spawned in its own process group — `Setpgid` on Unix, `CREATE_N
 Electron starts **only** this binary from the worker tree, from the app's `cli-bin` directory with every worker's `--*-path` passed explicitly, and reaches every capability through it; no worker is ever launched by both Electron and the broker, and there is no broker-absent path. `nvpair-tui` is a peer client, not a supervised worker: it spawns and supervises its own `nvpair-ui-broker` child (`--broker-path`, defaulting to the sibling binary) and speaks the same contract described here. Each front end also launches the Inference Demo's `inference-dispatcher` itself; that binary is an ordinary HTTP client of the local facades, not a worker, and the broker neither spawns nor sees it.
 
 Build and staging: `services/build.sh` and `services/build.bat` read the component version out of `services/versions.json`, build the broker with that version stamped into `main.Version`, and stage it into `services/build/bin/` alongside the eleven other component binaries and `inference-dispatcher`. `services/installer/nvpair-setup.nsi` (with the `linux/` and `macos/` counterparts) packages that bundle, installs the broker as the process the graphical UI and the TUI launch, and owns the firewall rules for the workers that actually listen — the broker itself needs none, because it opens no socket. When a JSON-RPC contract on any relayed namespace changes, the producing Go service, the Electron bridge under `desktop/src/electron/service-bridge/`, and `npm --prefix desktop run service-contracts:check` must all be updated in the same change.
+
+### Enabled engines awaiting a model
+
+The broker relays the engine manager's optional `awaiting_model` status field
+unchanged on local and paired-peer status/operation responses and state events.
+This is enabled intent without a serving process: `running` and `healthy` remain
+false, and no resident model is advertised. Enabled vLLM can nevertheless
+advertise complete cached models as request-loadable capabilities. The proxy
+must prepare the requested model before forwarding inference; this state does
+not claim the native engine is already healthy. An enabled engine that loses
+its serving process returns to this state and can load on the next request.
+The desktop and terminal clients display model-selection guidance while allowing
+explicit Stop and model selection. No broker-owned model default is added.
+
+
+### Internal model-preparation relay
+
+`model:prepare {id, engine, model}` and `model:cancel` from the supervised proxy
+are relayed as `engine:prepare-model` and `engine:cancel-model-preparation` to
+engine-manager. `engine:model-prepared {id, engine, port?, error?, status?}` is
+returned to the matching engine facade as `model:prepared`. These internal
+notifications carry operational metadata only; they never carry inference
+content or become desktop commands. The shared engine capability currently
+permits this for vLLM. The broker advertises enabled vLLM even while awaiting a
+model and supplies `loadOnRequest:true` to its local proxy target; engine-manager
+rechecks enabled intent before loading, so stale discovery cannot revive OFF.
+
+The broker acknowledges `node/set-local-models {engine, id, enginePort, enabled,
+models}` before exposing initial model snapshots or model-change events to the
+UI. The proxy projects this authoritative inventory onto this node's stable ID,
+superseding only its stale self-discovery entry. This makes an immediate request
+after download routable and removes deleted local models immediately. The port
+comes from engine-manager lifecycle state, including custom server ports. Cached
+model listings through PAIR do not load a model. Browser-origin requests retain
+the native engine's CORS decision.
+
+A manager restart settles pending proxy preparations with a retryable failure;
+a proxy restart cancels preparations orphaned by the old process.
+
+`EngineStatus.enabled` is authoritative ON intent, independent of process
+residency. Model switching preserves `enabled` and reports `starting` until the
+replacement is ready. The broker acknowledges local availability updates before
+forwarding lifecycle events. `requestableByEngine` is retained loader capability
+independent of ON/OFF state; only enabled inventories are advertised for routing.
+It must not be interpreted as loaded models by desktop, TUI or discovery clients.
+
+Before `app:ready`, the broker seeds enabled model-on-request facades from the
+engine manager's persisted intent and cached inventory. The first cached-model
+request after restart can load its model without waiting for periodic
+availability reconciliation. Explicit OFF remains authoritative.
+
+For engines that load cached models on request, settings completion reconciles
+local request eligibility and cached inventory from the engine manager's observed
+enabled state. An idle enabled engine remains requestable after changing its
+cache or ports; a disabled engine stays unavailable.

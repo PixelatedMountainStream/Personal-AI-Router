@@ -98,6 +98,15 @@ func (e *Executor) StartWith(ctx context.Context, engine string, opts startOpts)
 	}
 	st.lockOperation()
 	defer st.unlockOperation()
+	st.mu.Lock()
+	st.enabling = true
+	st.mu.Unlock()
+	defer func() {
+		st.mu.Lock()
+		st.enabling = false
+		st.mu.Unlock()
+		e.emitState(engine)
+	}()
 	if err := e.doStart(ctx, st, engine, opts); err != nil {
 		return e.startStopped(st, err)
 	}
@@ -208,6 +217,15 @@ func (e *Executor) doStart(ctx context.Context, st *engineState, engine string, 
 	if flag := modelLaunchFlag(st.manifest); flag != "" {
 		tokens, err := parseLaunchText(e.launchStateLocked(engine, st).LaunchText)
 		if model, _ := launchFlagValue(tokens, flag); err == nil && model == "" {
+			if rt.WaitForModel {
+				st.mu.Lock()
+				st.awaitingModel = true
+				st.stopping = false
+				st.port = port
+				st.mu.Unlock()
+				e.emitState(engine)
+				return nil
+			}
 			return refuse(fmt.Errorf("%s has no model selected; load a model to start it", st.manifest.DisplayName))
 		}
 	}
@@ -224,6 +242,7 @@ func (e *Executor) doStart(ctx context.Context, st *engineState, engine string, 
 	st.mu.Lock()
 	st.port = port
 	st.stopping = false
+	st.awaitingModel = false
 	st.starting = true
 	st.mu.Unlock()
 	e.emitState(engine)
@@ -526,6 +545,11 @@ func (e *Executor) Stop(engine string) error {
 	// engine back on. Restart and StopAll call doStop directly and never
 	// rewrite intent — shutdown must not erase the user's saved choice.
 	setErr := e.setDesiredEnabled(engine, false)
+	// Explicit commands must finish the client's transitional state even when
+	// the engine was already stopped and doStop had no change to announce.
+	if stopErr == nil {
+		e.emitState(engine)
+	}
 	return errors.Join(stopErr, setErr)
 }
 
@@ -539,7 +563,12 @@ func (e *Executor) doStop(st *engineState, engine string) error {
 		// old probe is invalidated by the operation revision, and later status
 		// checks must not adopt the listener behind the user's explicit Stop.
 		st.stopping = true
+		wasAwaiting := st.awaitingModel
+		st.awaitingModel = false
 		st.mu.Unlock()
+		if wasAwaiting {
+			e.emitState(engine)
+		}
 		return nil
 	}
 	proc := st.proc
@@ -711,6 +740,7 @@ func (e *Executor) markStopped(st *engineState, engine string) {
 		st.healthStop = nil
 	}
 	st.running = false
+	st.awaitingModel = false
 	st.healthy = false
 	st.stopping = true
 	st.adopted = false
@@ -885,6 +915,14 @@ func (e *Executor) Restart(ctx context.Context, engine string) error {
 // StopAll rejects new starts and terminates every running engine during
 // shutdown without changing the user's saved ON/OFF intent.
 //
+// It stops every download too, and starts no more. A download's tool is no
+// engine, so stopping the engines would leave it running past engine-manager's
+// exit, above all one a peer started, whose request nothing else cancels. The
+// sweep waits for the downloads while the engines stop, for at most
+// downloadShutdownBudget. Shutdown is no cancel someone asked for, so a
+// download only it stopped keeps its partial files for the next attempt to
+// resume.
+//
 // Two entry points ask for it on an ordinary quit — the
 // engine:prepare-shutdown handler, which the broker calls from its own
 // teardown, and the stdin-EOF path in Run, which follows when the broker then
@@ -915,13 +953,17 @@ func (e *Executor) StopAll() {
 
 func (e *Executor) stopAllNow() {
 	e.shuttingDown.Store(true)
+	downloads := e.stopDownloads()
 	e.mu.Lock()
 	names := make([]string, 0, len(e.engines))
 	for n := range e.engines {
 		names = append(names, n)
 	}
 	e.mu.Unlock()
+	var stopping sync.WaitGroup
+	stopping.Go(func() { awaitDownloads(downloads) })
 	e.failedStops = e.stopEngines(names)
+	stopping.Wait()
 	e.mu.Lock()
 	if e.modelScope != nil {
 		_ = e.modelScope.Close()
@@ -1045,7 +1087,7 @@ func (e *Executor) waitReady(ctx context.Context, p *Probe, port int, began time
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("not ready after %s", timeout)
+			return &readyTimeoutError{timeout: timeout}
 		}
 		select {
 		case <-ctx.Done():

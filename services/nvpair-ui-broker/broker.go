@@ -23,6 +23,7 @@ import (
 	"nvpair-shared/clustertrust"
 	"nvpair-shared/engines"
 	"nvpair-shared/errors"
+	"nvpair-shared/modelrequest"
 	"nvpair-shared/nodeid"
 	"nvpair-shared/noderec"
 	"nvpair-shared/schedulerwire"
@@ -952,6 +953,7 @@ func (b *Broker) spawnProxy() (supervisedHandle, error) {
 		}
 	}
 	b.lmstudioProxyPublishedGeneration.Store(lmstudioGeneration)
+	b.cancelOrphanedModelPreparations()
 	slog.Info("proxy started", "path", b.proxyPath, "pid", pp.cmd.Process.Pid)
 
 	// The child is serving its JSON-RPC channel but has no listeners yet, so
@@ -1511,6 +1513,35 @@ func (b *Broker) applyClusterIdentityChange() {
 // forwardEngineNotification handles engine-manager's settings and discovery
 // relay requests, routes service errors, and forwards client-facing events.
 func (b *Broker) forwardEngineNotification(method string, params json.RawMessage) {
+	if method == "engine:state-changed" {
+		var state struct {
+			Engine    string `json:"engine"`
+			Port      int    `json:"port"`
+			Installed bool   `json:"installed"`
+			Enabled   bool   `json:"enabled"`
+		}
+		if json.Unmarshal(params, &state) == nil && state.Port > 0 && state.Port <= 65535 {
+			if profile, known := engineProxyProfileFor(state.Engine); known && profile.LoadOnRequest {
+				runtime := b.engineProxy(profile)
+				runtime.backendPort.Store(int32(state.Port))
+				runtime.requestEnabled.Store(state.Installed && state.Enabled)
+				if b.nodeID != "" {
+					b.callProxyManual(b.engineProxyHandle(profile), profile.Name, "node/set-local-models", modelrequest.LocalInventory{Engine: profile.Name, ID: b.nodeID, EnginePort: state.Port, Enabled: runtime.requestEnabled.Load()}, "model-availability")
+				}
+			}
+		}
+	}
+	if method == "engine:models-changed" {
+		var payload struct {
+			Models json.RawMessage `json:"models"`
+		}
+		if json.Unmarshal(params, &payload) == nil {
+			b.publishLocalModelInventory(payload.Models)
+		}
+	}
+	if b.relayModelPrepared(method, params) {
+		return
+	}
 	if method == "engine:settings-request" {
 		b.handleSettingsRelay(params)
 		return
@@ -1533,6 +1564,7 @@ func (b *Broker) forwardEngineNotification(method string, params json.RawMessage
 		return
 	}
 	if method == "engine:ready" {
+		b.resetModelPreparations()
 		b.reconcileLMStudioProxyAfterEngineManagerReady()
 		go func() {
 			b.engineConfigMu.Lock()
@@ -2288,6 +2320,17 @@ func (b *Broker) Serve(ctx context.Context) error {
 			b.trackWorker(b.proxySup)
 		}
 	}
+
+	// Seed cached-model routing from persisted ON intent before app:ready.
+	// The periodic advertiser may still be waiting on its first status read;
+	// UI inventory can already be visible while the proxy has no local owner.
+	b.engineConfigMu.Lock()
+	for _, profile := range engineProxyProfiles {
+		if profile.LoadOnRequest && b.proxyEnabled(profile) && b.engineProxyHandle(profile) != nil {
+			b.reconcileRequestedModelEngine(profile)
+		}
+	}
+	b.engineConfigMu.Unlock()
 
 	// Restore engines and begin advertising only after both managed proxy
 	// startup attempts have established either readiness or a terminal outcome.
@@ -3540,7 +3583,56 @@ func (b *Broker) handleMessage(msg *Message) {
 // response asynchronously rather than fabricating a timeout — meanwhile
 // other client requests keep being served on the read-loop goroutine.
 func (b *Broker) relayToEngine(msg *Message) {
+	if downloadOrderedMethods[msg.Method] {
+		b.relayToEngineInOrder(msg)
+		return
+	}
 	go b.relayToEngineNow(msg)
+}
+
+// downloadOrderedMethods reach engine-manager in the order the client sent
+// them. Engine-manager orders a cancel behind the pull it names only from its
+// own read loop onward, so a cancel relayed ahead of its pull finds nothing to
+// stop and the download runs to completion.
+var downloadOrderedMethods = map[string]bool{
+	"engine:action":             true,
+	"engine:cancel-pull":        true,
+	"engine:remote-pull-model":  true,
+	"engine:remote-cancel-pull": true,
+}
+
+// relayToEngineInOrder writes the request on the calling read loop and relays
+// the response asynchronously. None of these methods is subject to the port
+// gates or the engine-config lock in relayToEngineNow.
+func (b *Broker) relayToEngineInOrder(msg *Message) {
+	em := b.getEngineMgr()
+	if em == nil {
+		if err := b.codec.RespondError(msg.ID, -32000, "engine-manager not available"); err != nil {
+			log.Printf("failed to respond to %s: %v", msg.Method, err)
+		}
+		return
+	}
+	id := msg.ID
+	method := msg.Method
+	respond := func(result json.RawMessage, rpcErr *RPCError, err error) {
+		switch {
+		case err != nil:
+			if e := b.codec.RespondError(id, -32000, fmt.Sprintf("engine call failed: %v", err)); e != nil {
+				log.Printf("failed to relay engine error for %s: %v", method, e)
+			}
+		case rpcErr != nil:
+			if e := b.codec.RespondError(id, rpcErr.Code, rpcErr.Message); e != nil {
+				log.Printf("failed to relay engine error for %s: %v", method, e)
+			}
+		default:
+			if e := b.codec.Respond(id, result); e != nil {
+				log.Printf("failed to relay engine result for %s: %v", method, e)
+			}
+		}
+	}
+	if err := em.RelayRequest(method, msg.Params, respond); err != nil {
+		respond(nil, nil, err)
+	}
 }
 
 func (b *Broker) relayToEngineNow(msg *Message) {
@@ -3642,6 +3734,9 @@ func (b *Broker) relayToEngineNow(msg *Message) {
 		}
 		if isLMStudioSetPort {
 			b.lmstudioState().backendPort.Store(int32(requestedLMStudioPort))
+		}
+		if method == "engine:models" {
+			b.publishLocalModelInventory(result)
 		}
 		if e := b.codec.Respond(id, result); e != nil {
 			log.Printf("failed to relay engine result for %s: %v", method, e)
