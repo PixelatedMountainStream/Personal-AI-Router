@@ -124,14 +124,15 @@ and recovery. Editing `args`/`start` directly remains trusted manifest authoring
 | `manifest_version` | int | yes | Must be `1`. A higher value is rejected (asks for behavior this binary lacks). Unknown optional fields within a supported version are ignored, so the schema can grow additively. |
 | `platforms` | object | yes | Map of `"<goos>/<goarch>"` → platform block (e.g. `"windows/amd64"`, `"darwin/arm64"`, `"linux/amd64"`). At least one entry. The runner selects the block matching the host. |
 | `actions` | object | no | Map of action name → action (see below). |
-| `detect` / `install` / `uninstall` / `models_dir` / `runtime` | — | no | Optional **shared defaults** inherited by every platform (see below). |
+| `install_dir` / `detect` / `install` / `uninstall` / `models_dir` / `runtime` | — | no | Optional **shared defaults** inherited by every platform (see below). |
 
-**Shared defaults & per-platform overrides.** The platform-level fields `detect`, `install`, `uninstall`, `models_dir`, and `runtime` may also be given once at the top level as shared defaults; each `platforms` entry is then merged onto them. Nested objects (e.g. `runtime`, `runtime.env`) merge key-by-key with the platform value winning, while arrays and scalars are replaced wholesale. So a runtime that's identical across platforms except `cli` is declared once at the top level, and each platform sets only `"runtime": { "cli": "…" }`. Omitting a key inherits the default; setting it (even to a zero value like `"port": 0`) overrides it. A manifest that fully specifies each platform with no top-level defaults behaves exactly as before.
+**Shared defaults & per-platform overrides.** The platform-level fields `install_dir`, `detect`, `install`, `uninstall`, `models_dir`, and `runtime` may also be given once at the top level as shared defaults; each `platforms` entry is then merged onto them. Nested objects (e.g. `runtime`, `runtime.env`) merge key-by-key with the platform value winning, while arrays and scalars are replaced wholesale. So a runtime that's identical across platforms except `cli` is declared once at the top level, and each platform sets only `"runtime": { "cli": "…" }`. Omitting a key inherits the default; setting it (even to a zero value like `"port": 0`) overrides it. A manifest that fully specifies each platform with no top-level defaults behaves exactly as before.
 
 ## Platform block
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
+| `install_dir` | string | no | Literal managed payload directory, with OS env refs and a leading `~` expanded. Its expanded value must not be blank on the host. Defaults to the app-data root's `engine-bin/<engine>`. Use an external location only when the engine requires it, and add that path to every app-data wipe/uninstall inventory. Available to the rest of the platform block as `{install_dir}`. |
 | `detect` | string[] | no | Paths that, if any exists, mean the engine is already installed. Supports OS env refs (`%VAR%`, `$VAR`), a leading `~`, and the `{install_dir}` placeholder. |
 | `install` | object | no | How to obtain the engine (see Install). Omit for engines that are only ever detected/launched. |
 | `uninstall` | object | no | How to remove a user-mode install (see Uninstall). Backs `engine:uninstall`. |
@@ -181,10 +182,15 @@ PAIR cannot replace for them. Two separate removals have to leave them alone:
    data directory. Nothing can exempt a subdirectory of it, so the only defense
    is for `models_dir` to resolve somewhere else entirely.
 
-That second one is why `models_dir` must be a literal path: `{install_dir}` is
-inside the app data root, so any store derived from it is destroyed when a user
-uninstalls the app — even though the prompt promises their models are kept, and
-even though no engine uninstall ever touched them.
+That second one is why `models_dir` must be a literal path. By default,
+`{install_dir}` is inside the app data root, so any store derived from it is
+destroyed when a user uninstalls the app. A platform may declare an external
+`install_dir`, but that PAIR-owned path must also be in the app wipe inventory,
+so it is no safer for models. Keep the store separate from both locations.
+An explicit `install_dir` must also stay outside `models_dir`: uninstall refuses
+to remove anything inside the protected store, including an engine payload.
+For the host platform, relative paths are resolved against the service's working
+directory before checking this separation.
 
 Declare the engine's own default where it has one, so PAIR and a user's own copy
 of that engine share a library rather than downloading the same weights twice.
@@ -367,10 +373,10 @@ placeholder before the action runs:
   declared `remove_path.root` via `lms ls --json`. When no indexed file
   matches, the runner falls back to `{root}/{model}` if that path exists.
 
-A manifest-level **`advertised_models`** (`"list"`, the default, or `"loaded"`)
+A manifest-level **`advertised_models`** (`"list"`, the default, `"loaded"`, or `"available"`)
 chooses what the node tells its peers and its own proxy it can serve. The proxy
 sends a request to any node advertising the model, so an engine that serves one
-model per process sets `"loaded"` and advertises only `loaded_models`, even when
+model per process without request-triggered loading sets `"loaded"` and advertises only `loaded_models`, even when
 its `list_models` offers many models it could be switched to. With `"loaded"`,
 a `loaded_models` action is required, and `engine:models` reports the engine in
 two parts:
@@ -398,7 +404,10 @@ in the directory that holds the engine binary, and reports byte progress taken
 from the cache directory. It needs no running engine.
 
 A **`stop_engine`** action (only as `unload_model`) stops the engine, for one that
-serves a single model per process and so cannot unload it while running. A
+serves a single model per process and so cannot unload it while running. With
+`wait_for_model`, Eject also clears its selected model and leaves it enabled
+awaiting a new choice, including when cancelling a Load in progress. An already
+disabled engine stays disabled. A
 `launch_model` action on a stopped engine saves the choice and starts it.
 
 A runtime **`auto_launch`** (`{"kind": "hf_context", "context_tokens": 65536, "max_num_seqs": 32}`)
@@ -412,6 +421,12 @@ then appends `--max-model-len`
 native window, and `--gpu-memory-utilization` sized to the weights the engine
 loads plus KV cache, never below 15% of the GPU and never above what is free
 less a 1 GiB margin (the free-memory cap wins).
+For FP8 checkpoints on vLLM-Metal's MLX worker, disk size understates resident
+weights because the loader expands them to BF16. These launches use the measured
+free-memory cap instead of estimating a smaller share or context from the weight
+size. The context target and rules for the model's native limit and rope scaling
+still apply; the worker profiles resident weights and determines whether that
+context fits.
 A model that is not in the cache yet, which vLLM downloads during the start,
 first has its files other than weights fetched into the cache with the engine's
 Hugging Face tool (the one an `hf_pull` action names) at that revision, and is
@@ -430,8 +445,9 @@ Arguments the user saved always win and nothing added is written back to saved
 settings, so a model switch is re-sized for the new model. It also adds
 `--enable-auto-tool-choice` and a `--tool-call-parser` found from the model's own
 chat template with the installed vLLM (see the README's vLLM section), or nothing
-when no parser reads the model's tool calls. Tensor- or
-pipeline-parallel launches are left alone. It requires a process-mode runtime
+when no parser reads the model's tool calls. Memory and context sizing are left
+to the engine for tensor- or pipeline-parallel launches and explicit
+`--worker-cls` selections. It requires a process-mode runtime
 with `editable_launch`.
 
 A runtime **`unsupported_weights`** (`{"formats": ["fp8"], "except_model_types":
@@ -509,7 +525,7 @@ validation at load:
 | `{cli}` | The platform's `runtime.cli` path | runtime start/stop, action `cmd` |
 | `{download}` | Path of the verified download | `install.run` |
 | `{download_<name>}` | Path of a verified member of `install.artifacts` | `install.run` |
-| `{install_dir}` | Per-engine user-scoped install dir | `detect`, `install`, runtime |
+| `{install_dir}` | Per-engine managed payload directory: the platform's expanded `install_dir`, or the app-data root's `engine-bin/<engine>` by default | `detect`, `install`, uninstall, runtime |
 | `{hf_hub_cache}` | The Hugging Face hub cache the engine itself uses, from its launch environment as `huggingface_hub` resolves it: `HF_HUB_CACHE`, else `HUGGINGFACE_HUB_CACHE`, else `HF_HOME/hub`, else `$XDG_CACHE_HOME/huggingface/hub`, else `~/.cache/huggingface/hub` | the `dir` of an `hf_cache` or `hf_pull` action only |
 | `{models_dir}` | The platform's `models_dir`, expanded | `detect`, runtime args/env, `uninstall.run`, actions. **Not** `install`, which resolves only `{install_dir}` and the download paths — and not `uninstall.remove`, where naming the store is rejected at load. Unset when the platform declares no store, so a template referencing it then fails to resolve rather than silently becoming a path under `/` |
 
@@ -623,7 +639,7 @@ script. It is still added with **no code** — using `mode: "command"`, a
         "cli": "~/.lmstudio/bin/lms",
         "port": 1235,
         "start": [["{cli}", "server", "start", "--port", "{port}"]],
-        "stop":  { "cmd": ["{cli}", "server", "stop"] },
+        "stop":  { "cmd": ["{cli}", "daemon", "down"], "grace_s": 10 },
         "ready":  { "http": "http://127.0.0.1:{port}/v1/models", "status": 200, "timeout_s": 60 },
         "health": { "http": "http://127.0.0.1:{port}/v1/models", "status": 200, "interval_s": 10 }
       }
@@ -638,7 +654,7 @@ script. It is still added with **no code** — using `mode: "command"`, a
 ```
 
 What each piece does here:
-- **`mode: "command"`** — no owned process; liveness is the `/v1/models` probe, and `stop.cmd` (`lms server stop`) brings the daemon down.
+- **`mode: "command"`** — no owned process; liveness is the `/v1/models` probe. For LM Studio's bundled `stop.cmd` (`["{cli}", "daemon", "down"]`), engine-manager first reads `lms daemon status --json`. A confirmed running headless host uses `daemon down` to terminate `llmster` and release loaded models; a GUI host uses `server stop` to close HTTP without quitting the GUI or unloading its models. Failed or unrecognized host status also uses `server stop`, which may leave the host and models in memory. An explicit `not-running` status requires no stop command. Explicit custom stop commands bypass this selection and execute unchanged.
 - **`cmd` action** — `pull_model` shells out to `lms get {model}` (no HTTP equivalent exists), with `{model}` filled from the call's params.
 - **`model_resolution: "lms-get"`** — `pull_model` tries the model as given, then the Hub artifact id, then the Hugging Face repo URL, so a bare `owner/name` for a Hugging-Face-hosted model (most of LM Studio's catalog) downloads instead of 404ing against the Hub registry.
 - **`{cli}`** — the manifest-global `pull_model` action resolves to the right per-OS binary (`lms.exe` on Windows, `lms` elsewhere).
@@ -664,10 +680,26 @@ GPU selection, and auth.
 | **GPT4All** | weak (GUI app) | none (Local API Server toggled in the GUI, `:4891`) | desktop settings / Python SDK — not env | OpenAI `/v1` once enabled in-app |
 
 Caveats worth encoding when authoring these:
-- **Model store location**: leave each engine's model cache at the engine's own default — `~/.ollama`, `~/.llamacpp`, `~/.lmstudio/models` — and declare that path as `models_dir`. Never point one inside `{install_dir}` or anywhere else under the app data root: `uninstall` skips `models_dir`, but the app-level "remove all data" uninstall deletes the entire app data root and nothing can exempt a subdirectory of it. See Model stores.
+- **Model store location**: leave each engine's model cache at the engine's own default — `~/.ollama`, `~/.llamacpp`, `~/.lmstudio/models` — and declare that path as `models_dir`. Never point one inside `{install_dir}` or anywhere else under the app data root: `uninstall` skips `models_dir`, but app reset removes both the data root and PAIR-owned external payload directories. See Model stores.
 - **llama.cpp** ships prebuilt archives with **published SHA-256s**, so it's an ideal checksum-pinned `fetch`+`run` target (no placeholder SHA needed).
 - **LM Studio** model dir is settings-controlled (no documented relocation env); surface its config as flags/API, not env.
 - **vLLM**: native Windows is unsupported (WSL only), and macOS is Apple Silicon only through the vLLM-Metal plugin (`darwin/arm64`); the bind is a flag, not env. The bundled `vllm.json` is the reference: it passes the model as `--model`, since manifest `runtime.args` have no `{model}` token, and installs through a sha256-pinned `uv` bootstrap with a detect-first path.
 - **GPT4All**: no first-class headless CLI today — out of scope for a config-only manager unless targeting its Python SDK.
 
 Known limitation (exclusive loads): operator-configured engine startup loads (llama.cpp `--models-preset`/load-on-startup, model environment variables) are not gated by engine-manager; rely on LM Studio JIT off, `--models-max 1` and `OLLAMA_MAX_LOADED_MODELS=1`.
+
+### Waiting for explicit model selection
+
+`runtime.wait_for_model: true` is supported for process engines with a
+`launch_model` action. When no model launch argument is configured, Start succeeds
+with `awaiting_model:true` and saves enabled intent without spawning a serving
+process. The bundled vLLM manifest uses this policy and supplies no default model.
+Once a model argument is saved, the usual startup and readiness checks apply.
+
+### Cached model availability for request-triggered loading
+
+`advertised_models: "available"` is for a `wait_for_model` runtime with an
+`hf_cache` model inventory and `loaded_models` action. While enabled it advertises
+complete cached models that engine-manager can prepare on request. While disabled
+its advertised set is empty. Downloaded and resident sets remain separately
+reported. Its loaded result may use `inventory_field`, as with `"loaded"`.

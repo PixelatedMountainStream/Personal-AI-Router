@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestManifest_RejectsWaitingWithoutModelSelection(t *testing.T) {
+	m := validManifest()
+	p := m.Platforms["linux/amd64"]
+	p.Runtime.WaitForModel = true
+	m.Platforms["linux/amd64"] = p
+	require.ErrorContains(t, m.Validate(), "wait_for_model requires process mode and a launch_model action")
+}
 
 // validManifest is a minimal well-formed manifest used as the base for
 // validation tests; individual tests mutate a copy to introduce one
@@ -52,6 +61,49 @@ func validManifest() Manifest {
 func TestValidate_AcceptsValidManifest(t *testing.T) {
 	m := validManifest()
 	require.NoError(t, m.Validate(), "valid manifest rejected")
+}
+
+func TestValidate_RejectsTemplatedInstallDirectory(t *testing.T) {
+	m := validManifest()
+	platform := m.Platforms["linux/amd64"]
+	platform.InstallDir = "{models_dir}/engine"
+	m.Platforms["linux/amd64"] = platform
+
+	require.ErrorContains(t, m.Validate(), "install_dir", "templated install directory accepted")
+}
+
+func TestValidate_AcceptsEnvironmentReferenceInInstallDirectory(t *testing.T) {
+	t.Setenv("NVPAIR_INSTALL_ROOT", t.TempDir())
+	m := validManifest()
+	platform := m.Platforms["linux/amd64"]
+	platform.InstallDir = "${NVPAIR_INSTALL_ROOT}/engine"
+	m.Platforms["linux/amd64"] = platform
+
+	require.NoError(t, m.Validate(), "supported braced environment reference rejected")
+}
+
+func TestValidate_RejectsOverlappingInstallAndModelDirectories(t *testing.T) {
+	workingDir := t.TempDir()
+	t.Chdir(workingDir)
+	key := runtime.GOOS + "/" + runtime.GOARCH
+	test := func(name, installDir, modelsDir string) {
+		t.Helper()
+		t.Run(name, func(t *testing.T) {
+			m := validManifest()
+			platform := m.Platforms["linux/amd64"]
+			platform.InstallDir = installDir
+			platform.ModelsDir = modelsDir
+			platform.Uninstall = &Uninstall{Remove: []string{"{install_dir}"}}
+			m.Platforms = map[string]Platform{key: platform}
+
+			require.ErrorContains(t, m.Validate(), "models_dir")
+		})
+	}
+	test("model store inside installation", "~/.nvpair/engine-bin/demo", "~/.nvpair/engine-bin/demo/models")
+	test("installation inside model store", "~/.cache/huggingface/engine-bin/demo", "~/.cache/huggingface")
+	test("same directory through relative and absolute paths", "payload", filepath.Join(workingDir, "payload"))
+	test("relative installation inside absolute model store", "models/engine", filepath.Join(workingDir, "models"))
+	test("absolute installation around relative model store", filepath.Join(workingDir, "payload"), "payload/models")
 }
 
 func TestValidate_AcceptsCommandModeAndCmdAction(t *testing.T) {
@@ -440,7 +492,7 @@ func TestLoadRegistryMissingDir_IsSkipped(t *testing.T) {
 }
 
 // TestApplyPlatformDefaults covers the shared-base merge: a top-level
-// runtime/install block is inherited by each platform, per-platform keys
+// runtime/install block and install directory are inherited by each platform, per-platform keys
 // override, nested objects (env) deep-merge, and a platform can override
 // a shared scalar.
 func TestApplyPlatformDefaults_InheritsBaseFieldsAndKeepsPlatformOverrides(t *testing.T) {
@@ -449,6 +501,7 @@ func TestApplyPlatformDefaults_InheritsBaseFieldsAndKeepsPlatformOverrides(t *te
   "engine": "demo",
   "display_name": "Demo",
   "manifest_version": 1,
+  "install_dir": "~/.nvpair/engine-bin/demo",
   "install": { "mode": "user" },
   "runtime": {
     "args": ["serve"],
@@ -464,6 +517,7 @@ func TestApplyPlatformDefaults_InheritsBaseFieldsAndKeepsPlatformOverrides(t *te
       "runtime": { "bin": "{install_dir}/bin/demo", "env": { "EXTRA": "2" } }
     },
     "linux/arm64": {
+      "install_dir": "/opt/nvpair/demo",
       "detect": ["{install_dir}/bin/demo"],
       "install": { "fetch": { "url": "https://x/demo.tgz" }, "run": ["tar", "xf", "{download}", "-C", "{install_dir}"] },
       "uninstall": { "run": ["rm", "-rf", "{install_dir}"] },
@@ -489,6 +543,7 @@ func TestApplyPlatformDefaults_InheritsBaseFieldsAndKeepsPlatformOverrides(t *te
 		assert.Equal(t, "user", amd.Install.ModeOrDefault(), "amd64 install: expected base mode + platform fetch")
 		assert.NotNil(t, amd.Install.Fetch, "amd64 install: expected base mode + platform fetch")
 	}
+	assert.Equal(t, "~/.nvpair/engine-bin/demo", amd.InstallDir, "amd64 install_dir: expected inherited path")
 	// per-platform override applied:
 	assert.Equal(t, "{install_dir}/bin/demo", amd.Runtime.Bin, "amd64 bin override missing")
 	// nested object (env) deep-merges base + platform keys:
@@ -500,6 +555,7 @@ func TestApplyPlatformDefaults_InheritsBaseFieldsAndKeepsPlatformOverrides(t *te
 	require.True(t, ok, "linux/arm64 missing")
 	assert.Equal(t, 5678, arm.Runtime.Port, "arm64 port override expected 5678")
 	assert.Equal(t, "1", arm.Runtime.Env["SHARED"], "arm64 should still inherit base env SHARED")
+	assert.Equal(t, "/opt/nvpair/demo", arm.InstallDir, "arm64 install_dir override missing")
 }
 
 // TestBundledManifestsMerge guards the actual shipped manifests: they must
@@ -565,6 +621,21 @@ func TestBundledVLLM_StartFitsTheRemoteReadinessBudget(t *testing.T) {
 		startAllowance := time.Duration(p.Runtime.Ready.TimeoutS) * time.Second
 		assert.Greater(t, remoteReadyResponseHeaderTimeout, startAllowance, "the whole start, work before launch included (%v)", key)
 		assert.Greater(t, startAllowance, hfMetadataTimeout+toolParserProbeTimeout, "the work before launch leaves the engine time to come up (%v)", key)
+	}
+}
+
+// On integrated-GPU Linux machines such as DGX Spark the default memory-mapped
+// safetensors load took longer than ten minutes for a 4B model. Linux reads the
+// weights into host memory first; the macOS launch is left as it was.
+func TestBundledVLLM_LinuxLoadsWeightsEagerly(t *testing.T) {
+	reg := NewRegistry()
+	require.NoError(t, reg.LoadFS(bundledManifests, "manifests"))
+	m, ok := reg.Get("vllm")
+	require.True(t, ok, "vllm manifest not loaded")
+	for key, p := range m.Platforms {
+		require.NotNil(t, p.Runtime.AutoLaunch, "vllm must size its launch on every platform (%v)", key)
+		assert.Equal(t, strings.HasPrefix(key, "linux/"), p.Runtime.AutoLaunch.EagerSafetensors, "only Linux loads eagerly (%v)", key)
+		assert.NotContains(t, p.Runtime.Args, "--safetensors-load-strategy", "eager loading is added at launch, not saved as a default (%v)", key)
 	}
 }
 
@@ -724,6 +795,8 @@ func TestBundledVLLMManifest_PinsTheInstallAndSizesTheLaunchOnEachPlatform(t *te
 			// Our managed install must win over an external one.
 			require.GreaterOrEqual(t, len(platform.Detect), 2, "detect must list the managed install and an external one")
 			assert.True(t, strings.HasPrefix(platform.Detect[0], "{install_dir}/"), "detect order = %v, want the managed install first", platform.Detect)
+			assert.Equal(t, "~/.nvpair/engine-bin/vllm", platform.InstallDir, "use the space-free managed vLLM directory")
+			assert.False(t, strings.ContainsAny(platform.InstallDir, " \t\r\n"), "the managed install path must not contain whitespace")
 			require.NotNil(t, platform.Install)
 			require.NotNil(t, platform.Install.Fetch, "the uv bootstrap must be a fetch")
 			require.NotEmpty(t, platform.Install.Fetch.SHA256, "the uv bootstrap must be sha256-pinned")
@@ -734,8 +807,13 @@ func TestBundledVLLMManifest_PinsTheInstallAndSizesTheLaunchOnEachPlatform(t *te
 			// argument of get_lark_from_jinja required that vLLM 0.32 does not pass,
 			// so with the Mistral tool-call parser every request to a Mistral model
 			// fails. vLLM 0.33 makes the same call; drop the pin only with a vLLM
-			// release that itself requires mistral_common 1.13.
-			assert.Contains(t, script, "mistral_common==1.12.0", "the install must pin mistral_common==1.12.0 for vLLM 0.32")
+			// release that itself requires mistral_common 1.13. vLLM 0.34 does, so
+			// Linux must not pin it: the pin makes the install unsolvable.
+			if strings.HasPrefix(key, "darwin/") {
+				assert.Contains(t, script, "mistral_common==1.12.0", "the install must pin mistral_common==1.12.0 for vLLM 0.32")
+			} else {
+				assert.NotContains(t, script, "mistral_common", "vLLM 0.34 requires mistral_common>=1.13, so the Linux install must not pin it")
+			}
 			if strings.HasPrefix(key, "darwin/") {
 				// The macOS wheels are downloaded by the script itself, so each one
 				// has to be checked against a digest before it is installed.
@@ -743,14 +821,16 @@ func TestBundledVLLMManifest_PinsTheInstallAndSizesTheLaunchOnEachPlatform(t *te
 			}
 
 			rt := platform.Runtime
+			assert.True(t, rt.WaitForModel, "first enable must wait for explicit model selection")
+			_, selected := launchFlagValue(rt.Args, "--model")
+			assert.False(t, selected, "the bundled launch must not select a model")
 			require.NotNil(t, rt.EditableLaunch)
 			assert.Equal(t, []string{"serve"}, rt.EditableLaunch.FixedArgs, "launch must start with the fixed serve subcommand")
 			assert.Equal(t, "~/.cache/huggingface", platform.ModelsDir, "models_dir must be the Hugging Face cache")
-			// vLLM compiles FlashInfer sampling kernels at first start and that build
-			// cannot cope with the spaces in PAIR's app-data path
-			// ("Nvidia Corporation/Personal AI Router"), so it must stay off. It also
-			// keeps a system CUDA toolkit and C++ compiler from being required.
+			// Keep the optional sampler off so ordinary models do not need a CUDA
+			// toolkit solely for sampling. Other kernels can use the space-free path.
 			assert.Equal(t, "0", rt.Env["VLLM_USE_FLASHINFER_SAMPLER"], "the FlashInfer sampler must be disabled")
+			assert.NotContains(t, rt.Env, "VLLM_DISABLED_KERNELS", "kernels must stay enabled with the space-free install")
 			// vLLM reserves 92% of GPU memory by default and refuses a context above
 			// the model's own limit. Both are decided per model at start, so the
 			// manifest must not pin them in the saved launch.
@@ -758,7 +838,7 @@ func TestBundledVLLMManifest_PinsTheInstallAndSizesTheLaunchOnEachPlatform(t *te
 			assert.Equal(t, autoLaunchHFContext, rt.AutoLaunch.Kind)
 			assert.Equal(t, 65536, rt.AutoLaunch.ContextTokens, "vllm must aim for a 64K window")
 			// vLLM's default of 256 concurrent requests does not fit a hybrid model
-			// such as the default Qwen3.5-4B on a 16 GiB GPU.
+			// such as Qwen3.5-4B on a 16 GiB GPU.
 			assert.Equal(t, 32, rt.AutoLaunch.MaxNumSeqs, "vllm must run at most 32 requests at a time")
 			assert.NotContains(t, rt.Args, "--gpu-memory-utilization", "must not be pinned in the default launch")
 			assert.NotContains(t, rt.Args, "--max-model-len", "must not be pinned in the default launch")
@@ -777,13 +857,13 @@ func TestBundledVLLMManifest_DeclaresTheModelActionsTheStackReliesOn(t *testing.
 
 	assert.Contains(t, manifest.Actions, "list_models")
 	assert.Contains(t, manifest.Actions, "loaded_models")
-	// list_models is what is on disk; only the model being served is advertised.
+	// list_models is what is on disk; enabled vLLM can load these on request.
 	// Listing, Delete and Pull use the hub cache vLLM itself uses, resolved from
 	// its launch environment ({hf_hub_cache}).
 	if list := manifest.Actions["list_models"]; assert.NotNil(t, list.HFCache, "list_models must list the Hugging Face cache") {
 		assert.Equal(t, "{hf_hub_cache}", list.HFCache.Dir)
 	}
-	assert.Equal(t, advertisedModelsLoaded, manifest.AdvertisedModels, "peers and the proxy must only be offered the served model")
+	assert.Equal(t, advertisedModelsAvailable, manifest.AdvertisedModels, "enabled vLLM must offer cached models for request-triggered loading")
 	if loaded := manifest.Actions["loaded_models"]; assert.NotNil(t, loaded.HTTP, "loaded_models must read vLLM's /v1/models") {
 		assert.Equal(t, "/v1/models", loaded.HTTP.Path)
 	}

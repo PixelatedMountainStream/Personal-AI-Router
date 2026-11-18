@@ -41,6 +41,7 @@
 - ⚠️ nvpair-proxy → facade/enable
 - ⚠️ nvpair-proxy → node/selected
 - ⚠️ nvpair-proxy → node/set-local-backend
+- ⚠️ nvpair-proxy → node/set-local-models
 - ⚠️ nvpair-ui-broker → discovery:unsubscribe
 - ⚠️ nvpair-ui-broker → engine:configure-launch
 - ⚠️ nvpair-ui-broker → engine:restart
@@ -92,6 +93,7 @@
 | `errors:clear` | notification (we consume) | ✅ yes |
 | `errors:report` | notification (we consume) | ✅ yes |
 | `engine:action` | request (we call) | ✅ yes |
+| `engine:cancel-pull` | request (we call) | ✅ yes |
 | `engine:catalog` | request (we call) | ✅ yes |
 | `engine:configure-launch` | request (we call) | ⚠️ not called |
 | `engine:configured-ports` | request (we call) | ⚠️ not called |
@@ -105,6 +107,7 @@
 | `engine:prepare-shutdown` | request (we call) | ➖ ignored |
 | `engine:preview-launch` | request (we call) | ⚠️ not called |
 | `engine:remote-apply-settings` | request (we call) | ⚠️ not called |
+| `engine:remote-cancel-pull` | request (we call) | ✅ yes |
 | `engine:remote-delete-model` | request (we call) | ✅ yes |
 | `engine:remote-get-installed` | request (we call) | ✅ yes |
 | `engine:remote-get-settings` | request (we call) | ⚠️ not called |
@@ -179,7 +182,7 @@
 | `ready` | notification (we consume) | ✅ yes |
 
 **Dynamic / unresolved notify sites (verify by hand — `npm run service-contracts` prints the line numbers):**
-- `method (var)  (daemon.go, 3 sites)`
+- `method (var)  (daemon.go, 4 sites)`
 
 ## nvpair-node-settings
 
@@ -217,6 +220,7 @@
 | `node/select` | request (we call) | ✅ yes |
 | `node/selected` | request (we call) | ⚠️ not called |
 | `node/set-local-backend` | request (we call) | ⚠️ not called |
+| `node/set-local-models` | request (we call) | ⚠️ not called |
 | `node/set-priority` | request (we call) | ✅ yes |
 | `nodes/list` | request (we call) | ✅ yes |
 
@@ -296,6 +300,7 @@
 - `method (var)  (broker.go, 5 sites)`
 - `method (var)  (clustermanager.go)`
 - `method (var)  (errors.go)`
+- `target (var)  (modelrequest.go)`
 - `method (var)  (proxy.go, 2 sites)`
 - `method (var)  (rpcworker.go, 2 sites)`
 

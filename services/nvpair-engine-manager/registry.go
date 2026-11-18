@@ -77,7 +77,8 @@ type Manifest struct {
 	Actions         map[string]Action   `json:"actions,omitempty"`
 	// AdvertisedModels says which models this node tells its peers and its own
 	// proxy it can serve: "list" (the default) advertises list_models, "loaded"
-	// advertises loaded_models. An engine that serves one model per process
+	// advertises loaded_models; "available" advertises cached models while enabled
+	// and prepares them on request. An engine that serves one model per process
 	// can list many models it has on disk but only answer for the one it is
 	// running, and the proxy sends a request to any node advertising its model.
 	AdvertisedModels string `json:"advertised_models,omitempty"`
@@ -87,15 +88,19 @@ type Manifest struct {
 // first; OS-specific Go code is the fallback only for primitives a
 // manifest cannot express (process termination, console hiding).
 type Platform struct {
-	Detect    []string   `json:"detect,omitempty"`
-	Install   *Install   `json:"install,omitempty"`
-	Uninstall *Uninstall `json:"uninstall,omitempty"`
-	Runtime   Runtime    `json:"runtime"`
+	// InstallDir overrides the default app-data-root engine directory. It is a
+	// literal user path with the same ~ and OS environment expansion as detect
+	// paths; its resolved value is exposed to the manifest as {install_dir}.
+	InstallDir string     `json:"install_dir,omitempty"`
+	Detect     []string   `json:"detect,omitempty"`
+	Install    *Install   `json:"install,omitempty"`
+	Uninstall  *Uninstall `json:"uninstall,omitempty"`
+	Runtime    Runtime    `json:"runtime"`
 	// ModelsDir is the engine's on-disk model store, referenced elsewhere as
 	// {models_dir}. Nothing this service removes may delete it: Uninstall skips
-	// it, and the app-level data purge never reaches it because validation
-	// rejects a models_dir that is a placeholder (and therefore cannot be
-	// derived from the install directory, which lives under the app data root).
+	// it, validation keeps it outside an explicit managed install directory, and
+	// the bundled-manifest tests keep it outside the app data root. App reset
+	// removes both kinds of managed application path.
 	// Declare the engine's real default — the path it would use on its own —
 	// so PAIR and a user's own copy of the engine share one library.
 	ModelsDir string `json:"models_dir,omitempty"`
@@ -160,6 +165,9 @@ type InstallArtifact struct {
 //     (e.g. LM Studio's `lms`); liveness = the readiness/health probe,
 //     and Stop.Cmd brings it down.
 type Runtime struct {
+	// WaitForModel keeps an installed engine enabled without starting a serving
+	// process until the user selects a model through its launch_model action.
+	WaitForModel bool `json:"wait_for_model,omitempty"`
 	// ModelSource selects llama.cpp's model catalogue and download provider.
 	ModelSource string `json:"model_source,omitempty"`
 	// EditableLaunch declares which startup arguments and environment controls
@@ -230,6 +238,11 @@ type AutoLaunch struct {
 	// hybrid model such as Qwen3.5 cannot fit one state block per sequence for
 	// 256 of them and refuses to start. 0 leaves the engine's default.
 	MaxNumSeqs int `json:"max_num_seqs,omitempty"`
+	// EagerSafetensors adds --safetensors-load-strategy eager unless the user set
+	// it. The default memory-mapped load is very slow on integrated-GPU machines
+	// such as DGX Spark. It is a launch-time argument rather than a manifest
+	// default so installs with saved launch arguments get it too.
+	EagerSafetensors bool `json:"eager_safetensors,omitempty"`
 }
 
 const autoLaunchHFContext = "hf_context"
@@ -722,9 +735,9 @@ func (r *Registry) mergeOntoBundled(override []byte) ([]byte, error) {
 }
 
 // applyPlatformDefaults implements manifest-level shared defaults: a
-// top-level "detect" / "install" / "uninstall" / "runtime" / "models_dir"
-// block is merged into every entry under "platforms", with the per-platform block
-// winning key-by-key. Nested objects (runtime, runtime.env, …) merge
+// top-level "install_dir" / "detect" / "install" / "uninstall" / "runtime" /
+// "models_dir" block is merged into every entry under "platforms", with the
+// per-platform block winning key-by-key. Nested objects (runtime, runtime.env, …) merge
 // recursively; arrays and scalars are replaced wholesale. The merge runs
 // at the JSON level before unmarshalling, so an omitted key truly
 // inherits the default while an explicit zero value (e.g. "port": 0)
@@ -737,7 +750,7 @@ func applyPlatformDefaults(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("invalid JSON: %w", err)
 	}
 	base := map[string]any{}
-	for _, k := range []string{"detect", "install", "uninstall", "runtime", "models_dir"} {
+	for _, k := range []string{"install_dir", "detect", "install", "uninstall", "runtime", "models_dir"} {
 		raw, ok := top[k]
 		if !ok {
 			continue
@@ -826,6 +839,11 @@ func (m *Manifest) Validate() error {
 			return err
 		}
 	}
+	for key, p := range m.Platforms {
+		if p.Runtime.WaitForModel && (p.Runtime.modeOrDefault() != "process" || modelLaunchFlag(m) == "") {
+			return fmt.Errorf("platform %q: wait_for_model requires process mode and a launch_model action", key)
+		}
+	}
 	for name, a := range m.Actions {
 		if err := a.validate(name); err != nil {
 			return err
@@ -858,16 +876,27 @@ func (m *Manifest) Validate() error {
 			}
 		}
 	}
+	if m.AdvertisedModels == advertisedModelsAvailable {
+		action, ok := m.Actions["list_models"]
+		if !ok || action.HFCache == nil {
+			return fmt.Errorf("advertised_models available requires a cached model inventory")
+		}
+		for _, platform := range m.Platforms {
+			if !platform.Runtime.WaitForModel {
+				return fmt.Errorf("advertised_models available requires wait_for_model")
+			}
+		}
+	}
 	switch m.AdvertisedModels {
 	case "", advertisedModelsList:
-	case advertisedModelsLoaded:
+	case advertisedModelsLoaded, advertisedModelsAvailable:
 		if _, ok := m.Actions["loaded_models"]; !ok {
 			return fmt.Errorf("advertised_models %q requires a loaded_models action", m.AdvertisedModels)
 		}
 	default:
-		return fmt.Errorf("advertised_models %q invalid (want %q or %q)", m.AdvertisedModels, advertisedModelsList, advertisedModelsLoaded)
+		return fmt.Errorf("advertised_models %q invalid (want %q, %q or %q)", m.AdvertisedModels, advertisedModelsList, advertisedModelsLoaded, advertisedModelsAvailable)
 	}
-	if act, ok := m.Actions["loaded_models"]; ok && act.Result != nil && act.Result.InventoryField != "" && m.AdvertisedModels != advertisedModelsLoaded {
+	if act, ok := m.Actions["loaded_models"]; ok && act.Result != nil && act.Result.InventoryField != "" && m.AdvertisedModels != advertisedModelsLoaded && m.AdvertisedModels != advertisedModelsAvailable {
 		return fmt.Errorf("action %q: result.inventory_field requires advertised_models %q", "loaded_models", advertisedModelsLoaded)
 	}
 	return m.validatePlaceholders()
@@ -875,13 +904,50 @@ func (m *Manifest) Validate() error {
 
 // advertisedModels values for Manifest.AdvertisedModels.
 const (
-	advertisedModelsList   = "list"
-	advertisedModelsLoaded = "loaded"
+	advertisedModelsList      = "list"
+	advertisedModelsLoaded    = "loaded"
+	advertisedModelsAvailable = "available"
 )
 
 func (p *Platform) validate(key string) error {
 	if source := p.Runtime.ModelSource; source != "" && source != "huggingface" && source != "modelscope" {
 		return fmt.Errorf("platform %q: invalid model_source", key)
+	}
+	if p.InstallDir != "" {
+		if strings.TrimSpace(p.InstallDir) == "" {
+			return fmt.Errorf("platform %q: install_dir cannot be blank", key)
+		}
+		literalPath := p.InstallDir
+		if !strings.HasPrefix(key, "windows/") {
+			literalPath = unixEnvRe.ReplaceAllString(literalPath, "")
+		}
+		if strings.ContainsAny(literalPath, "{}") {
+			return fmt.Errorf("platform %q: install_dir %q must be a literal path, not a template", key, p.InstallDir)
+		}
+		if p.ModelsDir != "" {
+			installDir := expandPath(p.InstallDir)
+			modelsDir := expandPath(p.ModelsDir)
+			// Only the host platform's relative paths have a meaningful local base.
+			if key == runtime.GOOS+"/"+runtime.GOARCH {
+				var err error
+				installDir, err = filepath.Abs(installDir)
+				if err != nil {
+					return fmt.Errorf("platform %q: resolve install_dir: %w", key, err)
+				}
+				modelsDir, err = filepath.Abs(modelsDir)
+				if err != nil {
+					return fmt.Errorf("platform %q: resolve models_dir: %w", key, err)
+				}
+			}
+			installDir = strings.ToLower(filepath.Clean(installDir))
+			modelsDir = strings.ToLower(filepath.Clean(modelsDir))
+			if pathWithinRoot(installDir, modelsDir) {
+				return fmt.Errorf("platform %q: models_dir %q cannot be inside install_dir %q — app reset removes managed engine payloads", key, p.ModelsDir, p.InstallDir)
+			}
+			if pathWithinRoot(modelsDir, installDir) {
+				return fmt.Errorf("platform %q: install_dir %q cannot be inside models_dir %q — uninstall preserves the model store", key, p.InstallDir, p.ModelsDir)
+			}
+		}
 	}
 	if auto := p.Runtime.AutoLaunch; auto != nil {
 		if auto.Kind != autoLaunchHFContext || auto.ContextTokens < 1024 {
@@ -983,9 +1049,8 @@ func (p *Platform) validate(key string) error {
 		}
 	}
 	// A models_dir derived from {install_dir} is the mistake this field exists to
-	// prevent: the install directory lives under the app data root, so the
-	// app-level "remove all data" uninstall would take the weights with it even
-	// though no engine uninstall ever touched them. Keeping it literal means the
+	// prevent: app reset removes every managed install directory, so it would take
+	// the weights too even though no engine uninstall ever touched them. Keeping it literal means the
 	// only way to point the model store at the data root is to type that path
 	// out, which review will catch.
 	if strings.Contains(p.ModelsDir, "{") {

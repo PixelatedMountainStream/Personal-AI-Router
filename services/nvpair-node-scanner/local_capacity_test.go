@@ -29,16 +29,16 @@ func TestRefreshSlotChangeReportsChange(t *testing.T) {
 	}
 	stub, port := startModelsStub(t, http.StatusOK, body(2, false))
 	seedEMNode(d, "peer-S", "127.0.0.1", port)
-	require.True(t, d.refreshNodeModels("peer-S", "127.0.0.1", port, ""), "initial populate should report a change")
+	require.True(t, refreshUUID(d, "peer-S"), "initial populate should report a change")
 	got, _ := d.dir.get("peer-S")
 	si := got.SlotsByEngine["lmstudio"]["a"]
 	require.True(t, si.Slots == 2 && si.CtxPerSlot == 4096 && !got.JITLoadByEngine["lmstudio"],
 		"slots/jit not populated: %+v %+v", got.SlotsByEngine, got.JITLoadByEngine)
-	assert.False(t, d.refreshNodeModels("peer-S", "127.0.0.1", port, ""), "identical slots should not report a change")
+	assert.False(t, refreshUUID(d, "peer-S"), "identical slots should not report a change")
 	stub.set(http.StatusOK, body(4, false))
-	assert.True(t, d.refreshNodeModels("peer-S", "127.0.0.1", port, ""), "a slot-count change must report a change")
+	assert.True(t, refreshUUID(d, "peer-S"), "a slot-count change must report a change")
 	stub.set(http.StatusOK, body(4, true))
-	assert.True(t, d.refreshNodeModels("peer-S", "127.0.0.1", port, ""), "a jit_load change must report a change")
+	assert.True(t, refreshUUID(d, "peer-S"), "a jit_load change must report a change")
 }
 
 // TestApplyModelsObservedAtHeartbeat: an identical sweep republishes a fresher
@@ -85,55 +85,23 @@ func emNode(hostUUID string, port int) noderec.DirectoryNode {
 		noderec.ServiceEngineManager: {Port: port}}}
 }
 
-// TestLocalEnrichSetsSlotsAndObservedAt: a successful enrichment carries slots,
-// jit_load and a fresh ModelsObservedAt onto the node.
-func TestLocalEnrichSetsSlotsAndObservedAt(t *testing.T) {
+// refreshUUID refreshes a seeded directory node's models.
+func refreshUUID(d *daemon, uuid string) bool {
+	n, _ := d.dir.get(uuid)
+	return d.refreshNodeModels(n)
+}
+
+// TestLocalFetchSetsSlotsAndObservedAt: a successful fetch with fork state
+// carries slots, jit_load and a fresh observed-at in the inventory extension.
+func TestLocalFetchSetsSlotsAndObservedAt(t *testing.T) {
 	d := newLocalTestDaemon()
 	_, port := startModelsStub(t, http.StatusOK, slotBody(3, true))
-	n := emNode("p", port)
 	before := time.Now().UnixMilli()
-	d.enrichModelsCandidates(&n, []string{"127.0.0.1"})
-	assert.Equal(t, 3, n.SlotsByEngine["lmstudio"]["a"].Slots)
-	assert.True(t, n.JITLoadByEngine["lmstudio"])
-	assert.True(t, n.ModelsObservedAt >= before && n.ModelsObservedAt <= time.Now().UnixMilli())
-}
-
-// TestLocalEnrichFallbackRestoresSlots: a failed fetch restores the cached
-// slots, jit_load and observed-at from the last refresh.
-func TestLocalEnrichFallbackRestoresSlots(t *testing.T) {
-	d := newLocalTestDaemon()
-	stub, port := startModelsStub(t, http.StatusOK, slotBody(2, true))
-	seedEMNode(d, "p", "127.0.0.1", port)
-	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""))
-	got, _ := d.dir.get("p")
-	require.NotZero(t, got.ModelsObservedAt)
-	stub.set(http.StatusInternalServerError, nil)
-	n := emNode("p", port)
-	d.enrichModelsCandidates(&n, []string{"127.0.0.1"})
-	assert.Equal(t, 2, n.SlotsByEngine["lmstudio"]["a"].Slots)
-	assert.True(t, n.JITLoadByEngine["lmstudio"])
-	assert.Equal(t, got.ModelsObservedAt, n.ModelsObservedAt)
-}
-
-// TestLocalForgetAndDropSelfSlotCaches: forget drops the slot caches; dropSelf
-// migrates them to the new host UUID.
-func TestLocalForgetAndDropSelfSlotCaches(t *testing.T) {
-	d := newLocalTestDaemon()
-	stub, port := startModelsStub(t, http.StatusOK, slotBody(2, false))
-	seedEMNode(d, "old", "127.0.0.1", port)
-	seedEMNode(d, "gone", "127.0.0.1", port)
-	require.True(t, d.refreshNodeModels("old", "127.0.0.1", port, ""))
-	require.True(t, d.refreshNodeModels("gone", "127.0.0.1", port, ""))
-	d.dropSelf("old", "new")
-	d.forget("gone")
-	stub.set(http.StatusInternalServerError, nil)
-	moved, gone := emNode("new", port), emNode("gone", port)
-	d.enrichModelsCandidates(&moved, []string{"127.0.0.1"})
-	d.enrichModelsCandidates(&gone, []string{"127.0.0.1"})
-	assert.Equal(t, 2, moved.SlotsByEngine["lmstudio"]["a"].Slots)
-	assert.NotZero(t, moved.ModelsObservedAt)
-	assert.Nil(t, gone.SlotsByEngine)
-	assert.Zero(t, gone.ModelsObservedAt)
+	inv, ok := d.fetchModels("127.0.0.1", port, "")
+	require.True(t, ok)
+	assert.Equal(t, 3, inv.local.slotsByEngine["lmstudio"]["a"].Slots)
+	assert.True(t, inv.local.jitByEngine["lmstudio"])
+	assert.True(t, inv.local.observedAt >= before && inv.local.observedAt <= time.Now().UnixMilli())
 }
 
 // TestLocalApplyModelsCapacityMerge (step-3 characterization): a capacity-only
