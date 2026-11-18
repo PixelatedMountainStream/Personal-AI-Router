@@ -163,7 +163,9 @@ func (e *Executor) residentStrict(ctx context.Context) ([]residentModel, error) 
 		if err != nil {
 			return nil, fmt.Errorf("cannot determine which models engine %q has loaded: %w", name, err)
 		}
-		loaded, loading, err := extractResidency(raw, act.Result)
+		// Identity is the declared inventory field (vLLM root), not the served
+		// alias: an alias must not hide the resident model's size or name.
+		loaded, loading, err := extractResidency(raw, residencySpec(act.Result))
 		if err != nil {
 			return nil, fmt.Errorf("engine %q loaded_models is unusable: %w", name, err)
 		}
@@ -180,6 +182,17 @@ func (e *Executor) residentStrict(ctx context.Context) ([]residentModel, error) 
 		out[i].Loading = loadingSet[out[i].Engine+"/"+out[i].Model]
 	}
 	return out, nil
+}
+
+// residencySpec returns the spec whose Field is the resident model identity:
+// the engine's inventory_field when declared, else its served-name field.
+func residencySpec(spec *ActionResult) *ActionResult {
+	if spec == nil || spec.InventoryField == "" {
+		return spec
+	}
+	inv := *spec
+	inv.Field = spec.InventoryField
+	return &inv
 }
 
 // residencyUnqueryable: a stopped engine normally holds nothing, but an
