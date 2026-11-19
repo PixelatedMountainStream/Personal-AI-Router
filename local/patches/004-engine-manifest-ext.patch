@@ -1,4 +1,4 @@
-From 3ebbccbc9ed7e1a44c0df201259f87fb93ad10b2 Mon Sep 17 00:00:00 2001
+From 9851be294fd43f02d03ce6bcf8f8e0e5d0b2d10b Mon Sep 17 00:00:00 2001
 From: "erik.hauan" <erik.hauan@radiantvs.com>
 Date: Thu, 12 Nov 2026 15:26:24 -0800
 Subject: [PATCH] engine-manager: manifest action extensions behind E10
@@ -27,10 +27,10 @@ local/patches/004-engine-manifest-ext.patch.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- .../nvpair-engine-manager/local_e10_test.go   |  46 +++++++
- .../nvpair-engine-manager/local_registry.go   | 113 ++++++++++++++++++
- services/nvpair-engine-manager/registry.go    |  11 +-
- 3 files changed, 169 insertions(+), 1 deletion(-)
+ .../nvpair-engine-manager/local_e10_test.go   |  46 ++++++
+ .../nvpair-engine-manager/local_registry.go   | 152 ++++++++++++++++++
+ services/nvpair-engine-manager/registry.go    |  12 +-
+ 3 files changed, 209 insertions(+), 1 deletion(-)
  create mode 100644 services/nvpair-engine-manager/local_e10_test.go
  create mode 100644 services/nvpair-engine-manager/local_registry.go
 
@@ -88,17 +88,19 @@ index 0000000..7b5ecc2
 +}
 diff --git a/services/nvpair-engine-manager/local_registry.go b/services/nvpair-engine-manager/local_registry.go
 new file mode 100644
-index 0000000..9f6fdc1
+index 0000000..67c3260
 --- /dev/null
 +++ b/services/nvpair-engine-manager/local_registry.go
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,152 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package main
 +
 +import (
++	"encoding/json"
 +	"fmt"
++	"log/slog"
 +	"regexp"
 +	"strings"
 +)
@@ -205,11 +207,48 @@ index 0000000..9f6fdc1
 +	}
 +	return nil
 +}
++
++// localBundledActions are fork-owned actions overlaid onto the bundled upstream
++// manifests so the manifests stay upstream-shaped. catalog_sizes lists every
++// downloaded model's size in bytes (no loaded filter), letting a pinned load size
++// a cold target before choosing victims.
++var localBundledActions = map[string]map[string]json.RawMessage{
++	"lmstudio": {"catalog_sizes": json.RawMessage(`{"description":"Size in bytes of every downloaded model (/api/v1/models models[].size_bytes).","http":{"method":"GET","path":"/api/v1/models"},"result":{"array":"models","field":"key","record":{"fields":{"bytes":"size_bytes"}}}}`)},
++	"ollama":   {"catalog_sizes": json.RawMessage(`{"description":"Size in bytes of every downloaded model (/api/tags models[].size).","http":{"method":"GET","path":"/api/tags"},"result":{"array":"models","field":"name","record":{"fields":{"bytes":"size"}}}}`)},
++}
++
++// overlayLocal merges localBundledActions into one bundled engine's raw JSON (so
++// a per-user override still deep-merges onto them) and reloads that manifest. A
++// failure is logged and leaves the upstream manifest as loaded.
++func (r *Registry) overlayLocal(eng string) {
++	acts, ok := localBundledActions[eng]
++	if !ok {
++		return
++	}
++	var doc map[string]json.RawMessage
++	cur := map[string]json.RawMessage{}
++	if json.Unmarshal(r.bundledRaw[eng], &doc) != nil || (doc["actions"] != nil && json.Unmarshal(doc["actions"], &cur) != nil) {
++		slog.Warn("local manifest overlay skipped", "engine", eng)
++		return
++	}
++	for k, v := range acts {
++		if _, exists := cur[k]; !exists {
++			cur[k] = v
++		}
++	}
++	doc["actions"], _ = json.Marshal(cur)
++	out, _ := json.Marshal(doc)
++	if _, err := r.addManifest("local overlay "+eng, out); err != nil {
++		slog.Warn("local manifest overlay rejected", "engine", eng, "err", err)
++		return
++	}
++	r.bundledRaw[eng] = out
++}
 diff --git a/services/nvpair-engine-manager/registry.go b/services/nvpair-engine-manager/registry.go
-index abb1f13..955d774 100644
+index 8277e83..96e3279 100644
 --- a/services/nvpair-engine-manager/registry.go
 +++ b/services/nvpair-engine-manager/registry.go
-@@ -354,6 +354,8 @@ type Action struct {
+@@ -369,6 +369,8 @@ type Action struct {
  	// only a restart makes the deletion visible to clients. A stopped engine is
  	// left stopped; a restart failure fails the action.
  	RestartAfter bool `json:"restart_after,omitempty"`
@@ -218,7 +257,7 @@ index abb1f13..955d774 100644
  }
  
  // ActionResult is the list-extraction spec on an Action (see Action.Result).
-@@ -374,6 +376,8 @@ type ActionResult struct {
+@@ -389,6 +391,8 @@ type ActionResult struct {
  	// model it loaded as "root" (its --model): peers and the proxy are told the
  	// id, and the loaded marker on the model list uses the root.
  	InventoryField string `json:"inventory_field,omitempty"`
@@ -227,7 +266,7 @@ index abb1f13..955d774 100644
  }
  
  // ResultMatch is the optional row filter on an ActionResult. Exactly one of
-@@ -386,6 +390,8 @@ type ResultMatch struct {
+@@ -401,6 +405,8 @@ type ResultMatch struct {
  	Field    string   `json:"field"`              // element field to test, e.g. "state" / "loaded_instances"
  	In       []string `json:"in,omitempty"`       // accepted string values, e.g. ["loaded"]
  	Nonempty bool     `json:"nonempty,omitempty"` // true → Field must be a nonempty JSON array
@@ -236,7 +275,15 @@ index abb1f13..955d774 100644
  }
  
  // ActionRemovePath deletes a filesystem path declared in the manifest.
-@@ -1123,7 +1129,10 @@ func (a *Action) validate(name string) error {
+@@ -561,6 +567,7 @@ func (r *Registry) LoadFS(fsys fs.FS, root string) error {
+ 		// Remember the raw bundled JSON so LoadOverrideDir can deep-merge
+ 		// a per-user override onto it later.
+ 		r.bundledRaw[eng] = append([]byte(nil), data...)
++		r.overlayLocal(eng) // fork:E10
+ 	}
+ 	return nil
+ }
+@@ -1193,7 +1200,10 @@ func (a *Action) validate(name string) error {
  			return fmt.Errorf("action %q: unsupported progress_protocol %q", name, a.ProgressProtocol)
  		}
  	}

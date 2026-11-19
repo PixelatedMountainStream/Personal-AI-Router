@@ -139,7 +139,7 @@ func TestVictims(t *testing.T) {
 		t.Fatalf("diff-params victims %v same=%v", v, same)
 	}
 	// A small target evicts nothing.
-	if v, _ = ex.victimsOf(snap, PinnedRequest{Engine: "ollama", Model: "phi:3b"}); len(v) != 0 {
+	if v, _ = ex.victimsOfSized(snap, PinnedRequest{Engine: "ollama", Model: "phi:3b"}, 2*gib); len(v) != 0 {
 		t.Fatalf("small target victims %v", v)
 	}
 }

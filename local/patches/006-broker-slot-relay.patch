@@ -1,7 +1,7 @@
-From 2cb1c3412817dc46a99050c4f25f54de8b0690f2 Mon Sep 17 00:00:00 2001
+From 893b0ced3001eab18555e5836a810439ea301d2e Mon Sep 17 00:00:00 2001
 From: "erik.hauan" <erik.hauan@radiantvs.com>
-Date: Thu, 12 Nov 2026 15:26:24 -0800
-Subject: [PATCH] ui-broker: relay slot capacity and jit_load behind S6
+Date: Wed, 18 Nov 2026 18:11:45 -0800
+Subject: ui-broker: relay slot capacity and jit_load behind S6
 
 Behaviour: a directory node's slotsByEngine and jitLoadByEngine reach
 EnrichedNode and the client-facing AvailableNode under their wire keys;
@@ -23,32 +23,32 @@ local/patches/006-broker-slot-relay.patch.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- services/nvpair-ui-broker/broker.go        |  2 ++
- services/nvpair-ui-broker/discovery.go     |  4 +++
- services/nvpair-ui-broker/local_ext.go     | 21 +++++++++++
- services/nvpair-ui-broker/local_s6_test.go | 41 ++++++++++++++++++++++
- 4 files changed, 68 insertions(+)
+ services/nvpair-ui-broker/broker.go        |  2 +
+ services/nvpair-ui-broker/discovery.go     |  4 ++
+ services/nvpair-ui-broker/local_ext.go     | 28 +++++++++++
+ services/nvpair-ui-broker/local_s6_test.go | 56 ++++++++++++++++++++++
+ 4 files changed, 90 insertions(+)
  create mode 100644 services/nvpair-ui-broker/local_ext.go
  create mode 100644 services/nvpair-ui-broker/local_s6_test.go
 
 diff --git a/services/nvpair-ui-broker/broker.go b/services/nvpair-ui-broker/broker.go
-index 5464d26..13a183a 100644
+index e8c6469..2c1d855 100644
 --- a/services/nvpair-ui-broker/broker.go
 +++ b/services/nvpair-ui-broker/broker.go
-@@ -122,6 +122,8 @@ type AvailableNode struct {
- 	// inventory was read and is empty; a missing key means it was not read.
- 	// Omitted when no engine reports one.
- 	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
+@@ -128,6 +128,8 @@ type AvailableNode struct {
+ 	// Info is the latest hardware observation for this record. Unverified
+ 	// records carry display-only public previews, never scheduling evidence.
+ 	Info *noderec.NodeInfo `json:"info,omitempty"`
 +	// fork:S6
 +	LocalBrokerExt
  }
  
  // GetNodesResult is the response to "discovery:get-nodes". Wrapped in an
 diff --git a/services/nvpair-ui-broker/discovery.go b/services/nvpair-ui-broker/discovery.go
-index 9420bef..e4f784e 100644
+index f55ae69..3ae6f0b 100644
 --- a/services/nvpair-ui-broker/discovery.go
 +++ b/services/nvpair-ui-broker/discovery.go
-@@ -77,6 +77,8 @@ type EnrichedNode struct {
+@@ -78,6 +78,8 @@ type EnrichedNode struct {
  	// engine-manager /v1/models downloadedByEngine field. Carried through to
  	// AvailableNode so a remote node's model manager keeps its rows.
  	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
@@ -56,29 +56,29 @@ index 9420bef..e4f784e 100644
 +	LocalBrokerExt
  }
  
- // directoryToEnriched projects the promoted daemon's DirectoryNode onto the
-@@ -116,6 +118,7 @@ func directoryToEnriched(n noderec.DirectoryNode) EnrichedNode {
- 		ModelsByEngine:     n.ModelsByEngine,
- 		LoadedByEngine:     n.LoadedByEngine,
- 		DownloadedByEngine: n.DownloadedByEngine,
-+		LocalBrokerExt:     localBrokerExt(n), // fork:S6
+ // directoryToEnriched preserves scanner provenance in the client-facing store.
+@@ -113,6 +115,7 @@ func directoryToEnriched(n noderec.DirectoryNode) EnrichedNode {
+ 		ModelsByEngine:       n.ModelsByEngine,
+ 		LoadedByEngine:       n.LoadedByEngine,
+ 		DownloadedByEngine:   n.DownloadedByEngine,
++		LocalBrokerExt:       localBrokerExt(n), // fork:S6
  	}
  }
  
-@@ -333,6 +336,7 @@ func (sn storedNode) toAvailable() AvailableNode {
- 		ModelsByEngine:     n.ModelsByEngine,
- 		LoadedByEngine:     n.LoadedByEngine,
- 		DownloadedByEngine: n.DownloadedByEngine,
-+		LocalBrokerExt:     n.LocalBrokerExt, // fork:S6
+@@ -458,6 +461,7 @@ func (sn storedNode) toAvailable(includeHardware bool) AvailableNode {
+ 		ModelsByEngine:       n.ModelsByEngine,
+ 		LoadedByEngine:       n.LoadedByEngine,
+ 		DownloadedByEngine:   n.DownloadedByEngine,
++		LocalBrokerExt:       n.LocalBrokerExt, // fork:S6
+ 		Info:                 info,
  	}
  }
- 
 diff --git a/services/nvpair-ui-broker/local_ext.go b/services/nvpair-ui-broker/local_ext.go
 new file mode 100644
-index 0000000..2c61fdc
+index 0000000..15cd5c1
 --- /dev/null
 +++ b/services/nvpair-ui-broker/local_ext.go
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,28 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -90,22 +90,29 @@ index 0000000..2c61fdc
 +// (seam S6): per-engine slot capacity (loaded models) and jit_load flags,
 +// relayed from the node directory. It is embedded, so encoding/json flattens
 +// it and the wire keys are unchanged; the zero value adds no keys. The
-+// scanner-only ModelsObservedAt is not relayed.
++// scanner-only ModelsObservedAt is not relayed. It also carries the directory
++// node's GPUs, CPU and Memory (NVIDIA #179 moved hardware to the separate Info
++// observation; the fork's node cards still read these flat keys). The directory
++// holds them only for the owned node and authenticated peers.
 +type LocalBrokerExt struct {
 +	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine,omitempty"`
 +	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine,omitempty"`
++	GPUs            []noderec.GPUInfo                      `json:"gpus,omitempty"`
++	CPU             *noderec.CPUInfo                       `json:"cpu,omitempty"`
++	Memory          *noderec.MemoryInfo                    `json:"memory,omitempty"`
 +}
 +
 +// localBrokerExt projects a directory node's extension onto the broker's.
 +func localBrokerExt(n noderec.DirectoryNode) LocalBrokerExt {
-+	return LocalBrokerExt{SlotsByEngine: n.SlotsByEngine, JITLoadByEngine: n.JITLoadByEngine}
++	return LocalBrokerExt{SlotsByEngine: n.SlotsByEngine, JITLoadByEngine: n.JITLoadByEngine,
++		GPUs: n.GPUs, CPU: n.CPU, Memory: n.Memory}
 +}
 diff --git a/services/nvpair-ui-broker/local_s6_test.go b/services/nvpair-ui-broker/local_s6_test.go
 new file mode 100644
-index 0000000..ebf27ce
+index 0000000..b2015f7
 --- /dev/null
 +++ b/services/nvpair-ui-broker/local_s6_test.go
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,56 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -126,7 +133,7 @@ index 0000000..ebf27ce
 +func TestS6_Nil(t *testing.T) {
 +	e := directoryToEnriched(noderec.DirectoryNode{HostUUID: "h", Name: "n"})
 +	assert.Zero(t, e.LocalBrokerExt)
-+	b, err := json.Marshal(storedNode{scanner: &e}.toAvailable())
++	b, err := json.Marshal(storedNode{scanner: &e}.toAvailable(false))
 +	require.NoError(t, err)
 +	assert.NotContains(t, string(b), "slotsByEngine")
 +	assert.NotContains(t, string(b), "jitLoadByEngine")
@@ -142,10 +149,25 @@ index 0000000..ebf27ce
 +	if e.SlotsByEngine["ollama"]["q"].Slots != 4 || !e.JITLoadByEngine["ollama"] {
 +		t.Fatalf("enriched lost capacity: %+v", e)
 +	}
-+	av := storedNode{scanner: &e}.toAvailable()
++	av := storedNode{scanner: &e}.toAvailable(false)
 +	if av.SlotsByEngine["ollama"]["q"].CtxPerSlot != 8192 || !av.JITLoadByEngine["ollama"] {
 +		t.Fatalf("available lost capacity: %+v", av)
 +	}
++}
++
++// TestLocalBrokerRelaysHardware: GPUs, CPU and Memory on a directory node reach
++// the enriched projection and the AvailableNode (NVIDIA #179 dropped them).
++func TestLocalBrokerRelaysHardware(t *testing.T) {
++	n := noderec.DirectoryNode{HostUUID: "h", Name: "n", GPUs: []noderec.GPUInfo{{Name: "g", VramBytes: 8}},
++		CPU: &noderec.CPUInfo{Name: "c", Cores: 4}, Memory: &noderec.MemoryInfo{TotalBytes: 16}}
++	e := directoryToEnriched(n)
++	require.Len(t, e.GPUs, 1)
++	av := storedNode{scanner: &e}.toAvailable(false)
++	assert.Equal(t, "c", av.CPU.Name)
++	assert.Equal(t, int64(16), int64(av.Memory.TotalBytes))
++	b, err := json.Marshal(av)
++	require.NoError(t, err)
++	assert.Contains(t, string(b), `"gpus"`)
 +}
 -- 
 2.53.0

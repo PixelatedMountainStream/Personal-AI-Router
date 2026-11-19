@@ -567,6 +567,7 @@ func (r *Registry) LoadFS(fsys fs.FS, root string) error {
 		// Remember the raw bundled JSON so LoadOverrideDir can deep-merge
 		// a per-user override onto it later.
 		r.bundledRaw[eng] = append([]byte(nil), data...)
+		r.overlayLocal(eng) // fork:E10
 	}
 	return nil
 }

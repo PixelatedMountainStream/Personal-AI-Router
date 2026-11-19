@@ -1,8 +1,7 @@
-From 55670f7bd1e75e04c3eb1829d64ef6e7216b0f3c Mon Sep 17 00:00:00 2001
+From b12458ce67cde2b0e72adb1ed0f25b68c272bd8c Mon Sep 17 00:00:00 2001
 From: "erik.hauan" <erik.hauan@radiantvs.com>
-Date: Thu, 12 Nov 2026 17:01:42 -0800
-Subject: [PATCH] proxy: slot-aware routing, affinity, JIT, residency behind
- P1-P9
+Date: Wed, 18 Nov 2026 18:11:46 -0800
+Subject: proxy: slot-aware routing, affinity, JIT, residency behind P1-P9
 
 Behaviour (unchanged from pre-step develop unless noted): residency-filtered
 candidates with 503 for an advertised but not-loaded model and model lookups
@@ -51,7 +50,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  services/nvpair-proxy/facade.go               |   1 +
  .../nvpair-proxy/local/affinity/affinity.go   | 114 +++
  .../local/affinity/affinity_test.go           |  44 +
- .../nvpair-proxy/local/capacity/capacity.go   | 347 ++++++++
+ .../nvpair-proxy/local/capacity/capacity.go   | 369 +++++++++
  .../nvpair-proxy/local/respnorm/respnorm.go   | 125 +++
  .../local/respnorm/respnorm_test.go           |  30 +
  .../nvpair-proxy/local/routing/notloaded.go   |  75 ++
@@ -69,7 +68,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  services/nvpair-proxy/local_slotscore_test.go | 311 +++++++
  services/nvpair-proxy/main.go                 |   1 +
  services/nvpair-proxy/proxy.go                |  47 +-
- 21 files changed, 3167 insertions(+), 3 deletions(-)
+ 21 files changed, 3189 insertions(+), 3 deletions(-)
  create mode 100644 services/nvpair-proxy/local/affinity/affinity.go
  create mode 100644 services/nvpair-proxy/local/affinity/affinity_test.go
  create mode 100644 services/nvpair-proxy/local/capacity/capacity.go
@@ -90,10 +89,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 services/nvpair-proxy/local_slotscore_test.go
 
 diff --git a/services/nvpair-proxy/facade.go b/services/nvpair-proxy/facade.go
-index b53cfa3..13431b1 100644
+index 6dd7de6..dfe1d8c 100644
 --- a/services/nvpair-proxy/facade.go
 +++ b/services/nvpair-proxy/facade.go
-@@ -327,6 +327,7 @@ func (f *facade) replaceSubscribed(params json.RawMessage) {
+@@ -333,6 +333,7 @@ func (f *facade) replaceSubscribed(params json.RawMessage) {
  		slog.Warn("invalid discovery:nodes snapshot", "err", err)
  		return
  	}
@@ -273,10 +272,10 @@ index 0000000..6f0d99e
 +}
 diff --git a/services/nvpair-proxy/local/capacity/capacity.go b/services/nvpair-proxy/local/capacity/capacity.go
 new file mode 100644
-index 0000000..d031287
+index 0000000..084696f
 --- /dev/null
 +++ b/services/nvpair-proxy/local/capacity/capacity.go
-@@ -0,0 +1,347 @@
+@@ -0,0 +1,369 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -290,6 +289,7 @@ index 0000000..d031287
 +	"encoding/json"
 +	"log/slog"
 +	"os"
++	"slices"
 +	"strconv"
 +	"strings"
 +	"sync"
@@ -612,17 +612,38 @@ index 0000000..d031287
 +}
 +
 +// ServedLoaded is the loaded set directory residency compares a request's
-+// model with. A loaded-only engine (vLLM by name, or any engine the node gives a
-+// downloadedByEngine entry; the name alone covers a failed disk-inventory read,
-+// which omits that entry) names its loadedByEngine models by --model root (NVIDIA #181),
-+// but a request names the served model, which is what its modelsByEngine
-+// advertises; a stopped one advertises nothing, so nothing is loaded. Any
-+// other engine keeps loadedByEngine.
++// model with. A loaded-only/available engine (vLLM by name, or any engine the
++// node gives a downloadedByEngine entry; the name alone covers a failed
++// disk-inventory read, which omits that entry) names its loadedByEngine models
++// by --model root (NVIDIA #181), but a request names the served model. Its
++// modelsByEngine is the whole available inventory (also while stopped), so it
++// is not the loaded set: only the loaded roots are translated. A root the
++// inventory lists serves as itself; otherwise it is served by the single
++// alias the inventory lists that is not a downloaded root (--served-model-name),
++// and with no such unique alias it stays the root. A node that relays
++// servedLoadedByEngine is used as reported instead. Any other engine keeps
++// loadedByEngine.
 +func ServedLoaded(n noderec.DirectoryNode, engine string, loaded []string) []string {
-+	if _, loadedOnly := n.DownloadedByEngine[engine]; loadedOnly || engine == engines.NameVLLM {
-+		return n.ModelsByEngine[engine]
++	if _, loadedOnly := n.DownloadedByEngine[engine]; !loadedOnly && engine != engines.NameVLLM {
++		return loaded
 +	}
-+	return loaded
++	if sv, ok := n.ServedLoadedByEngine[engine]; ok {
++		return sv // the engine's own served names; no inference
++	}
++	var aliases []string
++	for _, m := range n.ModelsByEngine[engine] {
++		if !slices.Contains(n.DownloadedByEngine[engine], m) {
++			aliases = append(aliases, m)
++		}
++	}
++	out := make([]string, 0, len(loaded))
++	for _, m := range loaded {
++		if !slices.Contains(n.ModelsByEngine[engine], m) && len(aliases) == 1 {
++			m = aliases[0]
++		}
++		out = append(out, m)
++	}
++	return out
 +}
 diff --git a/services/nvpair-proxy/local/respnorm/respnorm.go b/services/nvpair-proxy/local/respnorm/respnorm.go
 new file mode 100644
@@ -3343,10 +3364,10 @@ index ebfa902..b4a1624 100644
  	// the proxy serves only the loopback plaintext personality; once this node is
  	// a member the same listener also serves the pin-gated LAN mTLS ingress, and
 diff --git a/services/nvpair-proxy/proxy.go b/services/nvpair-proxy/proxy.go
-index 3448b8e..849531f 100644
+index 2da9ed5..4347fb2 100644
 --- a/services/nvpair-proxy/proxy.go
 +++ b/services/nvpair-proxy/proxy.go
-@@ -144,6 +144,8 @@ type RequestEvent struct {
+@@ -145,6 +145,8 @@ type RequestEvent struct {
  	Duration int64  `json:"duration_ms"`
  	TTFB     int64  `json:"ttfb_ms,omitempty"`
  	Error    string `json:"error,omitempty"`
@@ -3355,7 +3376,7 @@ index 3448b8e..849531f 100644
  }
  
  // Workload lifecycle method names (workload-manager spec 7). The proxy is
-@@ -405,6 +407,9 @@ type Proxy struct {
+@@ -414,6 +416,9 @@ type Proxy struct {
  	coolMu    sync.Mutex
  	coolUntil map[string]time.Time
  
@@ -3365,7 +3386,7 @@ index 3448b8e..849531f 100644
  	// transportMu guards the long-lived HTTP transports reused across forwards
  	// and model-list fetches. Allocating a new http.Transport per request
  	// defeats connection pooling and leaks idle sockets until GC.
-@@ -843,6 +848,8 @@ type candidate struct {
+@@ -853,6 +858,8 @@ type candidate struct {
  	id       string
  	url      *url.URL
  	peerUUID string
@@ -3374,7 +3395,7 @@ index 3448b8e..849531f 100644
  }
  
  // candidateTransport returns the reverse-proxy / model-list transport for a
-@@ -1148,7 +1155,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
+@@ -1183,7 +1190,7 @@ func (f *facade) serveModelList(w http.ResponseWriter, r *http.Request, matchedR
  				continue
  			}
  			seen[item.key] = item
@@ -3383,10 +3404,10 @@ index 3448b8e..849531f 100644
  		}
  	}
  	if !success {
-@@ -1197,11 +1204,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
- 	role, routed := f.profile.roleFor(r.Method, r.URL.Path)
- 	lookup := routed && role == roleModelLookupPOST
- 	bodyBytes, model := bufferBodyAndModel(r, lookup)
+@@ -1249,11 +1256,14 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+ 		}
+ 		slog.Warn("request body read error", "id", reqID, "err", bodyErr)
+ 	}
 +	bodyBytes = p.local.rewriteBody(r, bodyBytes) // fork:P4
  	routingModel := ""
  	if isInf || lookup {
@@ -3398,7 +3419,7 @@ index 3448b8e..849531f 100644
  	if cors.IsPreflight(r) {
  		targets := make([]cors.Target, 0, len(candidates))
  		for _, cand := range candidates {
-@@ -1220,7 +1230,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1272,7 +1282,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  		held  reservation
  	)
  	if isInf && model != "" {
@@ -3407,7 +3428,7 @@ index 3448b8e..849531f 100644
  	}
  	// Released exactly once, whichever way the request ends: normal unwind,
  	// client disconnect, or an early return below. Without this a node stays
-@@ -1235,6 +1245,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1287,6 +1297,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  		resMu.Lock()
  		defer resMu.Unlock()
  		held = p.moveReservation(held, nodeID)
@@ -3415,7 +3436,7 @@ index 3448b8e..849531f 100644
  	}
  	defer func() {
  		resMu.Lock()
-@@ -1272,6 +1283,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1324,6 +1335,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  				rejectionStatus = http.StatusNotFound
  			}
  		}
@@ -3423,7 +3444,7 @@ index 3448b8e..849531f 100644
  		slog.Warn("proxy request rejected",
  			"id", reqID, "method", r.Method, "path", r.URL.Path,
  			"remote", r.RemoteAddr, "reason", rejectionError)
-@@ -1462,6 +1474,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1519,6 +1531,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  			"duration_ms", time.Since(start).Milliseconds(),
  			"ttfb_ms", ttfbMs,
  			"err", reportErr,
@@ -3431,7 +3452,7 @@ index 3448b8e..849531f 100644
  		)
  
  		_ = f.notify("proxy/request", RequestEvent{
-@@ -1474,6 +1487,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1531,6 +1544,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  			Duration: time.Since(start).Milliseconds(),
  			TTFB:     ttfbMs,
  			Error:    reportErr,
@@ -3439,7 +3460,7 @@ index 3448b8e..849531f 100644
  		})
  
  		// Terminal workload transition pairs with the workload:started emitted
-@@ -1565,7 +1579,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1622,7 +1636,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  		defer resMu.Unlock()
  		p.releaseReservation(held)
  		var out []candidate
@@ -3448,7 +3469,7 @@ index 3448b8e..849531f 100644
  		return out
  	}
  
-@@ -1636,10 +1650,12 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1693,10 +1707,12 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  				break
  			}
  			round = f.resolveCandidates(routingModel)
@@ -3461,7 +3482,7 @@ index 3448b8e..849531f 100644
  			if len(round) == 0 {
  				// Every owner went away mid-flight. Not a rejection: keep
  				// waiting for one to come back. This consumes no attempt, which
-@@ -1648,6 +1664,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1705,6 +1721,11 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  			}
  		}
  		cand := round[next]
@@ -3473,7 +3494,7 @@ index 3448b8e..849531f 100644
  		next++
  		dispatches++
  		// lastPermitted means no further dispatch can happen, so this attempt's
-@@ -1662,6 +1683,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1719,6 +1740,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  		// a node for the whole first-content budget, and for that time it is
  		// the node under load. A same-node move is a no-op.
  		moveHeld(cand.id)
@@ -3481,7 +3502,7 @@ index 3448b8e..849531f 100644
  
  		// Each attempt runs on its own context, a child of the request's, so we
  		// can abandon this dispatch without touching the request itself. The
-@@ -1737,6 +1759,10 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1794,6 +1816,10 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  			// have arrived but before the body streams. That's both the retry
  			// decision point and, on commit, the time-to-first-byte boundary.
  			ModifyResponse: func(resp *http.Response) error {
@@ -3492,7 +3513,7 @@ index 3448b8e..849531f 100644
  				if !last && shouldRetry(resp.StatusCode) {
  					// Abort before streaming: ReverseProxy closes resp.Body and
  					// calls ErrorHandler with our sentinel, then we try next.
-@@ -1909,6 +1935,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1966,6 +1992,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  
  		proxy.ServeHTTP(sc, attemptReq)
  		cancelAttempt()
@@ -3500,7 +3521,7 @@ index 3448b8e..849531f 100644
  		// Record how this candidate behaved for the next request's ordering.
  		// Measured, not classified from the error: a dial failure is bounded by
  		// the much shorter dial timeout and a status-based retry commits a
-@@ -1937,6 +1964,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
+@@ -1999,6 +2026,7 @@ func (f *facade) handleHTTP(w http.ResponseWriter, r *http.Request) {
  			finalStatus = sc.status
  			committedSC = sc
  			committed = true
@@ -3508,15 +3529,15 @@ index 3448b8e..849531f 100644
  		}
  	}
  
-@@ -2098,6 +2126,7 @@ func (f *facade) resolveCandidates(model string) []candidate {
+@@ -2162,6 +2190,7 @@ func (f *facade) resolveCandidates(model string) []candidate {
  			return
  		}
  		seenHost[u.Host] = true
 +		seenHost[u.Host] = p.local.claimsHost(f, model, n.ID) // fork:P5
- 		out = append(out, candidate{
- 			id:       n.ID,
- 			url:      u,
-@@ -2148,6 +2177,8 @@ type reservation struct {
+ 		var availableModels []string
+ 		if f.profile.LoadOnRequest {
+ 			availableModels = append([]string{}, n.Models...)
+@@ -2218,6 +2247,8 @@ type reservation struct {
  	// held distinguishes "no reservation was taken" from "a reservation on the
  	// zero-value node", so release on the paths that never reserved is a no-op.
  	held bool
@@ -3525,7 +3546,7 @@ index 3448b8e..849531f 100644
  }
  
  // reserveCandidate atomically moves the least estimated loaded scheduler-listed
-@@ -2168,6 +2199,9 @@ type reservation struct {
+@@ -2238,6 +2269,9 @@ type reservation struct {
  // Process-wide is the point: two facades bursting at once are competing for the
  // same GPU, so a dispatch through either has to be visible to the other.
  func (p *Proxy) reserveCandidate(f *facade, candidates []candidate) ([]candidate, reservation) {
@@ -3535,7 +3556,7 @@ index 3448b8e..849531f 100644
  	if len(candidates) == 0 {
  		return candidates, reservation{}
  	}
-@@ -2339,6 +2373,9 @@ func (p *Proxy) releaseReservation(r reservation) {
+@@ -2409,6 +2443,9 @@ func (p *Proxy) releaseReservation(r reservation) {
  	}
  	p.priorityMu.Lock()
  	defer p.priorityMu.Unlock()
@@ -3545,7 +3566,7 @@ index 3448b8e..849531f 100644
  	if r.generation != p.appliedPriorityGeneration {
  		return
  	}
-@@ -2365,6 +2402,9 @@ func (p *Proxy) moveReservation(r reservation, nodeID string) reservation {
+@@ -2435,6 +2472,9 @@ func (p *Proxy) moveReservation(r reservation, nodeID string) reservation {
  	}
  	p.priorityMu.Lock()
  	defer p.priorityMu.Unlock()
@@ -3555,7 +3576,7 @@ index 3448b8e..849531f 100644
  	if r.generation == p.appliedPriorityGeneration {
  		if p.priorityReservations[r.nodeID] <= 1 {
  			delete(p.priorityReservations, r.nodeID)
-@@ -2673,6 +2713,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
+@@ -2743,6 +2783,7 @@ func (p *Proxy) setPriorityLocked(priority schedulerwire.Priority) int {
  	p.priorityPending = pending
  	p.priorityGPUPressure = gpuPressure
  	p.priorityReservations = make(map[string]int)
