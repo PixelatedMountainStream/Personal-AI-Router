@@ -779,7 +779,7 @@ func (e *Executor) catalogBytes(ctx context.Context, engine, model string) int64
 		return 0
 	}
 	act, ok := mf.Actions["catalog_sizes"]
-	if !ok || act.Result == nil {
+	if !ok || act.Result == nil || act.Result.Record == nil {
 		return 0
 	}
 	ctx, cancel := context.WithTimeout(ctx, modelsTimeout)
