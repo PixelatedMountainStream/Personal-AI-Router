@@ -335,14 +335,14 @@ func (e *Executor) victimsOf(snap []residentModel, req PinnedRequest) (victims [
 func (e *Executor) victimsOfSized(snap []residentModel, req PinnedRequest, targetBytes int64) (victims []Victim, targetSame bool) {
 	targetLarge := targetBytes <= 0 || isLargeModel(targetBytes, req.Model, e.largeModelBytes)
 	for _, r := range snap {
-		if r.Engine == req.Engine && r.Model == req.Model {
+		if r.Engine == req.Engine && sameModel(req.Engine, r.Model, req.Model) {
 			targetLarge = e.isLarge(r)
 			break
 		}
 	}
 	for _, r := range snap {
 		switch {
-		case r.Engine == req.Engine && r.Model == req.Model:
+		case r.Engine == req.Engine && sameModel(req.Engine, r.Model, req.Model):
 			// A different-params instance must go, or LM Studio adds "model:2".
 			if sameParams(r, req.LoadOpts) {
 				targetSame = true
@@ -392,7 +392,7 @@ func (e *Executor) confirmUncertain(ops *pinnedOps, snap []residentModel) bool {
 		return true
 	}
 	for _, r := range snap {
-		if r.Engine == eng && r.Model == model {
+		if r.Engine == eng && sameModel(eng, r.Model, model) {
 			e.uncertainAbsentSince = time.Time{}
 			if !r.Loading {
 				return release()
@@ -439,7 +439,7 @@ func (e *Executor) awaitLoaded(ctx context.Context, ops *pinnedOps, req PinnedRe
 		}
 		state := "absent"
 		for _, r := range snap {
-			if r.Engine == req.Engine && r.Model == req.Model {
+			if r.Engine == req.Engine && sameModel(req.Engine, r.Model, req.Model) {
 				state = "loaded"
 				if r.Loading {
 					state = "loading"
@@ -557,7 +557,7 @@ func (e *Executor) confirmGone(ctx context.Context, ops *pinnedOps, req PinnedRe
 		}
 		for _, r := range snap {
 			for _, v := range victims {
-				if r.Engine == v.Engine && r.Model == v.Model && !seen[v.Engine+"/"+v.Model] {
+				if r.Engine == v.Engine && sameModel(v.Engine, r.Model, v.Model) && !seen[v.Engine+"/"+v.Model] {
 					seen[v.Engine+"/"+v.Model] = true
 					remain = append(remain, r.victim())
 				}
@@ -757,7 +757,7 @@ func (e *Executor) checkMultiLarge(ctx context.Context, res ModelsResult) {
 // is resident, or when no verified size is available).
 func (e *Executor) coldTargetBytes(ctx context.Context, ops *pinnedOps, snap []residentModel, req PinnedRequest) int64 {
 	for _, r := range snap {
-		if r.Engine == req.Engine && r.Model == req.Model {
+		if r.Engine == req.Engine && sameModel(req.Engine, r.Model, req.Model) {
 			return 0
 		}
 	}
@@ -788,9 +788,20 @@ func (e *Executor) catalogBytes(ctx context.Context, engine, model string) int64
 	}
 	sizes, _ := extractRecords(raw, act.Result)
 	for k, v := range sizes {
-		if k == model {
+		if sameModel(engine, k, model) {
 			return v.Bytes
 		}
 	}
 	return 0
 }
+
+// normModel applies the engine's implicit-tag rule: an Ollama name without a
+// tag means ":latest".
+func normModel(engine, model string) string {
+	if engine == "ollama" && model != "" && !strings.Contains(model[strings.LastIndex(model, "/")+1:], ":") {
+		return model + ":latest"
+	}
+	return model
+}
+
+func sameModel(engine, a, b string) bool { return normModel(engine, a) == normModel(engine, b) }

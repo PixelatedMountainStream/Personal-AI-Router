@@ -23,3 +23,16 @@ func TestColdTargetSizing(t *testing.T) {
 		t.Fatalf("verified small target victims %v", v)
 	}
 }
+
+func TestOllamaImplicitTag(t *testing.T) {
+	ex := newTestExecutor(t, testEngineManifest(fakeEngineBin))
+	ex.largeModelBytes = 12 * gib
+	snap := []residentModel{{Engine: "ollama", Model: "model-27b:latest", Bytes: 16 * gib}}
+	v, same := ex.victimsOfSized(snap, PinnedRequest{Engine: "ollama", Model: "model-27b"}, 0)
+	if !same || len(v) != 0 {
+		t.Fatalf("model-27b must match resident :latest: victims %v same=%v", v, same)
+	}
+	if !sameModel("ollama", "org/m", "org/m:latest") || sameModel("lmstudio", "m", "m:latest") {
+		t.Fatal("normalisation must be Ollama-only")
+	}
+}
