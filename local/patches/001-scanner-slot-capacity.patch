@@ -1,8 +1,8 @@
-From aea7270d7259ca9b6dbb79067e4aefcc35c5dff4 Mon Sep 17 00:00:00 2001
+From 3d5bded7030ab90a24e3b8bb1709b492ad45681f Mon Sep 17 00:00:00 2001
 From: "erik.hauan" <erik.hauan@radiantvs.com>
-Date: Thu, 12 Nov 2026 15:26:23 -0800
-Subject: [PATCH] node-scanner, noderec: slot capacity, jit_load and
- observed-at on NVIDIA's modelInventory behind S1/S4/S5/S8
+Date: Wed, 18 Nov 2026 18:11:45 -0800
+Subject: node-scanner, noderec: slot capacity, jit_load and observed-at on
+ NVIDIA's modelInventory behind S1/S4/S5/S8
 
 Behaviour: the scanner decodes slotsByEngine and jitLoadByEngine from a
 node's /v1/models in the same pass as NVIDIA's fields and stamps the fetch
@@ -34,17 +34,17 @@ local/patches/001-scanner-slot-capacity.patch.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- services/nvpair-node-scanner/daemon.go        |  8 ++
+ services/nvpair-node-scanner/daemon.go        |  7 ++
  services/nvpair-node-scanner/directory.go     |  1 +
  services/nvpair-node-scanner/enrich_hosts.go  |  1 +
- .../nvpair-node-scanner/local_capacity.go     | 89 +++++++++++++++++++
- services/nvpair-node-scanner/local_s4_test.go | 30 +++++++
+ .../nvpair-node-scanner/local_capacity.go     | 92 +++++++++++++++++++
+ services/nvpair-node-scanner/local_s4_test.go | 42 +++++++++
  services/nvpair-node-scanner/local_s5_test.go | 27 ++++++
- services/nvpair-node-scanner/local_s8_test.go | 65 ++++++++++++++
- services/shared/noderec/local_ext.go          | 39 ++++++++
+ services/nvpair-node-scanner/local_s8_test.go | 65 +++++++++++++
+ services/shared/noderec/local_ext.go          | 43 +++++++++
  services/shared/noderec/local_s1_test.go      | 24 +++++
  services/shared/noderec/noderec.go            |  2 +
- 10 files changed, 286 insertions(+)
+ 10 files changed, 304 insertions(+)
  create mode 100644 services/nvpair-node-scanner/local_capacity.go
  create mode 100644 services/nvpair-node-scanner/local_s4_test.go
  create mode 100644 services/nvpair-node-scanner/local_s5_test.go
@@ -53,43 +53,35 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 services/shared/noderec/local_s1_test.go
 
 diff --git a/services/nvpair-node-scanner/daemon.go b/services/nvpair-node-scanner/daemon.go
-index f386548..d88ec52 100644
+index b6c3765..2b93553 100644
 --- a/services/nvpair-node-scanner/daemon.go
 +++ b/services/nvpair-node-scanner/daemon.go
-@@ -102,6 +102,8 @@ type daemon struct {
- 	lastInfo      map[string]NodeInfoResponse
- 	lastInfoAt    map[string]time.Time
- 	lastInventory map[string]modelInventory
+@@ -96,6 +96,8 @@ type daemon struct {
+ 	// record, including after its UUID changes. Guarded by peerMu. Remote models
+ 	// stay in the directory.
+ 	localModels modelInventory
 +	// fork:S4
 +	local *localScanState
- 	// nodeInfoDown holds the nodes whose last node-info enrichment failed, so
- 	// the outage is reported when it starts and when it ends rather than once
- 	// per sweep. Guarded by infoMu with the caches it explains: the reason a
-@@ -358,6 +360,7 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string, tlsHTTP
- 		lastInfo:       make(map[string]NodeInfoResponse),
- 		lastInfoAt:     make(map[string]time.Time),
- 		lastInventory:  make(map[string]modelInventory),
-+		local:          newLocalScanState(), // fork:S4
- 		nodeInfoDown:   make(map[string]bool),
- 		lastActivityAt: make(map[string]time.Time),
- 	}
-@@ -1324,6 +1327,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
- 		d.cacheInventory(node.HostUUID, inventory)
- 		d.infoMu.Unlock()
- 		inventory.applyTo(node)
-+		inventory.local.applyTo(node) // fork:S4
- 		return
- 	}
- 	d.infoMu.Lock()
-@@ -1331,6 +1335,7 @@ func (d *daemon) enrichModelsCandidates(node *noderec.DirectoryNode, hosts []str
- 	d.infoMu.Unlock()
- 	if had {
- 		cached.applyTo(node)
-+		cached.local.applyTo(node) // fork:S4
- 	}
- }
  
-@@ -1381,6 +1386,8 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
+ 	// activityMu guards lastActivityAt, when each peer was last seen returning
+ 	// inference response bytes to one of this node's proxies (keyed by hostUuid,
+@@ -335,6 +337,7 @@ func newDaemon(codec *Codec, mesh *clustertrust.Mesh, clusterDir string) *daemon
+ 		candidates:      make(map[string]*discoveryCandidate),
+ 		authWake:        make(chan struct{}, 1),
+ 		nodeInfoStatus:  make(map[string]peerInfoStatus),
++		local:           newLocalScanState(), // fork:S4
+ 		lastActivityAt:  make(map[string]time.Time),
+ 	}
+ 	// Track connection candidates independently of identity claims. Promoted
+@@ -1031,6 +1034,7 @@ func (d *daemon) publishSelfLocked() {
+ 	defer d.peerMu.Unlock()
+ 	if node.HasService(noderec.ServiceEngineManager) {
+ 		d.localModels.applyTo(&node)
++		d.localModels.local.applyTo(&node) // fork:S4
+ 	}
+ 
+ 	method := noderec.NotifyNodeUpdated
+@@ -1186,6 +1190,8 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
  		ModelsByEngine     map[string][]string `json:"modelsByEngine"`
  		LoadedByEngine     map[string][]string `json:"loadedByEngine"`
  		DownloadedByEngine map[string][]string `json:"downloadedByEngine"`
@@ -98,19 +90,19 @@ index f386548..d88ec52 100644
  	}
  	reader := io.LimitReader(resp.Body, modelsMaxResponseBytes)
  	if err := json.NewDecoder(reader).Decode(&body); err != nil {
-@@ -1391,6 +1398,7 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
- 		byEngine:           body.ModelsByEngine,
- 		loadedByEngine:     body.LoadedByEngine,
+@@ -1194,6 +1200,7 @@ func (d *daemon) fetchModels(ip string, port int, clusterUUID string) (modelInve
+ 	inventory := modelInventory{
+ 		models: body.Models, byEngine: body.ModelsByEngine, loadedByEngine: body.LoadedByEngine,
  		downloadedByEngine: body.DownloadedByEngine,
 +		local:              d.local.ext(body.localModelsWire), // fork:S8
- 	}, true
- }
- 
+ 	}
+ 	if scheme == "https" {
+ 		d.mesh.Refresh()
 diff --git a/services/nvpair-node-scanner/directory.go b/services/nvpair-node-scanner/directory.go
-index 1ddc9f9..b769203 100644
+index 74f4fd3..1a85a35 100644
 --- a/services/nvpair-node-scanner/directory.go
 +++ b/services/nvpair-node-scanner/directory.go
-@@ -251,6 +251,7 @@ func (d *directory) snapshot(filter noderec.ServiceKey) []noderec.DirectoryNode
+@@ -220,6 +220,7 @@ func (d *directory) applyLocalInfo(info noderec.NodeInfo) (noderec.DirectoryNode
  func (d *directory) applyModels(hostUUID, ip string, emPort int, inventory modelInventory) (node noderec.DirectoryNode, changed, ok bool) {
  	d.mu.Lock()
  	defer d.mu.Unlock()
@@ -119,23 +111,23 @@ index 1ddc9f9..b769203 100644
  	if !present {
  		return noderec.DirectoryNode{}, false, false
 diff --git a/services/nvpair-node-scanner/enrich_hosts.go b/services/nvpair-node-scanner/enrich_hosts.go
-index 715328c..b7e15f0 100644
+index 5fe6987..315dc79 100644
 --- a/services/nvpair-node-scanner/enrich_hosts.go
 +++ b/services/nvpair-node-scanner/enrich_hosts.go
-@@ -18,6 +18,7 @@ type modelInventory struct {
- 	byEngine           map[string][]string
+@@ -20,6 +20,7 @@ type modelInventory struct {
  	loadedByEngine     map[string][]string
  	downloadedByEngine map[string][]string
+ 	certificate        *x509.Certificate
 +	local              modelInventoryExt // fork:S8
  }
  
  // applyTo copies the inventory onto a directory entry's model fields.
 diff --git a/services/nvpair-node-scanner/local_capacity.go b/services/nvpair-node-scanner/local_capacity.go
 new file mode 100644
-index 0000000..7838545
+index 0000000..7ab613c
 --- /dev/null
 +++ b/services/nvpair-node-scanner/local_capacity.go
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,92 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -157,12 +149,13 @@ index 0000000..7838545
 +type modelInventoryExt struct {
 +	slotsByEngine map[string]map[string]noderec.SlotInfo
 +	jitByEngine   map[string]bool
++	servedLoaded  map[string][]string
 +	observedAt    int64
 +}
 +
 +// node is the extension published on a directory entry.
 +func (x modelInventoryExt) node() noderec.LocalNodeExt {
-+	return noderec.LocalNodeExt{SlotsByEngine: x.slotsByEngine, JITLoadByEngine: x.jitByEngine, ModelsObservedAt: x.observedAt}
++	return noderec.LocalNodeExt{SlotsByEngine: x.slotsByEngine, JITLoadByEngine: x.jitByEngine, ServedLoadedByEngine: x.servedLoaded, ModelsObservedAt: x.observedAt}
 +}
 +
 +// applyTo publishes the extension on a directory entry, alongside upstream's
@@ -174,8 +167,9 @@ index 0000000..7838545
 +// localModelsWire is embedded in fetchModels' decode struct (seam S8), so the
 +// fork's /v1/models keys decode in the same pass as upstream's.
 +type localModelsWire struct {
-+	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine"`
-+	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine"`
++	SlotsByEngine        map[string]map[string]noderec.SlotInfo `json:"slotsByEngine"`
++	JITLoadByEngine      map[string]bool                        `json:"jitLoadByEngine"`
++	ServedLoadedByEngine map[string][]string                    `json:"servedLoadedByEngine"`
 +}
 +
 +// localScanState is the daemon's fork state (seam S4). Its only job since
@@ -192,7 +186,7 @@ index 0000000..7838545
 +
 +// ext builds a fetch's extension from the decoded fork keys (seam S8).
 +func (s *localScanState) ext(w localModelsWire) modelInventoryExt {
-+	x := modelInventoryExt{slotsByEngine: w.SlotsByEngine, jitByEngine: w.JITLoadByEngine}
++	x := modelInventoryExt{slotsByEngine: w.SlotsByEngine, jitByEngine: w.JITLoadByEngine, servedLoaded: w.ServedLoadedByEngine}
 +	if s != nil {
 +		x.observedAt = s.now().UnixMilli()
 +	}
@@ -218,6 +212,7 @@ index 0000000..7838545
 +	n, x := d.nodes[hostUUID], inv.local
 +	if !*changed && reflect.DeepEqual(n.SlotsByEngine, x.slotsByEngine) &&
 +		reflect.DeepEqual(n.JITLoadByEngine, x.jitByEngine) &&
++		reflect.DeepEqual(n.ServedLoadedByEngine, x.servedLoaded) &&
 +		x.observedAt-n.ModelsObservedAt < modelsObservedHeartbeat.Milliseconds() {
 +		return
 +	}
@@ -227,20 +222,20 @@ index 0000000..7838545
 +}
 diff --git a/services/nvpair-node-scanner/local_s4_test.go b/services/nvpair-node-scanner/local_s4_test.go
 new file mode 100644
-index 0000000..34ddee9
+index 0000000..33bd32e
 --- /dev/null
 +++ b/services/nvpair-node-scanner/local_s4_test.go
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,42 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
 +package main
 +
 +import (
-+	"net/http"
 +	"testing"
 +
 +	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
 +
 +	"nvpair-shared/noderec"
 +)
@@ -253,13 +248,25 @@ index 0000000..34ddee9
 +	var n0 noderec.DirectoryNode
 +	modelInventoryExt{}.applyTo(&n0)
 +	assert.Zero(t, n0.LocalNodeExt)
-+	d := newRefreshTestDaemon()
-+	_, port := startModelsStub(t, http.StatusOK, map[string]any{"models": []string{"a"}})
-+	n := noderec.DirectoryNode{HostUUID: "p", Services: map[noderec.ServiceKey]noderec.ServiceStatus{
-+		noderec.ServiceEngineManager: {Port: port}}}
-+	d.enrichModelsCandidates(&n, []string{"127.0.0.1"})
-+	assert.Equal(t, []string{"a"}, n.Models)
++	d := newSelfTestDaemon("self", "127.0.0.1")
++	require.Nil(t, d.local)
++	d.reg.register(noderec.RegisterParams{Service: noderec.ServiceEngineManager, Port: 1})
++	d.publishSelf()
++	n, ok := d.dir.get("self")
++	require.True(t, ok)
 +	assert.Zero(t, n.LocalNodeExt)
++}
++
++// TestLocalPublishSelfCarriesExt: the owned inventory's extension is published
++// on the local record (S4).
++func TestLocalPublishSelfCarriesExt(t *testing.T) {
++	d := newSelfTestDaemon("self", "127.0.0.1")
++	d.reg.register(noderec.RegisterParams{Service: noderec.ServiceEngineManager, Port: 1})
++	d.localModels = modelInventory{local: modelInventoryExt{jitByEngine: map[string]bool{"lmstudio": true}, observedAt: 7}}
++	d.publishSelf()
++	n, _ := d.dir.get("self")
++	assert.True(t, n.JITLoadByEngine["lmstudio"])
++	assert.Equal(t, int64(7), n.ModelsObservedAt)
 +}
 diff --git a/services/nvpair-node-scanner/local_s5_test.go b/services/nvpair-node-scanner/local_s5_test.go
 new file mode 100644
@@ -296,7 +303,7 @@ index 0000000..c666678
 +}
 diff --git a/services/nvpair-node-scanner/local_s8_test.go b/services/nvpair-node-scanner/local_s8_test.go
 new file mode 100644
-index 0000000..0c9f234
+index 0000000..2d11528
 --- /dev/null
 +++ b/services/nvpair-node-scanner/local_s8_test.go
 @@ -0,0 +1,65 @@
@@ -328,11 +335,11 @@ index 0000000..0c9f234
 +	require.True(t, ok)
 +	assert.Zero(t, inv.local, "upstream-shaped answer must give a zero extension")
 +	seedEMNode(d, "p", "127.0.0.1", port)
-+	assert.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "first populate")
-+	assert.False(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "identical sweep")
++	assert.True(t, refreshUUID(d, "p"), "first populate")
++	assert.False(t, refreshUUID(d, "p"), "identical sweep")
 +	body["downloadedByEngine"] = map[string][]string{"vllm": {"a", "b"}}
 +	stub.set(http.StatusOK, body)
-+	assert.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "downloadedByEngine-only change")
++	assert.True(t, refreshUUID(d, "p"), "downloadedByEngine-only change")
 +	got, _ := d.dir.get("p")
 +	assert.Equal(t, []string{"a", "b"}, got.DownloadedByEngine["vllm"])
 +	assert.Zero(t, got.LocalNodeExt)
@@ -346,16 +353,16 @@ index 0000000..0c9f234
 +	body := slotBody(2, false)
 +	stub, port := startModelsStub(t, http.StatusOK, body)
 +	seedEMNode(d, "p", "127.0.0.1", port)
-+	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""))
++	require.True(t, refreshUUID(d, "p"))
 +	body["downloadedByEngine"] = map[string][]string{"lmstudio": {"a", "z"}}
 +	stub.set(http.StatusOK, body)
-+	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "downloaded-only change")
++	require.True(t, refreshUUID(d, "p"), "downloaded-only change")
 +	got, _ := d.dir.get("p")
 +	assert.Equal(t, []string{"a", "z"}, got.DownloadedByEngine["lmstudio"])
 +	assert.Equal(t, 2, got.SlotsByEngine["lmstudio"]["a"].Slots)
 +	assert.NotZero(t, got.ModelsObservedAt)
 +	stub.set(http.StatusOK, mergeBody(slotBody(5, false), "downloadedByEngine", body["downloadedByEngine"]))
-+	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""), "capacity-only change")
++	require.True(t, refreshUUID(d, "p"), "capacity-only change")
 +	got, _ = d.dir.get("p")
 +	assert.Equal(t, 5, got.SlotsByEngine["lmstudio"]["a"].Slots)
 +	assert.Equal(t, []string{"a", "z"}, got.DownloadedByEngine["lmstudio"])
@@ -367,10 +374,10 @@ index 0000000..0c9f234
 +}
 diff --git a/services/shared/noderec/local_ext.go b/services/shared/noderec/local_ext.go
 new file mode 100644
-index 0000000..fc9c596
+index 0000000..2c08b54
 --- /dev/null
 +++ b/services/shared/noderec/local_ext.go
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,43 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -391,6 +398,10 @@ index 0000000..fc9c596
 +	// default (see DefaultJITLoad). A missing engine key means the peer did not
 +	// say; treat as the engine default.
 +	JITLoadByEngine map[string]bool `json:"jitLoadByEngine,omitempty"`
++	// ServedLoadedByEngine is the names a loaded-only engine (vLLM) serves its
++	// loaded models under, as the engine reported them. Absent on older peers
++	// (the proxy then infers from the inventory).
++	ServedLoadedByEngine map[string][]string `json:"servedLoadedByEngine,omitempty"`
 +	// ModelsObservedAt is when (Unix milliseconds) the scanner last completed a
 +	// successful models fetch for this node, whether or not the inventory
 +	// changed. An unchanged sweep advances it only once it is 30s ahead of the
@@ -441,10 +452,10 @@ index 0000000..1857619
 +	}
 +}
 diff --git a/services/shared/noderec/noderec.go b/services/shared/noderec/noderec.go
-index bd908a9..b5e1fd1 100644
+index 258aef7..eb436ed 100644
 --- a/services/shared/noderec/noderec.go
 +++ b/services/shared/noderec/noderec.go
-@@ -526,6 +526,8 @@ type DirectoryNode struct {
+@@ -665,6 +665,8 @@ type DirectoryNode struct {
  	// field; omitted when no engine reports one.
  	DownloadedByEngine map[string][]string `json:"downloadedByEngine,omitempty"`
  	LastSeen           int64               `json:"lastSeen"` // Unix seconds
@@ -452,7 +463,7 @@ index bd908a9..b5e1fd1 100644
 +	LocalNodeExt
  }
  
- // Clustered reports whether the node advertises a cluster identity.
+ // Equals compares directory state, including hardware identity and capacity,
 -- 
 2.53.0
 
