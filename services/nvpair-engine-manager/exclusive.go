@@ -99,6 +99,9 @@ type pinnedOps struct {
 	applied  func(ctx context.Context, engine, model string) (SlotInfo, bool)
 	// running reports whether the engine process is up; nil means "assume yes".
 	running func(engine string) bool
+	// targetBytes reports a model's verified on-disk size (0 = unknown); nil
+	// means unknown.
+	targetBytes func(ctx context.Context, engine, model string) int64
 }
 
 func (e *Executor) pinnedOps() *pinnedOps {
@@ -123,6 +126,7 @@ func (e *Executor) pinnedOps() *pinnedOps {
 			si, ok := e.ModelsResult(ctx).SlotsByEngine[engine][model]
 			return si, ok
 		},
+		targetBytes: e.catalogBytes,
 		running: func(engine string) bool {
 			st, err := e.state(engine)
 			if err != nil {
@@ -322,7 +326,14 @@ func (e *Executor) residentFrom(ctx context.Context, res ModelsResult) []residen
 // victimsOf returns what must be unloaded before req can load, and whether the
 // target is already resident with the requested parameters.
 func (e *Executor) victimsOf(snap []residentModel, req PinnedRequest) (victims []Victim, targetSame bool) {
-	targetLarge := isLargeModel(0, req.Model, e.largeModelBytes)
+	return e.victimsOfSized(snap, req, 0)
+}
+
+// victimsOfSized is victimsOf with the cold target's verified on-disk size
+// (0 = unverified). A cold target whose size is unverified counts as large: its
+// name token is not evidence of a small size ("model-14b" can exceed 12 GiB).
+func (e *Executor) victimsOfSized(snap []residentModel, req PinnedRequest, targetBytes int64) (victims []Victim, targetSame bool) {
+	targetLarge := targetBytes <= 0 || isLargeModel(targetBytes, req.Model, e.largeModelBytes)
 	for _, r := range snap {
 		if r.Engine == req.Engine && r.Model == req.Model {
 			targetLarge = e.isLarge(r)
@@ -472,7 +483,8 @@ func (e *Executor) exclusiveRun(ctx context.Context, req PinnedRequest, load fun
 	if err != nil {
 		return PinnedResult{}, err
 	}
-	victims, same := e.victimsOf(snap, req)
+	targetBytes := e.coldTargetBytes(ctx, ops, snap, req)
+	victims, same := e.victimsOfSized(snap, req, targetBytes)
 	res := PinnedResult{Engine: req.Engine, Model: req.Model, Applied: req.LoadOpts, Unloaded: []Victim{}}
 	if len(victims) == 0 && same {
 		res.AlreadyLoaded = true
@@ -490,7 +502,7 @@ func (e *Executor) exclusiveRun(ctx context.Context, req PinnedRequest, load fun
 			}
 			res.Unloaded = append(res.Unloaded, v)
 		}
-		same, err = e.confirmGone(ctx, ops, req, victims)
+		same, err = e.confirmGone(ctx, ops, req, victims, targetBytes)
 		if err != nil {
 			return PinnedResult{}, err
 		}
@@ -521,7 +533,7 @@ func (e *Executor) exclusiveRun(ctx context.Context, req PinnedRequest, load fun
 // large is resident, all within one confirm deadline that also bounds each
 // snapshot. An empty result after the deadline does not count. It returns
 // whether the target is now resident with the requested parameters.
-func (e *Executor) confirmGone(ctx context.Context, ops *pinnedOps, req PinnedRequest, victims []Victim) (bool, error) {
+func (e *Executor) confirmGone(ctx context.Context, ops *pinnedOps, req PinnedRequest, victims []Victim, targetBytes int64) (bool, error) {
 	deadline := time.Now().Add(e.unloadConfirmTimeout)
 	dctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
@@ -538,7 +550,7 @@ func (e *Executor) confirmGone(ctx context.Context, ops *pinnedOps, req PinnedRe
 			}
 			return false, &pinnedError{Status: http.StatusBadGateway, Message: err.Error()}
 		}
-		remain, same := e.victimsOf(snap, req)
+		remain, same := e.victimsOfSized(snap, req, targetBytes)
 		seen := map[string]bool{}
 		for _, v := range remain {
 			seen[v.Engine+"/"+v.Model] = true
@@ -739,4 +751,46 @@ func (e *Executor) checkMultiLarge(ctx context.Context, res ModelsResult) {
 		}
 	}
 	e.observeLarge(large)
+}
+
+// coldTargetBytes resolves the size of a target that is not resident (0 when it
+// is resident, or when no verified size is available).
+func (e *Executor) coldTargetBytes(ctx context.Context, ops *pinnedOps, snap []residentModel, req PinnedRequest) int64 {
+	for _, r := range snap {
+		if r.Engine == req.Engine && r.Model == req.Model {
+			return 0
+		}
+	}
+	if ops.targetBytes == nil || req.Model == "" {
+		return 0
+	}
+	return ops.targetBytes(ctx, req.Engine, req.Model)
+}
+
+// catalogBytes reads a model's size from the engine's catalog_sizes action (all
+// downloaded models, not just loaded ones). 0 = engine declares none or the
+// model is not listed.
+func (e *Executor) catalogBytes(ctx context.Context, engine, model string) int64 {
+	mf, ok := e.reg.Get(engine)
+	if !ok {
+		return 0
+	}
+	act, ok := mf.Actions["catalog_sizes"]
+	if !ok || act.Result == nil {
+		return 0
+	}
+	ctx, cancel := context.WithTimeout(ctx, modelsTimeout)
+	defer cancel()
+	raw, err := e.Action(ctx, engine, "catalog_sizes", nil)
+	if err != nil {
+		slog.Debug("catalog_sizes failed", "engine", engine, "err", err)
+		return 0
+	}
+	sizes, _ := extractRecords(raw, act.Result)
+	for k, v := range sizes {
+		if k == model {
+			return v.Bytes
+		}
+	}
+	return 0
 }

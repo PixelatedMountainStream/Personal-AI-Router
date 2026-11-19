@@ -353,6 +353,11 @@ as large; `bytes` is a third `result.record` key beside `slots` and `ctx`, and a
 record may declare `bytes` without `slots`. Ollama reads `/api/ps` `size`, LM
 Studio `/api/v1/models` `size_bytes`; llama.cpp declares none (name rule applies).
 
+An optional **`catalog_sizes`** action has the same shape but lists every downloaded
+model (no `match`), so a pinned load can size a cold target before choosing victims
+(Ollama `/api/tags`, LM Studio `/api/v1/models`). A cold target with no verified size
+counts as large.
+
 An optional **`model_resolution`** expands or resolves the `{model}`
 placeholder before the action runs:
 

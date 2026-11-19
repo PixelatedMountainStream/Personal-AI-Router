@@ -81,6 +81,11 @@
       "http": { "method": "GET", "path": "/api/v1/models" },
       "result": { "array": "models", "field": "key", "each": "loaded_instances", "match": { "field": "loaded_instances", "nonempty": true }, "record": { "fields": { "slots": "loaded_instances.0.config.parallel", "ctx": "loaded_instances.0.config.context_length" } } }
     },
+    "catalog_sizes": {
+      "description": "Size in bytes of every downloaded model (/api/v1/models models[].size_bytes); lets a pinned load size a cold target.",
+      "http": { "method": "GET", "path": "/api/v1/models" },
+      "result": { "array": "models", "field": "key", "record": { "fields": { "bytes": "size_bytes" } } }
+    },
     "model_sizes": {
       "description": "Size in bytes of each loaded model (/api/v1/models models[].size_bytes, filtered to loaded_instances nonempty).",
       "http": { "method": "GET", "path": "/api/v1/models" },
