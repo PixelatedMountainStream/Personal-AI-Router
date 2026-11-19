@@ -44,7 +44,7 @@ func TestResidentTargetKeepsClassThroughUnload(t *testing.T) {
 	ex.largeModelBytes = 12 * gib
 	small := residentModel{Engine: "lmstudio", Model: "small", Bytes: 2 * gib}
 	big := residentModel{Engine: "lmstudio", Model: "big", Bytes: 20 * gib}
-	req := PinnedRequest{Engine: "lmstudio", Model: "small", Evict: true}
+	req := PinnedRequest{Engine: "lmstudio", Model: "small", Evict: true, LoadOpts: LoadOpts{ContextLength: 8192}}
 	tb := ex.coldTargetBytes(t.Context(), &pinnedOps{}, []residentModel{small, big}, req)
 	if v, _ := ex.victimsOfSized([]residentModel{small, big}, req, tb); len(v) != 1 || v[0].Model != "small" {
 		t.Fatalf("resident victims %v", v)
