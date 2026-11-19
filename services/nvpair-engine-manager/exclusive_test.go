@@ -396,3 +396,26 @@ func TestLMStudioInstancesAreResidentAndVictims(t *testing.T) {
 		}
 	})
 }
+
+// vLLM --model org/model-27b --served-model-name chat: residency is by root, so
+// the alias neither hides the 27B size nor breaks already_loaded.
+func TestResidencyUsesInventoryFieldRoot(t *testing.T) {
+	spec := &ActionResult{Array: "data", Field: "id", InventoryField: "root"}
+	raw := []byte(`{"data":[{"id":"chat","root":"org/model-27b"}]}`)
+	loaded, err := extractLoadedStrict(raw, residencySpec(spec))
+	if err != nil || len(loaded) != 1 || loaded[0] != "org/model-27b" {
+		t.Fatalf("loaded %v err %v", loaded, err)
+	}
+	ex := newTestExecutor(t, testEngineManifest(fakeEngineBin))
+	ex.largeModelBytes = 12 * gib
+	snap := []residentModel{{Engine: "vllm", Model: loaded[0]}}
+	if _, same := ex.victimsOf(snap, PinnedRequest{Engine: "vllm", Model: "org/model-27b"}); !same {
+		t.Fatal("aliased root should be already loaded")
+	}
+	if v, _ := ex.victimsOf(snap, PinnedRequest{Engine: "ollama", Model: "other-30b"}); len(v) != 1 {
+		t.Fatalf("27b root must be a large victim, got %v", v)
+	}
+	if isLargeModel(0, "chat", 12*gib) != true || !isLargeModel(0, loaded[0], 12*gib) {
+		t.Fatal("size classification via root")
+	}
+}

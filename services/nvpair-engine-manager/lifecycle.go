@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,8 +96,17 @@ func (e *Executor) StartWith(ctx context.Context, engine string, opts startOpts)
 	if err != nil {
 		return err
 	}
-	st.opMu.Lock()
-	defer st.opMu.Unlock()
+	st.lockOperation()
+	defer st.unlockOperation()
+	st.mu.Lock()
+	st.enabling = true
+	st.mu.Unlock()
+	defer func() {
+		st.mu.Lock()
+		st.enabling = false
+		st.mu.Unlock()
+		e.emitState(engine)
+	}()
 	if err := e.doStart(ctx, st, engine, opts); err != nil {
 		return e.startStopped(st, err)
 	}
@@ -207,6 +217,15 @@ func (e *Executor) doStart(ctx context.Context, st *engineState, engine string, 
 	if flag := modelLaunchFlag(st.manifest); flag != "" {
 		tokens, err := parseLaunchText(e.launchStateLocked(engine, st).LaunchText)
 		if model, _ := launchFlagValue(tokens, flag); err == nil && model == "" {
+			if rt.WaitForModel {
+				st.mu.Lock()
+				st.awaitingModel = true
+				st.stopping = false
+				st.port = port
+				st.mu.Unlock()
+				e.emitState(engine)
+				return nil
+			}
 			return refuse(fmt.Errorf("%s has no model selected; load a model to start it", st.manifest.DisplayName))
 		}
 	}
@@ -223,6 +242,7 @@ func (e *Executor) doStart(ctx context.Context, st *engineState, engine string, 
 	st.mu.Lock()
 	st.port = port
 	st.stopping = false
+	st.awaitingModel = false
 	st.starting = true
 	st.mu.Unlock()
 	e.emitState(engine)
@@ -372,7 +392,7 @@ func (e *Executor) bringUpProcess(ctx context.Context, st *engineState, engine s
 		st.mu.Lock()
 		st.proc = nil
 		st.mu.Unlock()
-		werr := fmt.Errorf("engine %q did not become ready: %w", engine, diagnostics.failure(err))
+		werr := fmt.Errorf("engine %q did not become ready: %w", engine, diagnostics.failure(ctx, err))
 		e.reportStartFailedUnlessShuttingDown(ctx, engine, werr)
 		e.emitState(engine)
 		return werr
@@ -403,6 +423,9 @@ func (e *Executor) bringUpCommand(ctx context.Context, st *engineState, engine s
 			return errors.Join(startErr, fmt.Errorf("clean up failed %s start: %w", engine, stopErr))
 		}
 		return startErr
+	}
+	if engine == "lmstudio" && rt.CLI != "" {
+		e.startLMStudioHost(ctx, expandPath(rt.CLI))
 	}
 	for index := range rt.Start {
 		launch, err := resolveRuntimeCommand(rt, index, vars)
@@ -470,7 +493,7 @@ func runPrivateLaunchCommand(ctx context.Context, argv []string, environment map
 	}
 	configureSysProcAttr(cmd)
 	if err := cmd.Run(); err != nil {
-		return diagnostics.failure(fmt.Errorf("launch command failed: %w", err))
+		return diagnostics.failure(ctx, fmt.Errorf("launch command failed: %w", err))
 	}
 	return nil
 }
@@ -486,6 +509,7 @@ func (e *Executor) watch(st *engineState, engine string, proc *managedProc) {
 			st.proc = nil
 			st.running = false
 			st.healthy = false
+			st.revision++
 			if st.healthStop != nil {
 				st.healthStop()
 				st.healthStop = nil
@@ -512,8 +536,8 @@ func (e *Executor) Stop(engine string) error {
 	}
 	done, _ := e.requestStop(st)
 	defer done()
-	st.opMu.Lock()
-	defer st.opMu.Unlock()
+	st.lockOperation()
+	defer st.unlockOperation()
 	stopErr := e.doStop(st, engine)
 	// A user-initiated Stop is explicit OFF intent. Persist it even when
 	// doStop declines a genuinely-foreign listener we can't terminate, so the
@@ -521,6 +545,11 @@ func (e *Executor) Stop(engine string) error {
 	// engine back on. Restart and StopAll call doStop directly and never
 	// rewrite intent — shutdown must not erase the user's saved choice.
 	setErr := e.setDesiredEnabled(engine, false)
+	// Explicit commands must finish the client's transitional state even when
+	// the engine was already stopped and doStop had no change to announce.
+	if stopErr == nil {
+		e.emitState(engine)
+	}
 	return errors.Join(stopErr, setErr)
 }
 
@@ -530,7 +559,16 @@ func (e *Executor) doStop(st *engineState, engine string) error {
 	mode := rt.modeOrDefault()
 	st.mu.Lock()
 	if !st.running {
+		// A Stop during an in-flight passive adoption still records OFF. The
+		// old probe is invalidated by the operation revision, and later status
+		// checks must not adopt the listener behind the user's explicit Stop.
+		st.stopping = true
+		wasAwaiting := st.awaitingModel
+		st.awaitingModel = false
 		st.mu.Unlock()
+		if wasAwaiting {
+			e.emitState(engine)
+		}
 		return nil
 	}
 	proc := st.proc
@@ -628,7 +666,12 @@ func (e *Executor) runCommandStop(st *engineState, engine string, rt Runtime, po
 	// force-kills engine-manager on a timeout, so an unbounded stop command
 	// would wedge StopAll and, in turn, the whole app shutdown.
 	stopCtx, cancelStop := context.WithTimeout(context.Background(), commandStopTimeout(rt))
-	runErr := e.runCommand(stopCtx, argv)
+	var runErr error
+	if engine == "lmstudio" && slices.Equal(sp.Cmd, []string{"{cli}", "daemon", "down"}) {
+		runErr = e.stopLMStudio(stopCtx, argv[0])
+	} else {
+		runErr = e.runCommand(stopCtx, argv)
+	}
 	cancelStop()
 	if runErr != nil {
 		return fmt.Errorf("stop %s: %w", engine, runErr)
@@ -697,6 +740,7 @@ func (e *Executor) markStopped(st *engineState, engine string) {
 		st.healthStop = nil
 	}
 	st.running = false
+	st.awaitingModel = false
 	st.healthy = false
 	st.stopping = true
 	st.adopted = false
@@ -713,7 +757,11 @@ func (e *Executor) markStopped(st *engineState, engine string) {
 // live listener returning 503 is unhealthy, not stopped. A successful control
 // command is likewise not proof that its daemon actually exited.
 func (e *Executor) waitUnavailable(p *Probe, port int, timeout time.Duration) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return e.waitUnavailableContext(context.Background(), p, port, timeout)
+}
+
+func (e *Executor) waitUnavailableContext(parent context.Context, p *Probe, port int, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	misses := 0
 	for {
@@ -853,8 +901,8 @@ func (e *Executor) Restart(ctx context.Context, engine string) error {
 	if err != nil {
 		return err
 	}
-	st.opMu.Lock()
-	defer st.opMu.Unlock()
+	st.lockOperation()
+	defer st.unlockOperation()
 	if err := e.doStop(st, engine); err != nil {
 		return err
 	}
@@ -866,6 +914,14 @@ func (e *Executor) Restart(ctx context.Context, engine string) error {
 
 // StopAll rejects new starts and terminates every running engine during
 // shutdown without changing the user's saved ON/OFF intent.
+//
+// It stops every download too, and starts no more. A download's tool is no
+// engine, so stopping the engines would leave it running past engine-manager's
+// exit, above all one a peer started, whose request nothing else cancels. The
+// sweep waits for the downloads while the engines stop, for at most
+// downloadShutdownBudget. Shutdown is no cancel someone asked for, so a
+// download only it stopped keeps its partial files for the next attempt to
+// resume.
 //
 // Two entry points ask for it on an ordinary quit — the
 // engine:prepare-shutdown handler, which the broker calls from its own
@@ -897,13 +953,17 @@ func (e *Executor) StopAll() {
 
 func (e *Executor) stopAllNow() {
 	e.shuttingDown.Store(true)
+	downloads := e.stopDownloads()
 	e.mu.Lock()
 	names := make([]string, 0, len(e.engines))
 	for n := range e.engines {
 		names = append(names, n)
 	}
 	e.mu.Unlock()
+	var stopping sync.WaitGroup
+	stopping.Go(func() { awaitDownloads(downloads) })
 	e.failedStops = e.stopEngines(names)
+	stopping.Wait()
 	e.mu.Lock()
 	if e.modelScope != nil {
 		_ = e.modelScope.Close()
@@ -951,8 +1011,8 @@ func (e *Executor) stopEngines(names []string) []string {
 			if cancel != nil {
 				cancel()
 			}
-			st.opMu.Lock()
-			defer st.opMu.Unlock()
+			st.lockOperation()
+			defer st.unlockOperation()
 			if err := e.doStop(st, n); err != nil {
 				slog.Warn("engine stop during shutdown failed", "engine", n, "err", err)
 				retry[i] = retryable
@@ -992,6 +1052,9 @@ func (e *Executor) runHealth(ctx context.Context, st *engineState, engine string
 			}
 			was := st.healthy
 			st.healthy = ok
+			if was != ok {
+				st.revision++
+			}
 			st.mu.Unlock()
 			switch {
 			case was && !ok:
@@ -1024,7 +1087,7 @@ func (e *Executor) waitReady(ctx context.Context, p *Probe, port int, began time
 			return nil
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("not ready after %s", timeout)
+			return &readyTimeoutError{timeout: timeout}
 		}
 		select {
 		case <-ctx.Done():

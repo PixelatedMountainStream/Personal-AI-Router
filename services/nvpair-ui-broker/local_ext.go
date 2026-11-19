@@ -9,13 +9,20 @@ import "nvpair-shared/noderec"
 // (seam S6): per-engine slot capacity (loaded models) and jit_load flags,
 // relayed from the node directory. It is embedded, so encoding/json flattens
 // it and the wire keys are unchanged; the zero value adds no keys. The
-// scanner-only ModelsObservedAt is not relayed.
+// scanner-only ModelsObservedAt is not relayed. It also carries the directory
+// node's GPUs, CPU and Memory (NVIDIA #179 moved hardware to the separate Info
+// observation; the fork's node cards still read these flat keys). The directory
+// holds them only for the owned node and authenticated peers.
 type LocalBrokerExt struct {
 	SlotsByEngine   map[string]map[string]noderec.SlotInfo `json:"slotsByEngine,omitempty"`
 	JITLoadByEngine map[string]bool                        `json:"jitLoadByEngine,omitempty"`
+	GPUs            []noderec.GPUInfo                      `json:"gpus,omitempty"`
+	CPU             *noderec.CPUInfo                       `json:"cpu,omitempty"`
+	Memory          *noderec.MemoryInfo                    `json:"memory,omitempty"`
 }
 
 // localBrokerExt projects a directory node's extension onto the broker's.
 func localBrokerExt(n noderec.DirectoryNode) LocalBrokerExt {
-	return LocalBrokerExt{SlotsByEngine: n.SlotsByEngine, JITLoadByEngine: n.JITLoadByEngine}
+	return LocalBrokerExt{SlotsByEngine: n.SlotsByEngine, JITLoadByEngine: n.JITLoadByEngine,
+		GPUs: n.GPUs, CPU: n.CPU, Memory: n.Memory}
 }

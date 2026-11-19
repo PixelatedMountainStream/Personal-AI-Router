@@ -161,12 +161,15 @@ async function nodeSettingString(method: string): Promise<string> {
 async function toggleLocalEngine(engine: string, engineType: EngineType): Promise<void> {
     const supervisor = getModularSupervisor()
     try {
-        // `engine:status` is a fast detect (no lifecycle lock), so awaiting the
-        // read is fine. Lifecycle ops stay fire-and-forget to the renderer. A stop
-        // observes its eventual response because an ownership rejection has no
-        // resolving `engine:state-changed`; start keeps its existing push path.
+        // `engine:status` probes independently of lifecycle operations, so it
+        // cannot wait on their lock. Lifecycle ops stay fire-and-forget to the
+        // renderer. A stop observes its eventual response because an ownership
+        // rejection has no resolving `engine:state-changed`; start keeps its
+        // existing push path.
         const status = await supervisor.callProcess('broker', 'engine:status', { engine })
-        const running = booleanValue(objectValue(status)?.running)
+        const running =
+            booleanValue(objectValue(status)?.running) ||
+            booleanValue(objectValue(status)?.awaiting_model)
         // Synthesize the transitional status the engine-manager never emits, so
         // the UI shows a spinner immediately instead of sitting idle until the
         // terminal engine:state-changed lands.
@@ -319,6 +322,11 @@ function routeEngineManagerCommand(payload: WsInvokeRequest<'engine:command'>): 
                 void supervisor.pullModel(engine, payload.engineType, payload.model)
             }
             break
+        case 'cancelModelPull':
+            if (payload.model) {
+                void supervisor.cancelModelPull(engine, payload.engineType, payload.model)
+            }
+            break
         case 'deleteModel':
             if (payload.model) {
                 void supervisor.deleteModel(engine, payload.engineType, payload.model)
@@ -335,8 +343,7 @@ function routeEngineManagerCommand(payload: WsInvokeRequest<'engine:command'>): 
             // (the model may not fit), so like Ollama's its rejection is observed
             // and attributed to the pending model row.
             // Ollama, LM Studio and llama.cpp require the engine running (HTTP/CLI
-            // action); vLLM declares modelOpsWhenStopped. ModelRow.tsx applies
-            // the same rule.
+            // action); enabled vLLM can load its first model before a server exists.
             // See docs/services-parity.md#models.
             if (payload.model) {
                 if (payload.engineType === 'vllm') {
@@ -425,7 +432,7 @@ async function toggleRemoteEngine(
     engineType: EngineType
 ): Promise<void> {
     const supervisor = getModularSupervisor()
-    const running = getModularBridgeState().isRemoteEngineRunning(nodeId, engineType)
+    const running = getModularBridgeState().isRemoteEngineEnabled(nodeId, engineType)
     await supervisor.toggleEngineRemote(nodeId, engine, engineType, running)
 }
 
@@ -462,6 +469,11 @@ function routeRemoteEngineCommand(payload: WsInvokeRequest<'engine:command'>): v
         case 'pullModel':
             if (payload.model) {
                 void supervisor.pullModelRemote(nodeId, engine, payload.engineType, payload.model)
+            }
+            break
+        case 'cancelModelPull':
+            if (payload.model) {
+                void supervisor.cancelModelPull(engine, payload.engineType, payload.model, nodeId)
             }
             break
         case 'uninstall':
@@ -737,10 +749,10 @@ async function handleNodeRemoveMember(
     const selfId = state.getSelfId()
     const isSelfLeave = selfId !== null && payload.nodeId === selfId
 
-    // The broker owns manual-node persistence and resolves a stable node UUID
-    // back to the manual alias expected by nvpair-manual-nodes. For a purely
-    // discovered peer this remains a harmless no-op.
-    supervisor.callProcess('broker', 'node/remove', { id: payload.nodeId }).catch(() => {})
+    // The broker resolves this node key to its manual entry, if any. Keeping it
+    // separate from the worker's entry ID prevents a matching user-supplied name
+    // from selecting a different configuration for removal.
+    supervisor.callProcess('broker', 'node/remove', { nodeId: payload.nodeId }).catch(() => {})
 
     if (isSelfLeave) {
         // Self-departure is `cluster:leave`, not `nodes:remove` (the cluster-manager
@@ -810,7 +822,7 @@ const EMPTY_SERVICE_BRIDGE_HANDLERS: BridgeHandlerMap = {
     'engine:command': payload => handleEngineCommand(payload),
     'engine:search-hub': payload =>
         payload
-            ? getEngineHubModels(payload.engineType, payload.query)
+            ? getEngineHubModels(payload.engineType, payload.nodeId, payload.query)
             : { models: [], searchable: false },
 
     'errors:get-initial': () => handleErrorsGetInitial(),

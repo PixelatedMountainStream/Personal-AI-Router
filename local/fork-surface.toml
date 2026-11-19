@@ -55,7 +55,7 @@ allow = [
   "services/shared/schedulerwire/schedulerwire_test.go",
 ]
 # Taken from upstream on conflict; excluded from budgets.
-generated = ["services/versions.json", "CHANGELOG.md", "desktop/package.json", "desktop/package-lock.json"]
+generated = ["services/versions.json", "CHANGELOG.md", "desktop/package.json", "desktop/package-lock.json", "desktop/docs/services-api.md"]
 # Held: kept byte-identical to the base branch by the sync (upstream workflow changes are ported by hand), so
 # they are excluded from not_allowlisted and the budgets. Changing this list needs surface-budget-raise.
 held = [".github/workflows/**"]
@@ -73,9 +73,9 @@ legacy_added = [
 ]
 
 [budget]            # ratchet, lowered per migration PR; raising it needs label surface-budget-raise (budget_raised)
-max_lines = 537     # changed lines in modified upstream files only (measured at catch-up step 5)
+max_lines = 537     # raised 536->537 (+1: models.go E11 hook call servedLoaded for residency served names); was changed lines in modified upstream files only (measured at the 20261118 sync, 18967eebed)
 max_files = 38      # modified upstream files only
-max_legacy_added_lines = 1734   # separate shrinking budget for legacy_added
+max_legacy_added_lines = 1777   # raised 1734->1777 (exclusive.go/exclusive_test.go load-gate and inventory_field residency fixes, aa3e3a2/86e5abb); was separate shrinking budget for legacy_added
 
 # Optional per-file budgets for hot files are added by PR-F:
 # [[file]]

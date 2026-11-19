@@ -163,7 +163,9 @@ func (e *Executor) residentStrict(ctx context.Context) ([]residentModel, error) 
 		if err != nil {
 			return nil, fmt.Errorf("cannot determine which models engine %q has loaded: %w", name, err)
 		}
-		loaded, loading, err := extractResidency(raw, act.Result)
+		// Identity is the declared inventory field (vLLM root), not the served
+		// alias: an alias must not hide the resident model's size or name.
+		loaded, loading, err := extractResidency(raw, residencySpec(act.Result))
 		if err != nil {
 			return nil, fmt.Errorf("engine %q loaded_models is unusable: %w", name, err)
 		}
@@ -180,6 +182,17 @@ func (e *Executor) residentStrict(ctx context.Context) ([]residentModel, error) 
 		out[i].Loading = loadingSet[out[i].Engine+"/"+out[i].Model]
 	}
 	return out, nil
+}
+
+// residencySpec returns the spec whose Field is the resident model identity:
+// the engine's inventory_field when declared, else its served-name field.
+func residencySpec(spec *ActionResult) *ActionResult {
+	if spec == nil || spec.InventoryField == "" {
+		return spec
+	}
+	inv := *spec
+	inv.Field = spec.InventoryField
+	return &inv
 }
 
 // residencyUnqueryable: a stopped engine normally holds nothing, but an
@@ -447,6 +460,9 @@ func (e *Executor) exclusiveRun(ctx context.Context, req PinnedRequest, load fun
 		return PinnedResult{}, &pinnedError{Status: http.StatusConflict, Message: "another pinned load is in progress on this node"}
 	}
 	defer e.loadMu.Unlock()
+	// The restart a load triggers (vLLM launch_model) starts under this gate;
+	// gateStartupLoad must not re-take loadMu for it.
+	ctx = context.WithValue(ctx, loadGateHeldKey{}, true)
 
 	ops := e.pinnedOps()
 	if load == nil {
@@ -622,13 +638,17 @@ func launchLoadsModel(args []string) bool {
 	return false
 }
 
+// loadGateHeldKey marks a context whose caller (exclusiveRun) already holds
+// loadMu, so internal restarts keep the gate without re-acquiring it.
+type loadGateHeldKey struct{}
+
 // gateStartupLoad gates an engine start whose launch args load a model (an
 // auto-start or custom launch): it refuses with 409 when a large model is
 // already resident, else holds loadMu until the returned release runs so no
 // pinned load interleaves with the start.
 func (e *Executor) gateStartupLoad(ctx context.Context, engine string, args []string) (func(), error) {
 	noop := func() {}
-	if !launchLoadsModel(args) {
+	if !launchLoadsModel(args) || ctx.Value(loadGateHeldKey{}) != nil {
 		return noop, nil
 	}
 	if !e.loadMu.TryLock() {

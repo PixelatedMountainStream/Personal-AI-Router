@@ -21,6 +21,8 @@ Hooks in Go files are marked `// fork:<id>` (trailing, or a standalone comment o
 
 One per file in `allow` today. PR-C..F replace them with real hook records (P/E/S ids) and shrink `allow`.
 
+Budget raise (surface-budget-raise): after the 20261118 sync, commits aa3e3a2/86e5abb added 1 counted line (models.go E11 hook call) and 43 legacy_added lines (exclusive.go, exclusive_test.go); budgets are now 537 lines / 38 files / 1777 legacy. The gate test moved to fork-owned local_exclusive_gate_test.go (no new allowlisted file).
+
 ### L-services-nvpair-engine-manager-manifest-md
 files: services/nvpair-engine-manager/MANIFEST.md
 kind: legacy
@@ -159,7 +161,7 @@ Tests: services/shared ./noderec/ -run 'TestS1_Nil|TestLocalNodeExtJSONKeys'
 ### S4
 files: services/nvpair-node-scanner/daemon.go
 kind: hook
-recipe: Take upstream daemon.go; add `// fork:S4` then `local *localScanState` after the lastInventory field, `local: newLocalScanState(), // fork:S4` in the newDaemon literal, and in enrichModelsCandidates `inventory.local.applyTo(node)` after `inventory.applyTo(node)` and `cached.local.applyTo(node)` after `cached.applyTo(node)`, each marked `// fork:S4`; NVIDIA's lastInventory cache (dropSelf, forget, fallback) carries the extension inside modelInventory, so no migrate/forget/record hooks remain; bodies in local_capacity.go. daemon.go also carries S8.
+recipe: Take upstream daemon.go; add `// fork:S4` then `local *localScanState` after the localModels field, `local: newLocalScanState(), // fork:S4` in the newDaemon literal, and in publishSelf `d.localModels.local.applyTo(&node) // fork:S4` after `d.localModels.applyTo(&node)`; NVIDIA #179 replaced the lastInfo/lastInventory caches with nodeInfoStatus and localModels (the owned inventory, which carries the extension inside modelInventory), so no enrichment, migrate or forget hooks remain; bodies in local_capacity.go. daemon.go also carries S8.
 Tests: services/nvpair-node-scanner . -run 'TestS4_Nil|TestLocal'
 
 ## Hook records (catch-up step 3)
@@ -197,13 +199,13 @@ NVIDIA #181 (vLLM) and #5. NVIDIA owns vLLM model switching (an operator action 
 ### S8
 files: services/nvpair-node-scanner/enrich_hosts.go, services/nvpair-node-scanner/daemon.go
 kind: hook
-recipe: Take upstream enrich_hosts.go and daemon.go (NVIDIA's #181 modelInventory, applyTo, fetchModels and 4-argument applyModels verbatim; no signature change, no test call-site edit); add `local modelInventoryExt // fork:S8` as the last modelInventory field; in fetchModels add `// fork:S8` then `localModelsWire` as the last field of the decode struct and `local: d.local.ext(body.localModelsWire), // fork:S8` as the last field of the returned literal; types and ext in local_capacity.go. observedAt lives in modelInventoryExt.observedAt, stamped at fetch time by a non-nil localScanState (0 with nil state), so NVIDIA's lastInventory cache carries it with the inventory.
+recipe: Take upstream enrich_hosts.go and daemon.go (NVIDIA's #181 modelInventory, applyTo, fetchModels and 4-argument applyModels verbatim; no signature change, no test call-site edit); add `local modelInventoryExt // fork:S8` as the last modelInventory field; in fetchModels add `// fork:S8` then `localModelsWire` as the last field of the decode struct and `local: d.local.ext(body.localModelsWire), // fork:S8` as the last field of the returned literal; types and ext in local_capacity.go. observedAt lives in modelInventoryExt.observedAt, stamped at fetch time by a non-nil localScanState (0 with nil state), so NVIDIA's localModels (the owned inventory, #179) carries it with the inventory.
 Tests: services/nvpair-node-scanner . -run 'TestS8_Nil|TestLocalDownloadedChangeKeepsCapacity|TestRefreshSlotChangeReportsChange'
 
 ### S6
 files: services/nvpair-ui-broker/broker.go, services/nvpair-ui-broker/discovery.go
 kind: hook
-recipe: Take upstream broker.go and discovery.go; add `// fork:S6` then `LocalBrokerExt` as the last AvailableNode and EnrichedNode field; set `LocalBrokerExt: localBrokerExt(n), // fork:S6` last in the directoryToEnriched literal and `LocalBrokerExt: n.LocalBrokerExt, // fork:S6` last in the toAvailable literal; type and projection in local_ext.go.
+recipe: Take upstream broker.go and discovery.go; add `// fork:S6` then `LocalBrokerExt` as the last AvailableNode and EnrichedNode field; set `LocalBrokerExt: localBrokerExt(n), // fork:S6` last in the directoryToEnriched literal and `LocalBrokerExt: n.LocalBrokerExt, // fork:S6` last in the toAvailable literal; type and projection in local_ext.go; LocalBrokerExt also relays the directory node's GPUs, CPU and Memory (NVIDIA #179 dropped them from the discovery record; user decision at the 20261118 sync; the directory holds them only for the owned node and authenticated peers, per the authenticated-inventory gate).
 Tests: services/nvpair-ui-broker . -run 'TestS6_Nil|TestDirectoryRelaysSlotCapacity|TestLocalBrokerRelayJSONKeys'
 
 ### E10

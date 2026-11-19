@@ -18,6 +18,10 @@ type LocalNodeExt struct {
 	// default (see DefaultJITLoad). A missing engine key means the peer did not
 	// say; treat as the engine default.
 	JITLoadByEngine map[string]bool `json:"jitLoadByEngine,omitempty"`
+	// ServedLoadedByEngine is the names a loaded-only engine (vLLM) serves its
+	// loaded models under, as the engine reported them. Absent on older peers
+	// (the proxy then infers from the inventory).
+	ServedLoadedByEngine map[string][]string `json:"servedLoadedByEngine,omitempty"`
 	// ModelsObservedAt is when (Unix milliseconds) the scanner last completed a
 	// successful models fetch for this node, whether or not the inventory
 	// changed. An unchanged sweep advances it only once it is 30s ahead of the

@@ -31,6 +31,11 @@ type LocalModelsExt struct {
 	// demand: the node-settings jit_load.<engine> override, else the engine
 	// default (noderec.DefaultJITLoad). Present only for engines that reported.
 	JITLoadByEngine map[string]bool `json:"jitLoadByEngine,omitempty"`
+	// ServedLoadedByEngine is the names a loaded-only engine (vLLM) answers to
+	// for its loaded models, as the engine reported them (--served-model-name),
+	// so a peer matches a request without inferring root->served. Present only
+	// when the engine reported both its served names and its loaded set.
+	ServedLoadedByEngine map[string][]string `json:"servedLoadedByEngine,omitempty"`
 }
 
 // SlotInfo is a loaded model's parallel capacity: concurrent request slots and
@@ -43,13 +48,15 @@ type SlotInfo = noderec.SlotInfo
 type localSlotSweep struct {
 	acts       []*Action
 	slots      []map[string]SlotInfo
-	loadedOnly map[string]bool // engines with advertised_models "loaded" (vLLM)
+	served     []*[]string     // per engine: served names of a loaded-only engine's loaded models
+	loadedOnly map[string]bool // engines with advertised_models "loaded" or "available" (vLLM)
+	onRequest  map[string]bool // the "available" subset: NVIDIA loads a cached model on request (#203)
 }
 
 // newLocalSlotSweep records each engine's optional slots action (one with a
 // record spec) and which engines advertise only their loaded models.
 func newLocalSlotSweep(e *Executor, engineNames []string) *localSlotSweep {
-	s := &localSlotSweep{acts: make([]*Action, len(engineNames)), slots: make([]map[string]SlotInfo, len(engineNames))}
+	s := &localSlotSweep{acts: make([]*Action, len(engineNames)), slots: make([]map[string]SlotInfo, len(engineNames)), served: make([]*[]string, len(engineNames))}
 	for i, name := range engineNames {
 		mf, ok := e.reg.Get(name)
 		if !ok {
@@ -58,11 +65,17 @@ func newLocalSlotSweep(e *Executor, engineNames []string) *localSlotSweep {
 		if act, ok := mf.Actions["slots"]; ok && act.Result != nil && act.Result.Record != nil {
 			s.acts[i] = &act
 		}
-		if mf.AdvertisedModels == advertisedModelsLoaded {
+		if mf.AdvertisedModels == advertisedModelsLoaded || mf.AdvertisedModels == advertisedModelsAvailable {
 			if s.loadedOnly == nil {
 				s.loadedOnly = map[string]bool{}
 			}
 			s.loadedOnly[name] = true
+			if mf.AdvertisedModels == advertisedModelsAvailable {
+				if s.onRequest == nil {
+					s.onRequest = map[string]bool{}
+				}
+				s.onRequest[name] = true
+			}
 		}
 	}
 	return s
@@ -79,11 +92,30 @@ func (s *localSlotSweep) collect(ctx context.Context, e *Executor, i int, name s
 	s.slots[i] = e.querySlots(ctx, name, s.acts[i], loaded)
 }
 
+// servedLoaded records engine i's reported served names (each goroutine writes
+// only index i) when both its served names and loaded set were read.
+func (s *localSlotSweep) servedLoaded(i int, loadedOK, servedOK bool, served []string) {
+	if s == nil || !loadedOK || !servedOK {
+		return
+	}
+	names := append([]string{}, served...)
+	s.served[i] = &names
+}
+
 // finish merges the collected slots into res and applies the node-settings
 // overrides (which also resolve jit_load for every reporting engine).
 func (s *localSlotSweep) finish(e *Executor, res *ModelsResult, engineNames []string) {
 	if s == nil {
 		return
+	}
+	for i, sv := range s.served {
+		if sv == nil {
+			continue
+		}
+		if res.ServedLoadedByEngine == nil {
+			res.ServedLoadedByEngine = make(map[string][]string)
+		}
+		res.ServedLoadedByEngine[engineNames[i]] = *sv
 	}
 	for i, sl := range s.slots {
 		if sl == nil {
@@ -94,19 +126,19 @@ func (s *localSlotSweep) finish(e *Executor, res *ModelsResult, engineNames []st
 		}
 		res.SlotsByEngine[engineNames[i]] = sl
 	}
-	res.applySettingsOverrides(e.settingsOverrides, s.loadedOnly)
+	res.applySettingsOverrides(e.settingsOverrides, s.loadedOnly, s.onRequest)
 }
 
 // applySettingsOverrides merges node-settings engine overrides (slots, ctx per
 // slot for loaded models) into the result and resolves jit_load for every
 // engine that reported. A nil source still resolves the jit_load defaults.
 //
-// A loaded-only engine (advertised_models "loaded", vLLM) switches models only
+// A loaded-only engine (advertised_models "loaded" or "available", vLLM) switches models only
 // by an operator action that restarts it (NVIDIA #181), never on demand: its
 // jit_load is false whatever the settings say, and its slot overrides are
 // keyed on the served name (modelsByEngine, what a request names), not on the
 // --model root that its loadedByEngine entry uses.
-func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage, loadedOnly map[string]bool) {
+func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMessage, loadedOnly, onRequest map[string]bool) {
 	var raw map[string]json.RawMessage
 	if src != nil {
 		raw = src()
@@ -123,12 +155,57 @@ func (r *ModelsResult) applySettingsOverrides(src func() map[string]json.RawMess
 	if len(loadedOnly) > 0 {
 		served = maps.Clone(r.LoadedByEngine)
 		for n := range loadedOnly {
-			if _, ok := served[n]; ok {
-				served[n] = r.ByEngine[n]
+			if loaded, ok := served[n]; ok {
+				served[n] = r.servedNames(n, loaded)
 			}
 		}
 	}
-	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, served, r.SlotsByEngine, loadedOnly)
+	// An available-mode engine loads a cached model when a request names it
+	// (NVIDIA #203), so it is JIT by default; only "loaded" mode never is.
+	never := maps.Clone(loadedOnly)
+	for n := range onRequest {
+		delete(never, n)
+	}
+	r.SlotsByEngine, r.JITLoadByEngine = noderec.ApplyCapacityOverrides(raw, names, served, r.SlotsByEngine, never)
+	for n := range onRequest {
+		if !reported[n] {
+			continue
+		}
+		if r.JITLoadByEngine == nil {
+			r.JITLoadByEngine = map[string]bool{}
+		}
+		r.JITLoadByEngine[n] = true
+		if v, ok := raw[noderec.SettingJITLoad+n]; ok {
+			if b, err := strconv.ParseBool(strings.Trim(string(v), `"`)); err == nil {
+				r.JITLoadByEngine[n] = b
+			}
+		}
+	}
+}
+
+// servedNames translates an engine's loaded --model roots to the names a request
+// uses. An available-mode engine's ByEngine is its whole inventory, so it is
+// never substituted for the loaded set: a root the inventory lists serves as
+// itself, otherwise as the one listed name that is not a downloaded root
+// (--served-model-name); with no unique such name the root stays.
+func (r *ModelsResult) servedNames(engine string, loaded []string) []string {
+	if sv, ok := r.ServedLoadedByEngine[engine]; ok {
+		return sv
+	}
+	var aliases []string
+	for _, m := range r.ByEngine[engine] {
+		if !slices.Contains(r.DownloadedByEngine[engine], m) {
+			aliases = append(aliases, m)
+		}
+	}
+	out := make([]string, 0, len(loaded))
+	for _, m := range loaded {
+		if !slices.Contains(r.ByEngine[engine], m) && len(aliases) == 1 {
+			m = aliases[0]
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // querySlots runs an engine's optional slots action and returns capacity keyed

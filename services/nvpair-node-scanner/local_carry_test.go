@@ -20,7 +20,7 @@ func TestLocalRefreshCarriesSlotsJITAndObservedAt(t *testing.T) {
 	_, port := startModelsStub(t, http.StatusOK, slotBody(3, true))
 	seedEMNode(d, "p", "127.0.0.1", port)
 	before := time.Now().UnixMilli()
-	require.True(t, d.refreshNodeModels("p", "127.0.0.1", port, ""))
+	require.True(t, refreshUUID(d, "p"))
 	got, _ := d.dir.get("p")
 	assert.Equal(t, 3, got.SlotsByEngine["lmstudio"]["a"].Slots)
 	assert.True(t, got.JITLoadByEngine["lmstudio"])
