@@ -13,7 +13,7 @@ name: Local CI
 
 on:
     pull_request:
-        branches: [develop]
+        branches: [develop, test/upstream-sim-1]
         # labeled/unlabeled re-gate when surface-budget-raise or upstream-sync is toggled.
         types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
