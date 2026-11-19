@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 )
@@ -122,35 +123,30 @@ var localBundledActions = map[string]map[string]json.RawMessage{
 	"ollama":   {"catalog_sizes": json.RawMessage(`{"description":"Size in bytes of every downloaded model (/api/tags models[].size).","http":{"method":"GET","path":"/api/tags"},"result":{"array":"models","field":"name","record":{"fields":{"bytes":"size"}}}}`)},
 }
 
-// overlayLocalActions merges localBundledActions into the bundled raw JSON (so a
-// per-user override still deep-merges onto them) and reloads those manifests.
-func (r *Registry) overlayLocalActions() error {
-	for eng, acts := range localBundledActions {
-		raw, ok := r.bundledRaw[eng]
-		if !ok {
-			continue
-		}
-		var doc map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &doc); err != nil {
-			return fmt.Errorf("overlay %s: %w", eng, err)
-		}
-		cur := map[string]json.RawMessage{}
-		if a, ok := doc["actions"]; ok {
-			if err := json.Unmarshal(a, &cur); err != nil {
-				return fmt.Errorf("overlay %s actions: %w", eng, err)
-			}
-		}
-		for k, v := range acts {
-			if _, exists := cur[k]; !exists {
-				cur[k] = v
-			}
-		}
-		doc["actions"], _ = json.Marshal(cur)
-		out, _ := json.Marshal(doc)
-		if _, err := r.addManifest("local overlay "+eng, out); err != nil {
-			return err
-		}
-		r.bundledRaw[eng] = out
+// overlayLocal merges localBundledActions into one bundled engine's raw JSON (so
+// a per-user override still deep-merges onto them) and reloads that manifest. A
+// failure is logged and leaves the upstream manifest as loaded.
+func (r *Registry) overlayLocal(eng string) {
+	acts, ok := localBundledActions[eng]
+	if !ok {
+		return
 	}
-	return nil
+	var doc map[string]json.RawMessage
+	cur := map[string]json.RawMessage{}
+	if json.Unmarshal(r.bundledRaw[eng], &doc) != nil || (doc["actions"] != nil && json.Unmarshal(doc["actions"], &cur) != nil) {
+		slog.Warn("local manifest overlay skipped", "engine", eng)
+		return
+	}
+	for k, v := range acts {
+		if _, exists := cur[k]; !exists {
+			cur[k] = v
+		}
+	}
+	doc["actions"], _ = json.Marshal(cur)
+	out, _ := json.Marshal(doc)
+	if _, err := r.addManifest("local overlay "+eng, out); err != nil {
+		slog.Warn("local manifest overlay rejected", "engine", eng, "err", err)
+		return
+	}
+	r.bundledRaw[eng] = out
 }
