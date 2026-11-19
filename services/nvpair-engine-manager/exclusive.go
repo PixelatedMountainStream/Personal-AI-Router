@@ -753,12 +753,20 @@ func (e *Executor) checkMultiLarge(ctx context.Context, res ModelsResult) {
 	e.observeLarge(large)
 }
 
-// coldTargetBytes resolves the size of a target that is not resident (0 when it
-// is resident, or when no verified size is available).
+// coldTargetBytes resolves the target's size for classification (0 = unverified,
+// counts as large). A resident target keeps its current classification through
+// unload confirmation, when it is no longer in the snapshot: large -> 0, small
+// -> its resident bytes (1 when unreported).
 func (e *Executor) coldTargetBytes(ctx context.Context, ops *pinnedOps, snap []residentModel, req PinnedRequest) int64 {
 	for _, r := range snap {
 		if r.Engine == req.Engine && sameModel(req.Engine, r.Model, req.Model) {
-			return 0
+			switch {
+			case e.isLarge(r):
+				return 0
+			case r.Bytes > 0:
+				return r.Bytes
+			}
+			return 1
 		}
 	}
 	if ops.targetBytes == nil || req.Model == "" {

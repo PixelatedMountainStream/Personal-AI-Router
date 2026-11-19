@@ -107,11 +107,6 @@
       "http": { "method": "GET", "path": "/api/ps" },
       "result": { "array": "models", "field": "name", "record": { "static": { "slots": 1 } } }
     },
-    "catalog_sizes": {
-      "description": "Size in bytes of every downloaded model (/api/tags models[].size); lets a pinned load size a cold target.",
-      "http": { "method": "GET", "path": "/api/tags" },
-      "result": { "array": "models", "field": "name", "record": { "fields": { "bytes": "size" } } }
-    },
     "model_sizes": {
       "description": "Resident size in bytes of each loaded model (/api/ps models[].size).",
       "http": { "method": "GET", "path": "/api/ps" },

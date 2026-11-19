@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -108,6 +109,48 @@ func (a *Action) localValidate(name string) error {
 	}
 	if !r.Record.declares("slots") && !r.Record.declares("bytes") {
 		return fmt.Errorf("action %q: result.record requires a slots or bytes field or static value", name)
+	}
+	return nil
+}
+
+// localBundledActions are fork-owned actions overlaid onto the bundled upstream
+// manifests so the manifests stay upstream-shaped. catalog_sizes lists every
+// downloaded model's size in bytes (no loaded filter), letting a pinned load size
+// a cold target before choosing victims.
+var localBundledActions = map[string]map[string]json.RawMessage{
+	"lmstudio": {"catalog_sizes": json.RawMessage(`{"description":"Size in bytes of every downloaded model (/api/v1/models models[].size_bytes).","http":{"method":"GET","path":"/api/v1/models"},"result":{"array":"models","field":"key","record":{"fields":{"bytes":"size_bytes"}}}}`)},
+	"ollama":   {"catalog_sizes": json.RawMessage(`{"description":"Size in bytes of every downloaded model (/api/tags models[].size).","http":{"method":"GET","path":"/api/tags"},"result":{"array":"models","field":"name","record":{"fields":{"bytes":"size"}}}}`)},
+}
+
+// overlayLocalActions merges localBundledActions into the bundled raw JSON (so a
+// per-user override still deep-merges onto them) and reloads those manifests.
+func (r *Registry) overlayLocalActions() error {
+	for eng, acts := range localBundledActions {
+		raw, ok := r.bundledRaw[eng]
+		if !ok {
+			continue
+		}
+		var doc map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return fmt.Errorf("overlay %s: %w", eng, err)
+		}
+		cur := map[string]json.RawMessage{}
+		if a, ok := doc["actions"]; ok {
+			if err := json.Unmarshal(a, &cur); err != nil {
+				return fmt.Errorf("overlay %s actions: %w", eng, err)
+			}
+		}
+		for k, v := range acts {
+			if _, exists := cur[k]; !exists {
+				cur[k] = v
+			}
+		}
+		doc["actions"], _ = json.Marshal(cur)
+		out, _ := json.Marshal(doc)
+		if _, err := r.addManifest("local overlay "+eng, out); err != nil {
+			return err
+		}
+		r.bundledRaw[eng] = out
 	}
 	return nil
 }

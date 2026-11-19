@@ -36,3 +36,25 @@ func TestOllamaImplicitTag(t *testing.T) {
 		t.Fatal("normalisation must be Ollama-only")
 	}
 }
+
+// A resident small target changing params keeps its small classification after
+// it is unloaded; the unrelated large model must not become a victim then.
+func TestResidentTargetKeepsClassThroughUnload(t *testing.T) {
+	ex := newTestExecutor(t, testEngineManifest(fakeEngineBin))
+	ex.largeModelBytes = 12 * gib
+	small := residentModel{Engine: "lmstudio", Model: "small", Bytes: 2 * gib}
+	big := residentModel{Engine: "lmstudio", Model: "big", Bytes: 20 * gib}
+	req := PinnedRequest{Engine: "lmstudio", Model: "small", Evict: true}
+	tb := ex.coldTargetBytes(t.Context(), &pinnedOps{}, []residentModel{small, big}, req)
+	if v, _ := ex.victimsOfSized([]residentModel{small, big}, req, tb); len(v) != 1 || v[0].Model != "small" {
+		t.Fatalf("resident victims %v", v)
+	}
+	if v, _ := ex.victimsOfSized([]residentModel{big}, req, tb); len(v) != 0 {
+		t.Fatalf("after unload the large model must not be a victim: %v", v)
+	}
+	// Large resident target stays large.
+	req = PinnedRequest{Engine: "lmstudio", Model: "big"}
+	if tb := ex.coldTargetBytes(t.Context(), &pinnedOps{}, []residentModel{big}, req); tb != 0 {
+		t.Fatalf("large target bytes %d", tb)
+	}
+}

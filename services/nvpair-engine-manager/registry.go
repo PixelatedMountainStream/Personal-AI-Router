@@ -568,7 +568,7 @@ func (r *Registry) LoadFS(fsys fs.FS, root string) error {
 		// a per-user override onto it later.
 		r.bundledRaw[eng] = append([]byte(nil), data...)
 	}
-	return nil
+	return r.overlayLocalActions() // fork:E10
 }
 
 func (r *Registry) addManifest(src string, data []byte) (string, error) {
