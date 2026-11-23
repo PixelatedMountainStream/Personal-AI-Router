@@ -23,6 +23,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import check_fork_surface as cfs  # noqa: E402  (glob dialect + ESCALATE_KINDS shared with the checker)
+import go_rules  # noqa: E402  (vet/skip rules shared with .github/workflows/local-ci.yml)
 
 ROOT = HERE.parents[1]
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -199,7 +200,9 @@ def plan(root, remote, cfg, ref, base, force, tags_base=None, pending=False, dem
         mode = "recheck"   # nothing new from upstream, but human commits may have landed: re-run checks
     else:
         mode = "none"
-    commits = int(out(root, "rev-list", "--count", f"{base_sha}..{target}")) if new else 0
+    # recheck: the PR already carries upstream commits; count pin(tags_base or base)..target, not 0.
+    count_from = hold_from if mode == "recheck" else base_sha
+    commits = int(out(root, "rev-list", "--count", f"{count_from}..{target}")) if new or mode == "recheck" else 0
     return {"mode": mode, "new": new, "base_sha": base_sha, "target": target, "short": target[:10],
             "commits": commits, "tags": tags, "rtags": rtags, "held": held, "legacy_touched": legacy, "legacy_error": legacy_error, "newest_tag": tags[-1] if tags else "",
             "release": bool(tags), "last_release_tag": last_tag, "remote": remote, "demo": bool(demo_ref)}
@@ -419,10 +422,12 @@ def cmd_check(a, root):
             if not (Path(root) / mod / "go.mod").exists():
                 continue
             go(f"build {mod}", mod, ["build", "./..."], "build_errors")
-            go(f"vet {mod}", mod, ["vet", "./..."], "build_errors")
+            vet, skip = go_rules.rules(cfg, mod)
+            if vet:
+                go(f"vet {mod}", mod, ["vet", "./..."], "build_errors")
             t = ["test", "./...", "-count=1", "-timeout=10m"]
-            if mod in cfg.get("go_skip", {}):
-                t += ["-skip", cfg["go_skip"][mod]]
+            if skip:
+                t += ["-skip", skip]
             go(f"test {mod}", mod, t, "test_failures")
         for i, (mod, pkg, _, rx) in enumerate(h[:4] for h in hook_tests(root)):
             go(f"hook-test-{i}", mod, ["test", pkg, "-run", rx], "test_failures")

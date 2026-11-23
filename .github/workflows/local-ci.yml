@@ -4,11 +4,9 @@
 # Fork-only CI (not upstream's ci.yml). Runs on PRs to `develop`.
 # Spec: PLAN-pair-upstream-sync.md sections 3.2, 4.3 and 5 (PR-A).
 #
-# Unlike the sync job (PR-B), these run the known-flaky tests unskipped so
-# #11 and #12 stay visible: TestUninstallTerminatesRunningInstance in
-# nvpair-engine-manager (#11) and TestWorkloadManagerOutboundBroadcast in
-# services/tests (#12). Whether they pass on ubuntu is unverified; if the first
-# run passes, nothing to do; if not, the sync job keeps its -skip with a comment.
+# Go vet/skip rules for the module matrix come from local/upstream-sync.toml
+# (via local/scripts/go_rules.py), the same source `sync_upstream.py check` uses.
+# The cross-process job runs services/tests with its own inline skip.
 name: Local CI
 
 on:
@@ -95,7 +93,11 @@ jobs:
             - run: sudo apt-get update -qq && sudo apt-get install -y -qq lsof iproute2
             - name: Build, vet, test
               working-directory: services/${{ matrix.module }}
-              run: go build ./... && go vet ./... && go test ./... -count=1 -timeout=10m
+              run: |
+                  go build ./...
+                  eval "$(python3 "$GITHUB_WORKSPACE/local/scripts/go_rules.py" "services/${{ matrix.module }}")"
+                  if [ "$GO_VET" = 1 ]; then go vet ./...; fi
+                  go test ./... -count=1 -timeout=10m ${GO_SKIP:+-skip "$GO_SKIP"}
 
     cross-process:
         name: Go cross-process tests

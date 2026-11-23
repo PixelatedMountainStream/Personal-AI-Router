@@ -25,8 +25,14 @@ required_checks = [
   "Go test (nvpair-node-settings)", "Go cross-process tests",
 ]
 
-# Known failures skipped in the sync job only (local-ci.yml runs them unskipped).
-# Drop an entry once the first local-ci run shows it passing on ubuntu.
+# Modules NOT vetted (build and test still run). services/tests is NVIDIA's own module with upstream
+# vet findings (main_test.go:213, :231).
+go_vet_skip = ["services/tests"]
+
+# Single source for the sync check AND local-ci.yml (read via local/scripts/go_rules.py). Known failures
+# skipped by `go test -skip`. Drop an entry once it passes on ubuntu.
+# NOTE: local-ci's cross-process job still carries its own inline GPU_pressure_converges skip (services/tests);
+# it is intentionally not in this file, another branch is fixing that regression.
 [go_skip]
 "services/nvpair-engine-manager" = "TestUninstallTerminatesRunningInstance"  # #11, macOS-only procImage
 "services/tests" = "TestWorkloadManagerOutboundBroadcast"                      # #12, hard-coded port 14320
