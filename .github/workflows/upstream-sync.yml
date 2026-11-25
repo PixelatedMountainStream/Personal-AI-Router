@@ -488,7 +488,9 @@ jobs:
             echo "enrolled=true" >> "$GITHUB_OUTPUT"
           elif [ "$code" = "1" ]; then
             # Refused. A kill-switch-only refusal is expected while the switch is off: no issue, but the run is still red.
-            if [ "$(jq -r '.kill_switch_only' "$RUNNER_TEMP/enroll.json")" != "true" ]; then
+            if [ "$(jq -r '.kill_switch_only' "$RUNNER_TEMP/enroll.json")" = "true" ]; then
+              echo "kill_switch_only=true" >> "$GITHUB_OUTPUT"
+            else
               python3 "$RUNNER_TEMP/trusted/sync_gh.py" issue --branch "$PR_BRANCH" --outcome enroll_refused \
                 --title "Upstream sync needs attention: $PR_BRANCH [enroll_refused]" --body-file "$RUNNER_TEMP/report.md" \
                 --sha "$CAND_SHA" --run-url "$RUN_URL"
@@ -529,13 +531,14 @@ jobs:
         if: always()
         env:
           ENROLLED: ${{ steps.enroll.outputs.enrolled }}
+          KILL_SWITCH_ONLY: ${{ steps.enroll.outputs.kill_switch_only }}
           OUTCOME: ${{ steps.report.outputs.outcome }}
           SYNC_AUTO_MERGE: ${{ vars.SYNC_AUTO_MERGE }}
         run: |
           # Green only when the PR ended enrolled (gap 6): every other run, including a kill-switch-only refusal, is red.
           [ "$ENROLLED" = "true" ] && exit 0
-          # Clean sync with auto-merge disabled: PR awaits manual merge, not a failure.
-          if [ "$OUTCOME" = "clean" ] && [ -z "$SYNC_AUTO_MERGE" ]; then
+          # Clean sync, switch unset, and Enroll refused solely for the kill switch (all other prerequisites passed): awaits manual merge.
+          if [ "$OUTCOME" = "clean" ] && [ -z "$SYNC_AUTO_MERGE" ] && [ "$KILL_SWITCH_ONLY" = "true" ]; then
             echo "::notice::clean; auto-merge disabled, awaiting manual merge"
             exit 0
           fi
