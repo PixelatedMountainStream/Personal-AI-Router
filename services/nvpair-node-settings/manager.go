@@ -67,15 +67,6 @@ type Settings struct {
 	// enough.
 	ClusterFriendlyName string `json:"cluster_friendly_name"`
 
-<<<<<<< HEAD
-	// EngineOverrides holds per-node engine capacity overrides as flat keys:
-	// "engine_slots.<engine>.<model>", "engine_ctx_per_slot.<engine>.<model>"
-	// (positive integers; applied only while the model is loaded) and
-	// "jit_load.<engine>" (bool; defaults: ollama and llamacpp true, lmstudio
-	// false). engine-manager merges them into its /v1/models reply, which is how
-	// they reach the node directory and the proxy.
-	EngineOverrides map[string]json.RawMessage `json:"engine_overrides,omitempty"`
-=======
 	// EngineAllowLANBind lifts the loopback-only restriction on local
 	// engine starts. Default false: a non-loopback bind override on
 	// engine:start is rejected, because engine APIs are unauthenticated
@@ -84,7 +75,14 @@ type Settings struct {
 	// reachable beyond loopback. Read live by the engine-manager on
 	// every start, so no restart is needed after a change.
 	EngineAllowLANBind bool `json:"engine_allow_lan_bind"`
->>>>>>> 7a8c524f9591fc6a1e0031433b67ce4850985997
+
+	// EngineOverrides holds per-node engine capacity overrides as flat keys:
+	// "engine_slots.<engine>.<model>", "engine_ctx_per_slot.<engine>.<model>"
+	// (positive integers; applied only while the model is loaded) and
+	// "jit_load.<engine>" (bool; defaults: ollama and llamacpp true, lmstudio
+	// false). engine-manager merges them into its /v1/models reply, which is how
+	// they reach the node directory and the proxy.
+	EngineOverrides map[string]json.RawMessage `json:"engine_overrides,omitempty"`
 }
 
 func defaultSettings() Settings {
@@ -476,7 +474,32 @@ func (m *Manager) handleMessage(msg *Message) {
 			slog.Warn("failed to emit cluster-auto-sync notification after set", "err", err)
 		}
 
-<<<<<<< HEAD
+	case "settings/get-engine-allow-lan-bind":
+		m.mu.RLock()
+		v := m.settings.EngineAllowLANBind
+		m.mu.RUnlock()
+		m.codec.Respond(msg.ID, map[string]bool{"value": v})
+
+	case "settings/set-engine-allow-lan-bind":
+		var p boolValueParams
+		if err := json.Unmarshal(msg.Params, &p); err != nil || p.Value == nil {
+			m.codec.RespondError(msg.ID, -32602, `invalid params: expected {"value": <bool>}`)
+			return
+		}
+		m.mu.RLock()
+		newSettings := m.settings
+		m.mu.RUnlock()
+		newSettings.EngineAllowLANBind = *p.Value
+		if err := m.saveSettings(newSettings); err != nil {
+			slog.Error("failed to persist engine-allow-lan-bind", "err", err)
+			m.codec.RespondError(msg.ID, -32603, "failed to persist setting: "+err.Error())
+			return
+		}
+		m.mu.Lock()
+		m.settings = newSettings
+		m.mu.Unlock()
+		m.codec.Respond(msg.ID, map[string]bool{"ok": true})
+
 	case "settings/get-engine-overrides":
 		m.mu.RLock()
 		v := m.settings.EngineOverrides
@@ -494,24 +517,11 @@ func (m *Manager) handleMessage(msg *Message) {
 		}
 		if err := json.Unmarshal(msg.Params, &p); err != nil || !validEngineOverride(p.Key, p.Value) {
 			m.codec.RespondError(msg.ID, -32602, `invalid params: expected {"key": "engine_slots.<engine>.<model>"|"engine_ctx_per_slot.<engine>.<model>"|"jit_load.<engine>", "value": <positive int | bool | null>}`)
-=======
-	case "settings/get-engine-allow-lan-bind":
-		m.mu.RLock()
-		v := m.settings.EngineAllowLANBind
-		m.mu.RUnlock()
-		m.codec.Respond(msg.ID, map[string]bool{"value": v})
-
-	case "settings/set-engine-allow-lan-bind":
-		var p boolValueParams
-		if err := json.Unmarshal(msg.Params, &p); err != nil || p.Value == nil {
-			m.codec.RespondError(msg.ID, -32602, `invalid params: expected {"value": <bool>}`)
->>>>>>> 7a8c524f9591fc6a1e0031433b67ce4850985997
 			return
 		}
 		m.mu.RLock()
 		newSettings := m.settings
 		m.mu.RUnlock()
-<<<<<<< HEAD
 		next := make(map[string]json.RawMessage, len(newSettings.EngineOverrides)+1)
 		for k, v := range newSettings.EngineOverrides {
 			next[k] = v
@@ -527,11 +537,6 @@ func (m *Manager) handleMessage(msg *Message) {
 		newSettings.EngineOverrides = next
 		if err := m.saveSettings(newSettings); err != nil {
 			slog.Error("failed to persist engine override", "err", err)
-=======
-		newSettings.EngineAllowLANBind = *p.Value
-		if err := m.saveSettings(newSettings); err != nil {
-			slog.Error("failed to persist engine-allow-lan-bind", "err", err)
->>>>>>> 7a8c524f9591fc6a1e0031433b67ce4850985997
 			m.codec.RespondError(msg.ID, -32603, "failed to persist setting: "+err.Error())
 			return
 		}
