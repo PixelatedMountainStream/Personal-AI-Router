@@ -79,6 +79,12 @@ before the switch. Explicit Load remains available; Eject releases model memory
 and keeps vLLM enabled. An explicitly disabled engine is never started by a request,
 and inference never downloads an uncached model.
 
+When vLLM starts from OFF after you turn it on or choose **Load**, model
+preparation returns HTTP 503 (`engine is starting`). If outdated routing
+information sends a request to vLLM while it is OFF, preparation returns HTTP 503
+(`engine is disabled`). In both cases, the proxy can try another node that
+advertises the requested model, subject to its retry limits.
+
 Request-triggered startup requires a complete cached snapshot at the launch's
 `--revision`, or `main` when none is set. A complete download of another revision
 does not make that startup eligible. Explicit Load can still fetch an uncached
@@ -839,6 +845,10 @@ cluster traffic. Managed engines bind **loopback by default**, but a manifest's
 `runtime.bind` may open an inference engine to the LAN — Ollama ships
 `0.0.0.0` to serve the cluster — overridable per call via
 `engine:start {bind}`; readiness/health probes always target loopback.
+The `bind` parameter is validated before anything launches: it must be a
+well-formed IP address, and a non-loopback address is rejected with
+`-32602` (`bind must be a loopback address`) unless `engine_allow_lan_bind`
+is on. Loopback addresses pass through to the executor unchanged.
 Downloads are **HTTPS-only** (plain `http` only from loopback) and verified
 against the manifest's `sha256` when one is pinned; an unpinned fetch runs
 with a loud warning.
