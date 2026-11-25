@@ -467,6 +467,9 @@ jobs:
             if [ -z "$PR_NUMBER" ] && [ -n "${CREATED_NUMBER:-}" ]; then
               # Search lag: fall back to the number from the create URL; verify_pr checks branch/base/repo by number.
               PR_NUMBER="$CREATED_NUMBER"; PR_FOUND_BRANCH="$BRANCH"
+              # By-number lookup skips the label filter, so require the sync label explicitly (gh pr create applied it).
+              req_label=upstream-sync; [ -z "$DEMO_REF" ] || req_label=sync-demo
+              gh_sync verify-pr --pr "$PR_NUMBER" --branch "$BRANCH" --label "$req_label" || { echo "::error::PR #$PR_NUMBER missing label $req_label or identity mismatch"; exit 1; }
             fi
             [ -n "$PR_NUMBER" ] || { echo "::error::could not resolve the PR number for $BRANCH after create"; exit 1; }
             { [ "$PR_FOUND_BRANCH" = "$BRANCH" ] && verify_pr; } || { echo "::error::created PR does not match $BRANCH"; exit 1; }
