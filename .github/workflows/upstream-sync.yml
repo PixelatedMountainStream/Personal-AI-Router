@@ -444,7 +444,10 @@ jobs:
             fi
           elif [ "$PUSH" = "true" ] && [ -f "$in/cand.bundle" ] && [ -n "$BRANCH" ]; then
             extra=(); [ "$DRAFT" = "true" ] && extra+=(--draft)
-            gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$body" --label "$LABELS" "${extra[@]}"
+            create_out=$(gh pr create --base "$BASE" --head "$BRANCH" --title "$TITLE" --body-file "$body" --label "$LABELS" "${extra[@]}")
+            echo "$create_out"
+            # The URL gh prints is authoritative; the label search used below lags right after creation (run 45664928087).
+            CREATED_NUMBER=$(grep -oE '/pull/[0-9]+[[:space:]]*$' <<<"$create_out" | grep -oE '[0-9]+' | tail -1 || true)
           fi
           # A clean existing PR is always made ready (the helper un-drafts only if needed and drops sync-failing).
           if [ -n "$PR_NUMBER" ] && [ "$OUTCOME" = "clean" ]; then
@@ -453,10 +456,20 @@ jobs:
           fi
           # A PR just created is looked up once, by the branch we pushed only, then verified; the carried one is kept.
           if [ -z "$PR_NUMBER" ] && [ "$PUSH" = "true" ] && [ -n "$BRANCH" ]; then
-            found=$(gh_sync find-pr "${find_args[@]}" --branch "$BRANCH")
-            PR_NUMBER=$(jq -r '.number // empty' <<<"$found")
+            for _try in 1 2 3 4 5; do
+              found=$(gh_sync find-pr "${find_args[@]}" --branch "$BRANCH")
+              PR_NUMBER=$(jq -r '.number // empty' <<<"$found")
+              [ -n "$PR_NUMBER" ] && break
+              [ -z "${CREATED_NUMBER:-}" ] || break
+              sleep 3
+            done
             PR_FOUND_BRANCH=$(jq -r '.branch // empty' <<<"$found")
-            [ -z "$PR_NUMBER" ] || { [ "$PR_FOUND_BRANCH" = "$BRANCH" ] && verify_pr; } || { echo "::error::created PR does not match $BRANCH"; exit 1; }
+            if [ -z "$PR_NUMBER" ] && [ -n "${CREATED_NUMBER:-}" ]; then
+              # Search lag: fall back to the number from the create URL; verify_pr checks branch/base/repo by number.
+              PR_NUMBER="$CREATED_NUMBER"; PR_FOUND_BRANCH="$BRANCH"
+            fi
+            [ -n "$PR_NUMBER" ] || { echo "::error::could not resolve the PR number for $BRANCH after create"; exit 1; }
+            { [ "$PR_FOUND_BRANCH" = "$BRANCH" ] && verify_pr; } || { echo "::error::created PR does not match $BRANCH"; exit 1; }
             # A new conflict PR: verify the label landed at creation; add it if missing, else fail the run.
             case ",$LABELS," in *,sync-conflict,*) [ -z "$PR_NUMBER" ] || gh_sync mark-conflict --pr "$PR_NUMBER" || { echo "::error::sync-conflict missing on new PR #$PR_NUMBER"; exit 1; };; esac
           fi
