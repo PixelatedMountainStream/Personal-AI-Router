@@ -895,10 +895,10 @@ index 0000000..19c2735
 +}
 diff --git a/services/nvpair-proxy/local/routing/routing.go b/services/nvpair-proxy/local/routing/routing.go
 new file mode 100644
-index 0000000..25b5647
+index 0000000..2351bf1
 --- /dev/null
 +++ b/services/nvpair-proxy/local/routing/routing.go
-@@ -0,0 +1,74 @@
+@@ -0,0 +1,82 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -915,19 +915,27 @@ index 0000000..25b5647
 +	Occ   int // requests occupying those slots now
 +	// GPU is the scheduler's GPU pressure plus this proxy's reservations
 +	// through any engine's facade (they share the GPU, not the slots).
-+	GPU   int
-+	Local bool // this host's own node
++	GPU int
++	// Pressure is the scheduler's GPU pressure alone (no reservations, which
++	// Occ already counts). It occupies slots like queued work, so a node the
++	// scheduler reports as GPU-loaded is not treated as idle (NVIDIA's
++	// pending+pressure+reservations balance).
++	Pressure int
++	Local    bool // this host's own node
 +	// Cooling is NVIDIA's #144 first-byte cooldown (coolingSet).
 +	Cooling bool
 +}
 +
 +// Full reports whether every slot is occupied.
-+func (c Candidate) Full() bool { return c.Occ >= c.Slots }
++func (c Candidate) Full() bool { return c.occ() >= c.Slots }
++
++// occ is Occ plus scheduler GPU pressure.
++func (c Candidate) occ() int { return c.Occ + c.Pressure }
 +
 +// queue is occupancy per slot, or, when full, the queue a new request would
 +// join: (occ-slots+1)/slots.
 +func (c Candidate) queue() float64 {
-+	slots, occ := float64(c.Slots), float64(c.Occ)
++	slots, occ := float64(c.Slots), float64(c.occ())
 +	if occ >= slots {
 +		return (occ - slots + 1) / slots
 +	}
@@ -2175,10 +2183,10 @@ index 0000000..c151d1e
 +}
 diff --git a/services/nvpair-proxy/local_proxy.go b/services/nvpair-proxy/local_proxy.go
 new file mode 100644
-index 0000000..d6783ae
+index 0000000..f655554
 --- /dev/null
 +++ b/services/nvpair-proxy/local_proxy.go
-@@ -0,0 +1,780 @@
+@@ -0,0 +1,781 @@
 +// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 +// SPDX-License-Identifier: Apache-2.0
 +
@@ -2737,9 +2745,10 @@ index 0000000..d6783ae
 +			Occ:   p.occLocked(inflightKey{engine, model, id}),
 +			// Reservations through any engine's facade count as pressure:
 +			// they share the GPU even though they do not share slots.
-+			GPU:     p.priorityGPUPressure[id] + p.priorityReservations[id],
-+			Local:   cands[i].local,
-+			Cooling: cooling[id],
++			GPU:      p.priorityGPUPressure[id] + p.priorityReservations[id],
++			Pressure: p.priorityGPUPressure[id],
++			Local:    cands[i].local,
++			Cooling:  cooling[id],
 +		})
 +		at = append(at, i)
 +	}
