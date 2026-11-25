@@ -233,6 +233,42 @@ class Sync(unittest.TestCase):
         self.assertEqual(self.sync("status")[1]["mode"], "none")
         self.assertEqual(self.sync("status", "--pending")[1]["mode"], "recheck")
 
+    def test_recheck_counts_carried_upstream_commits(self):
+        self.up_commit("a.txt", "2\n")
+        self.fetch()
+        self.merge()                                  # sync branch now pins the new upstream sha
+        st = self.sync("status", "--pending", "--base", "HEAD", "--tags-base", "develop")[1]
+        self.assertEqual((st["mode"], st["commits"]), ("recheck", 1))
+        self.assertIn("(1 commits)", self.sync("report", "--status", self._dump(st))[1]["title"])
+
+    def test_go_rules_shared_by_check_and_local_ci(self):
+        cfg = su.tomllib.loads((HERE.parent / "upstream-sync.toml").read_text())
+        self.assertIn("services/tests", cfg["go_vet_skip"])
+        self.assertNotIn("GPU_pressure", json.dumps(cfg))
+        ci = (HERE.parents[1] / ".github/workflows/local-ci.yml").read_text()
+        self.assertIn("local/scripts/go_rules.py", ci)
+        self.assertNotIn("go vet ./... &&", ci)
+        # Run the real `check` against a fake `go` that logs its calls, then compare with the helper's output.
+        mods = ["services/tests", "services/nvpair-engine-manager", "services/shared"]
+        self.put(self.fork, "local/upstream-sync.toml", CONF + "go_modules = %s\n" % json.dumps(mods)
+                 + "go_vet_skip = %s\n[go_skip]\n" % json.dumps(cfg["go_vet_skip"])
+                 + "".join('"%s" = "%s"\n' % kv for kv in cfg["go_skip"].items()))
+        bindir, log = Path(self.tmp.name) / "bin", Path(self.tmp.name) / "go.log"
+        self.put(bindir, "go", '#!/bin/sh\necho "$(pwd) $*" >> "%s"\n' % log)
+        (bindir / "go").chmod(0o755)
+        for m in mods:
+            self.put(self.fork, m + "/go.mod", "module x\n")
+        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+        subprocess.run([sys.executable, str(SCRIPT), "--root", str(self.fork), "check"], env=env, capture_output=True, text=True)
+        calls = log.read_text().splitlines()
+        for m in mods:
+            vet, skip = su.go_rules.rules(cfg, m)
+            mine = [c for c in calls if c.startswith(str(self.fork / m)) or c.startswith(str((self.fork / m).resolve()))]
+            self.assertEqual(any(" vet " in c for c in mine), vet, m)
+            self.assertEqual(any(f"-skip {skip}" in c for c in mine), bool(skip), m)
+            cli = subprocess.run([sys.executable, str(HERE / "go_rules.py"), m], capture_output=True, text=True).stdout
+            self.assertIn(f"GO_VET={int(vet)}", cli)
+
     def test_inconsistent_check_is_failing(self):
         st = {"ok": True, "tags": [], "short": "abc", "commits": 1}
         for ck, code in (({"ok": True, "escalate": False}, "1"),
