@@ -530,9 +530,15 @@ jobs:
         env:
           ENROLLED: ${{ steps.enroll.outputs.enrolled }}
           OUTCOME: ${{ steps.report.outputs.outcome }}
+          SYNC_AUTO_MERGE: ${{ vars.SYNC_AUTO_MERGE }}
         run: |
           # Green only when the PR ended enrolled (gap 6): every other run, including a kill-switch-only refusal, is red.
           [ "$ENROLLED" = "true" ] && exit 0
+          # Clean sync with auto-merge disabled: PR awaits manual merge, not a failure.
+          if [ "$OUTCOME" = "clean" ] && [ -z "$SYNC_AUTO_MERGE" ]; then
+            echo "::notice::clean; auto-merge disabled, awaiting manual merge"
+            exit 0
+          fi
           echo "::error::sync outcome '$OUTCOME' did not end enrolled"
           exit 1
 
