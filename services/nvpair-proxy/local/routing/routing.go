@@ -14,19 +14,27 @@ type Candidate struct {
 	Occ   int // requests occupying those slots now
 	// GPU is the scheduler's GPU pressure plus this proxy's reservations
 	// through any engine's facade (they share the GPU, not the slots).
-	GPU   int
-	Local bool // this host's own node
+	GPU int
+	// Pressure is the scheduler's GPU pressure alone (no reservations, which
+	// Occ already counts). It occupies slots like queued work, so a node the
+	// scheduler reports as GPU-loaded is not treated as idle (NVIDIA's
+	// pending+pressure+reservations balance).
+	Pressure int
+	Local    bool // this host's own node
 	// Cooling is NVIDIA's #144 first-byte cooldown (coolingSet).
 	Cooling bool
 }
 
 // Full reports whether every slot is occupied.
-func (c Candidate) Full() bool { return c.Occ >= c.Slots }
+func (c Candidate) Full() bool { return c.occ() >= c.Slots }
+
+// occ is Occ plus scheduler GPU pressure.
+func (c Candidate) occ() int { return c.Occ + c.Pressure }
 
 // queue is occupancy per slot, or, when full, the queue a new request would
 // join: (occ-slots+1)/slots.
 func (c Candidate) queue() float64 {
-	slots, occ := float64(c.Slots), float64(c.Occ)
+	slots, occ := float64(c.Slots), float64(c.occ())
 	if occ >= slots {
 		return (occ - slots + 1) / slots
 	}

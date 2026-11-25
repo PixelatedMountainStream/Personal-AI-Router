@@ -556,9 +556,10 @@ func (p *Proxy) bestLocked(engine, model string, cands []candidate, tried, cooli
 			Occ:   p.occLocked(inflightKey{engine, model, id}),
 			// Reservations through any engine's facade count as pressure:
 			// they share the GPU even though they do not share slots.
-			GPU:     p.priorityGPUPressure[id] + p.priorityReservations[id],
-			Local:   cands[i].local,
-			Cooling: cooling[id],
+			GPU:      p.priorityGPUPressure[id] + p.priorityReservations[id],
+			Pressure: p.priorityGPUPressure[id],
+			Local:    cands[i].local,
+			Cooling:  cooling[id],
 		})
 		at = append(at, i)
 	}
