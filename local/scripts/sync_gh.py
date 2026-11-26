@@ -145,7 +145,8 @@ def cmd_verify_pr(a):
     p = p if isinstance(p, dict) else {}
     why = [w for w, bad in ((f"head is {p.get('headRefName')!r}, not {a.branch!r}", p.get("headRefName") != a.branch),
                             (f"base is {p.get('baseRefName')!r}, not 'develop'", p.get("baseRefName") != "develop"),
-                            ("PR is cross-repository", p.get("isCrossRepository") is not False)) if bad]
+                            ("PR is cross-repository", p.get("isCrossRepository") is not False),
+                            (f"PR lacks required label {a.label!r}", bool(a.label) and a.label not in names(p))) if bad]
     return emit("verify-pr", not why, 1 if why else 0, pr=a.pr, reasons=why)
 
 
@@ -370,6 +371,7 @@ def main(argv=None):
     s.add_argument("--pr", type=int, required=True)
     s = add("verify-pr", cmd_verify_pr)
     s.add_argument("--pr", type=int, required=True); s.add_argument("--branch", required=True)
+    s.add_argument("--label", default="", help="also require this label on the PR")
     s = add("ready", cmd_ready)
     s.add_argument("--pr", type=int, required=True)
     s = add("veto", cmd_veto)
